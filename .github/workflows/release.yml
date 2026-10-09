@@ -288,7 +288,7 @@ jobs:
             echo "::error::The UNLAYERED_SOFTWARE_PUBLISH_TOKEN secret is not set, so this release is on GitHub but not on unlayered3d.com. See .github/publish/README.md."
             exit 1
           fi
-          npm ci --prefix .github/publish --no-audit --no-fund
+          npm install --prefix .github/publish --no-audit --no-fund --no-package-lock
           args=(--platform windows --arch x64 --version "$VERSION" --commit "$GITHUB_SHA"
                 --build-url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID")
           [ -f release-notes.md ] && args+=(--notes-file release-notes.md)
