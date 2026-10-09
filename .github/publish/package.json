@@ -1,0 +1,9 @@
+{
+  "name": "unlayered-publish",
+  "private": true,
+  "type": "module",
+  "description": "Publishes CI builds to unlayered3d.com (see README.md).",
+  "dependencies": {
+    "@vercel/blob": "2.8.0"
+  }
+}

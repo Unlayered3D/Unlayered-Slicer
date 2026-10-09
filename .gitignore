@@ -63,3 +63,6 @@ docs/superpowers/
 /sandboxes/skeleton_tests/
 # CLI slice output written into the repo root
 /result.json
+
+# The publish script's dependency (.github/publish/README.md)
+.github/publish/node_modules/

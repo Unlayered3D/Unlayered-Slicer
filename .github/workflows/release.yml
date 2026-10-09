@@ -270,12 +270,28 @@ jobs:
           generate_release_notes: true
           files: release-assets/*
 
-      # TODO(unlayered): publish release-assets/latest.json to
-      # https://unlayered3d.com/slicer/latest.json automatically. Until then it is downloaded from
-      # the latest-json artifact and uploaded by hand - the app will not see a new version until
-      # that file is live. Serve it with Cache-Control: max-age=300; a stale CDN copy is the most
-      # likely reason for "the updater says there is nothing new".
-      - name: Remind about the manual manifest publish
+      # The release is the site's stable build: /software's Windows download, and -- because the
+      # site builds /slicer/latest.json from it -- the update every installed copy is offered.
+      # Needs the UNLAYERED_SOFTWARE_PUBLISH_TOKEN secret (the site's stable publish token; see
+      # .github/publish/README.md). The latest-json artifact above is no longer what clients read.
+      - name: Publish to unlayered3d.com
         if: github.ref_type == 'tag' && !inputs.dry_run
+        working-directory: ${{ github.workspace }}
+        shell: bash
+        env:
+          UNLAYERED_SITE: ${{ vars.UNLAYERED_SITE || 'https://unlayered3d.com' }}
+          UNLAYERED_SOFTWARE_PUBLISH_TOKEN: ${{ secrets.UNLAYERED_SOFTWARE_PUBLISH_TOKEN }}
+          VERSION: ${{ steps.version.outputs.ver_pure }}
+          PRERELEASE: ${{ steps.version.outputs.prerelease }}
         run: |
-          echo "::notice::Download the latest-json artifact and publish it to https://unlayered3d.com/slicer/latest.json - clients will not see ${{ steps.version.outputs.tag }} until then."
+          if [ -z "$UNLAYERED_SOFTWARE_PUBLISH_TOKEN" ]; then
+            echo "::error::The UNLAYERED_SOFTWARE_PUBLISH_TOKEN secret is not set, so this release is on GitHub but not on unlayered3d.com. See .github/publish/README.md."
+            exit 1
+          fi
+          npm ci --prefix .github/publish --no-audit --no-fund
+          args=(--platform windows --arch x64 --version "$VERSION" --commit "$GITHUB_SHA"
+                --build-url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID")
+          [ -f release-notes.md ] && args+=(--notes-file release-notes.md)
+          [ "$PRERELEASE" = true ] && args+=(--prerelease)
+          node .github/publish/publish-software.mjs publish "${args[@]}" "build/Unlayered_Slicer_Windows_Installer_V$VERSION.exe"
+          node .github/publish/publish-software.mjs list
