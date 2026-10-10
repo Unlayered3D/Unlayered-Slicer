@@ -10,6 +10,11 @@ in-app update check offers every installed copy (the site builds `/slicer/latest
 `-beta1` style tag is published as a prerelease. `release-notes.md`, if present, becomes the update
 dialog's notes.
 
+Downloads come from the site only. The GitHub Release is made after the site publish, carries the
+tag and changelog with no files attached, and links to unlayered3d.com/software; the run's artifacts
+are then deleted. A dry run (`workflow_dispatch` with `dry_run`) keeps its artifacts for inspection
+and publishes nothing.
+
 Dev builds don't come from here: they're built and published by the private development repository.
 
 ## Settings

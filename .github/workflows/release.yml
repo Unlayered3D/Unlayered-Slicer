@@ -21,7 +21,8 @@ on:
         default: true
 
 permissions:
-  contents: write
+  contents: write # the GitHub Release
+  actions: write # delete this run's artifacts once the installer is on the site
 
 concurrency:
   group: release-${{ github.ref }}
@@ -261,15 +262,6 @@ jobs:
           path: release-assets/
           if-no-files-found: error
 
-      - name: Publish the GitHub Release
-        if: github.ref_type == 'tag' && !inputs.dry_run
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ steps.version.outputs.tag }}
-          prerelease: ${{ steps.version.outputs.prerelease == 'true' }}
-          generate_release_notes: true
-          files: release-assets/*
-
       # The release is the site's stable build: /software's Windows download, and -- because the
       # site builds /slicer/latest.json from it -- the update every installed copy is offered.
       # Needs the UNLAYERED_SOFTWARE_PUBLISH_TOKEN secret (the site's stable publish token; see
@@ -285,7 +277,7 @@ jobs:
           PRERELEASE: ${{ steps.version.outputs.prerelease }}
         run: |
           if [ -z "$UNLAYERED_SOFTWARE_PUBLISH_TOKEN" ]; then
-            echo "::error::The UNLAYERED_SOFTWARE_PUBLISH_TOKEN secret is not set, so this release is on GitHub but not on unlayered3d.com. See .github/publish/README.md."
+            echo "::error::The UNLAYERED_SOFTWARE_PUBLISH_TOKEN secret is not set, so the release can't go to unlayered3d.com (and no GitHub Release is made). See .github/publish/README.md."
             exit 1
           fi
           npm install --prefix .github/publish --no-audit --no-fund --no-package-lock
@@ -295,3 +287,31 @@ jobs:
           [ "$PRERELEASE" = true ] && args+=(--prerelease)
           node .github/publish/publish-software.mjs publish "${args[@]}" "build/Unlayered_Slicer_Windows_Installer_V$VERSION.exe"
           node .github/publish/publish-software.mjs list
+
+      # Downloads come from unlayered3d.com only, so the GitHub Release carries the tag and the
+      # changelog but no files -- just a link to the site. It's created after the site publish, so
+      # it never points at a download that isn't there.
+      - name: Publish the GitHub Release
+        if: github.ref_type == 'tag' && !inputs.dry_run
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          prerelease: ${{ steps.version.outputs.prerelease == 'true' }}
+          generate_release_notes: true
+          body: |
+            **Download Unlayered Slicer from [unlayered3d.com/software](https://unlayered3d.com/software).** Installed copies are offered this update automatically.
+
+      # The installer is on the site now; the run's copies would be a second, public download.
+      # A dry run keeps them, since that's how a dry run's build is inspected.
+      - name: Delete the run's artifacts
+        if: github.ref_type == 'tag' && !inputs.dry_run
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api --paginate "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts?per_page=100" \
+            -q '.artifacts[] | "\(.id) \(.name)"' \
+            | while read -r id name; do
+                echo "Deleting $name"
+                gh api -X DELETE "repos/$GITHUB_REPOSITORY/actions/artifacts/$id"
+              done
