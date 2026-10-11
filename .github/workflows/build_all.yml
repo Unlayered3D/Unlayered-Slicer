@@ -48,6 +48,16 @@ on:
         description: 'Only build dependencies (bypasses caching)'
         type: boolean
         default: false
+      publish:
+        description: 'Dev repository only: publish the installers to unlayered3d.com /software/beta (see .github/publish/README.md)'
+        type: boolean
+        default: false
+
+# Spelled out because a private repository's default job token is read-only. The callee workflows
+# inherit this. actions: write lets the test jobs delete their artifacts once consumed.
+permissions:
+  contents: read
+  actions: write
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
@@ -82,7 +92,7 @@ jobs:
           && '[{"arch":"","os":"orca-lnx-server"}]'
           || '[{"arch":"","os":"ubuntu-24.04"},{"arch":"aarch64","os":"ubuntu-24.04-arm"}]') }}
     # Don't run scheduled builds on forks:
-    if: ${{ !cancelled() && (github.event_name != 'schedule' || github.repository == 'Unlayered3D/Unlayered-Slicer') }}
+    if: ${{ !cancelled() && (github.event_name != 'schedule' || github.repository_owner == 'Unlayered3D') }}
     uses: ./.github/workflows/build_check_cache.yml
     with:
       os: ${{ matrix.os }}
@@ -100,7 +110,7 @@ jobs:
           || '[{"arch":"x64","os":"windows-latest","compiler":"clang"},{"arch":"arm64","os":"windows-11-arm","compiler":"clang"}]') }}
     needs: check_build_script
     # Don't run scheduled builds on forks:
-    if: ${{ !cancelled() && needs.check_build_script.result == 'success' && (github.event_name != 'schedule' || github.repository == 'Unlayered3D/Unlayered-Slicer') }}
+    if: ${{ !cancelled() && needs.check_build_script.result == 'success' && (github.event_name != 'schedule' || github.repository_owner == 'Unlayered3D') }}
     uses: ./.github/workflows/build_check_cache.yml
     with:
       os: ${{ matrix.os }}
@@ -133,6 +143,18 @@ jobs:
       os: ${{ vars.SELF_HOSTED && 'orca-macos-arm64' || 'macos-14' }}
       arch: universal
       macos-combine-only: true
+    secrets: inherit
+  # Dev builds to the site: only when asked (by hand, or by nightly_dev.yml), never on push or PR.
+  # !cancelled() rather than success(): publish whatever built, so one broken platform doesn't
+  # hold back the rest.
+  publish_dev:
+    name: Publish dev build
+    needs: [build_linux, build_windows, build_macos_universal]
+    if: ${{ !cancelled() && github.repository == 'Unlayered3D/Unlayered-Slicer-Dev' && github.event_name == 'workflow_dispatch' && inputs.publish && !inputs.build-deps-only }}
+    permissions:
+      contents: read
+      actions: write
+    uses: ./.github/workflows/publish_dev.yml
     secrets: inherit
   # One test job per built arch, on the runner that built it.
   unit_tests_linux_x86_64:
@@ -206,6 +228,12 @@ jobs:
     needs: [unit_tests_linux_x86_64, unit_tests_linux_aarch64, unit_tests_windows_x64, unit_tests_windows_arm64, unit_tests_macos_arm64]
     if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
+    # The publisher writes a check run and, on PRs, a summary comment.
+    permissions:
+      contents: read
+      actions: write
+      checks: write
+      pull-requests: write
     steps:
       - name: Download Test Results
         uses: actions/download-artifact@v8

@@ -528,6 +528,17 @@ jobs:
           if-no-files-found: error
 
 
+      # Consumed by build_all.yml's slice_check_linux, which looks it up by commit and arch.
+      - name: Upload profile validator for the slice check
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ github.sha }}-profile-validator-linux-${{ inputs.arch == 'aarch64' && 'aarch64' || 'x86_64' }}
+          overwrite: true
+          path: ./build/src/Release/UnlayeredSlicer_profile_validator
+          retention-days: 5
+          if-no-files-found: error
+
       - name: Build orca_custom_preset_tests
         if: github.ref == 'refs/heads/main' && runner.os == 'Linux' && !vars.SELF_HOSTED && inputs.arch != 'aarch64'
         working-directory: ${{ github.workspace }}/build/src/Release

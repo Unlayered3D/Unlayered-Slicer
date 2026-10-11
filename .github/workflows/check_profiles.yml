@@ -24,6 +24,8 @@ on:
 
 permissions:
   contents: read
+  # Downloading the validator artifact from a Build all run.
+  actions: read
 
 
 jobs:
@@ -44,12 +46,31 @@ jobs:
           python3 ./scripts/orca_extra_profile_check.py 2>&1 | tee ${{ runner.temp }}/extra_json_check.log
           exit ${PIPESTATUS[0]}
 
-      # download
-      - name: Download
+      # Upstream OrcaSlicer's nightly validator rejects option values only this fork has (for example
+      # print_sequence "by group"), so use the fork's own, which Build all uploads from its Linux
+      # x86_64 leg. Take it from the newest Build all run on this branch that has one, else from
+      # main. The repository is private, so this needs the job token and actions: read.
+      - name: Download the profile validator
         working-directory: ${{ github.workspace }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_BRANCH: ${{ github.head_ref || github.ref_name }}
         run: |
-          curl -L -o UnlayeredSlicer_profile_validator https://github.com/OrcaSlicer/OrcaSlicer/releases/download/nightly-builds/OrcaSlicer_profile_validator_Linux_Ubuntu2404_nightly  # upstream prebuilt validator
-          chmod +x ./UnlayeredSlicer_profile_validator
+          for branch in "$HEAD_BRANCH" main; do
+            runs=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow build_all.yml --branch "$branch" \
+                     --status completed --limit 10 --json databaseId --jq '.[].databaseId')
+            for run in $runs; do
+              if gh run download "$run" --repo "$GITHUB_REPOSITORY" --dir validator-download \
+                   --pattern 'Unlayered_Slicer_profile_validator_Linux_ubuntu_*' 2>/dev/null; then
+                echo "Using the profile validator from Build all run $run on $branch"
+                find validator-download -type f -name UnlayeredSlicer_profile_validator -exec mv {} . \;
+                chmod +x ./UnlayeredSlicer_profile_validator
+                exit 0
+              fi
+            done
+          done
+          echo "::error::No recent Build all run on $HEAD_BRANCH or main has a Linux profile validator artifact. Run Build all on main; its artifacts expire after the repository's retention period."
+          exit 1
 
       # Validate all system profiles.
       - name: validate system profiles

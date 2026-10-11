@@ -1,0 +1,161 @@
+name: Publish dev build
+
+# Publishes one Build all run's installers to unlayered3d.com's dev channel (/software/beta), with
+# .github/publish/publish-software.mjs. Called at the end of Build all when its `publish` input is
+# on (nightly_dev.yml turns it on), or run by hand with an earlier run's ID to publish that run
+# without rebuilding. See .github/publish/README.md.
+#
+# Publishes whatever installers the run produced: a platform whose build failed is simply missing
+# from that version on the site. Re-running is safe; a build already live is skipped.
+
+on:
+  workflow_call:
+    inputs:
+      run-id:
+        description: Build all run to publish; empty for the calling run
+        type: string
+        default: ''
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: Build all run ID to publish (the number in its URL)
+        required: true
+
+permissions:
+  contents: read
+  actions: write # read the run's artifacts, and delete them when DELETE_ARTIFACTS_AFTER_PUBLISH is on
+
+concurrency:
+  group: publish-dev-${{ inputs.run-id || inputs.run_id || github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Publish to unlayered3d.com (dev)
+    # The token publishes to the site; a fork has no business holding one.
+    if: github.repository == 'Unlayered3D/Unlayered-Slicer-Dev'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RUN_ID: ${{ inputs.run-id || inputs.run_id || github.run_id }}
+      UNLAYERED_SITE: ${{ vars.UNLAYERED_SITE || 'https://unlayered3d.com' }}
+      UNLAYERED_SOFTWARE_PUBLISH_TOKEN: ${{ secrets.UNLAYERED_SOFTWARE_PUBLISH_TOKEN }}
+      PUBLISH: node .github/publish/publish-software.mjs
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          sparse-checkout: .github/publish
+          lfs: 'false'
+
+      - name: Install the publish script's dependency
+        run: |
+          node --version
+          npm install --prefix .github/publish --no-audit --no-fund --no-package-lock
+
+      - name: Check the token
+        run: |
+          if [ -z "$UNLAYERED_SOFTWARE_PUBLISH_TOKEN" ]; then
+            echo "::error::The UNLAYERED_SOFTWARE_PUBLISH_TOKEN secret is not set. See .github/publish/README.md."
+            exit 1
+          fi
+          # Fails here, before downloading anything, if the site refuses the token or isn't reachable.
+          $PUBLISH list
+
+      # The version, commit and branch of the run being published -- not of this workflow's own
+      # checkout, which for a by-hand run is whatever branch it was started from.
+      - name: Read the run's version
+        id: run
+        run: |
+          run=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID")
+          sha=$(jq -r .head_sha <<<"$run")
+          branch=$(jq -r .head_branch <<<"$run")
+          base=$(gh api "repos/$GITHUB_REPOSITORY/contents/version.inc?ref=$sha" -q .content | base64 -d \
+            | grep 'set(UNLAYERED_VERSION' | cut -d '"' -f2)
+          if [ -z "$base" ]; then
+            echo "::error::Could not read UNLAYERED_VERSION from version.inc at $sha."
+            exit 1
+          fi
+          version="$base-dev+${sha:0:7}"
+          {
+            echo "sha=$sha"
+            echo "branch=$branch"
+            echo "version=$version"
+            echo "url=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$RUN_ID"
+          } >> "$GITHUB_OUTPUT"
+          echo "Publishing run $RUN_ID: $branch @ ${sha:0:7} as $version"
+
+      # By artifact ID through the API rather than download-artifact or `gh run download`, so it
+      # works on the calling run while it is still in progress, and fetches only the installers --
+      # not the portable folders, MSIX packages, test binaries or Flatpaks.
+      - name: Download the installers
+        run: |
+          gh api --paginate "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID/artifacts?per_page=100" \
+            -q '.artifacts[] | select(.expired | not) | "\(.id) \(.name)"' > artifacts.txt
+          grep -E ' Unlayered_Slicer_(Windows_.*_(x64|arm64)|Mac_universal_.*|Linux_ubuntu_.*)$' artifacts.txt \
+            | grep -v -E '_MSIX_|_portable$|profile_validator' > installers.txt || true
+          if [ ! -s installers.txt ]; then
+            echo "::error::Run $RUN_ID has no installer artifacts (expired, or every build failed)."
+            exit 1
+          fi
+          mkdir -p dl
+          while read -r id name; do
+            echo "Downloading $name"
+            gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$id/zip" > "dl/$id.zip"
+            unzip -q -o "dl/$id.zip" -d "dl/$name"
+            rm "dl/$id.zip"
+          done < installers.txt
+          find dl -type f -exec ls -l {} +
+
+      # Renamed to carry the dev version: the build names them after version.inc alone, so every
+      # dev build of 0.1.1 would otherwise download as the same file name.
+      - name: Publish
+        env:
+          VERSION: ${{ steps.run.outputs.version }}
+          SHA: ${{ steps.run.outputs.sha }}
+          BRANCH: ${{ steps.run.outputs.branch }}
+          BUILD_URL: ${{ steps.run.outputs.url }}
+        run: |
+          failed=0
+          published=0
+          mkdir -p out
+          while IFS= read -r -d '' file; do
+            case "$(basename "$file")" in
+              Unlayered_Slicer_Windows_Installer_*_arm64.exe) platform=windows; arch=arm64; name="Unlayered_Slicer_Windows_Installer_V${VERSION}_arm64.exe" ;;
+              Unlayered_Slicer_Windows_Installer_*.exe)       platform=windows; arch=x64;   name="Unlayered_Slicer_Windows_Installer_V${VERSION}_x64.exe" ;;
+              Unlayered_Slicer_Mac_universal_*.dmg)           platform=mac;     arch=universal; name="Unlayered_Slicer_Mac_universal_V${VERSION}.dmg" ;;
+              Unlayered_Slicer_Linux_*aarch64*.AppImage)      platform=linux;   arch=arm64; name="Unlayered_Slicer_Linux_V${VERSION}_aarch64.AppImage" ;;
+              Unlayered_Slicer_Linux_*.AppImage)              platform=linux;   arch=x64;   name="Unlayered_Slicer_Linux_V${VERSION}_x86_64.AppImage" ;;
+              *) echo "Skipping $(basename "$file")"; continue ;;
+            esac
+            mv "$file" "out/$name"
+            if $PUBLISH publish --platform "$platform" --arch "$arch" --version "$VERSION" \
+                 --commit "$SHA" --branch "$BRANCH" --build-url "$BUILD_URL" "out/$name"; then
+              published=$((published + 1))
+            else
+              echo "::error::Publishing $platform/$arch failed."
+              failed=1
+            fi
+          done < <(find dl -type f \( -name '*.exe' -o -name '*.dmg' -o -name '*.AppImage' \) -print0)
+          echo "Published $published installer(s) as $VERSION."
+          [ "$published" -gt 0 ] || { echo "::error::Nothing was published."; exit 1; }
+          exit $failed
+
+      - name: Live on the site
+        run: $PUBLISH list
+
+      # Only after everything published, so a failed publish can be re-run from the artifacts.
+      # Every downloadable build goes, not just the installers published above: the portable
+      # folders and MSIX packages are the same software. Flatpaks stay -- the site doesn't host
+      # them -- as do tests, validators and debug symbols.
+      - name: Delete the builds from GitHub
+        if: vars.DELETE_ARTIFACTS_AFTER_PUBLISH == 'true'
+        run: |
+          gh api --paginate "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID/artifacts?per_page=100" \
+            -q '.artifacts[] | "\(.id) \(.name)"' \
+            | grep -E ' (Unlayered_Slicer_|UnlayeredSlicer_Mac_bundle_)' \
+            | grep -v -E 'flatpak|profile_validator' \
+            | while read -r id name; do
+                echo "Deleting $name"
+                gh api -X DELETE "repos/$GITHUB_REPOSITORY/actions/artifacts/$id"
+              done

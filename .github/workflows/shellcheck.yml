@@ -12,7 +12,9 @@ on:
   workflow_dispatch: # allows for manual dispatch
 
 name: "Shellcheck"
-permissions: {}
+# Private repository: the job token needs contents: read just to check out the code.
+permissions:
+  contents: read
 
 jobs:
   shellcheck:

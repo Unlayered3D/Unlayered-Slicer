@@ -7,6 +7,10 @@ on:
       paths:
        - 'localization/**'
        - ".github/workflows/check_locale.yml"
+    workflow_dispatch: # allows for manual dispatch
+
+permissions:
+  contents: read
 
 jobs:
   check_translation:

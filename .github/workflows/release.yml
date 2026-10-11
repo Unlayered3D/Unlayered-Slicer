@@ -9,6 +9,12 @@ name: Release
 # Tag convention (enforced below): v0.0.4 for a release, v0.0.4-beta1 / -rc1 / -alpha1 for a
 # prerelease. A single alphanumeric prerelease identifier, no dots. version.inc must already say the
 # same version, minus the leading "v".
+#
+# The same file runs in the private Dev repository and the public one, which gets it in each source
+# snapshot (see .github/publish/README.md). Releases are built and published by the public
+# repository only, where Actions minutes are free. In Dev a tag push builds nothing, and a run by
+# hand must be a dry run: Dev's publish token is the site's dev-channel one, so a release published
+# from there would land on /software/beta.
 
 on:
   push:
@@ -16,7 +22,7 @@ on:
   workflow_dispatch:
     inputs:
       dry_run:
-        description: 'Build and produce latest.json, but do not create a GitHub Release'
+        description: 'Build the installer as an artifact, but publish nothing'
         type: boolean
         default: true
 
@@ -28,18 +34,32 @@ concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
 
+env:
+  PUBLIC_REPO: Unlayered3D/Unlayered-Slicer
+  # A tag push, or a by-hand run on a tag with dry_run off. (On a push there are no inputs, so
+  # !inputs.dry_run is true.)
+  RELEASING: ${{ github.ref_type == 'tag' && !inputs.dry_run }}
+
 jobs:
   windows:
     name: Release Windows
+    # Tag pushes build only in the public repository; by-hand runs are checked by the guards below.
+    if: github.repository == 'Unlayered3D/Unlayered-Slicer' || github.event_name == 'workflow_dispatch'
     runs-on: windows-latest
     # A cold dependency cache means building the whole vendored dep tree.
     timeout-minutes: 360
 
     steps:
-      - name: Guard against running on a fork of this fork
-        if: github.repository != 'Unlayered3D/Unlayered-Slicer'
+      - name: Guard against running on a fork
+        if: github.repository_owner != 'Unlayered3D'
         run: |
-          echo "::error::This workflow publishes releases for Unlayered3D/Unlayered-Slicer only."
+          echo "::error::This workflow publishes Unlayered3D's releases only."
+          exit 1
+
+      - name: Guard against releasing from the Dev repository
+        if: env.RELEASING == 'true' && github.repository != env.PUBLIC_REPO
+        run: |
+          echo "::error::Releases are published from ${{ env.PUBLIC_REPO }}. Here, run this with dry_run on."
           exit 1
 
       - name: Checkout
@@ -188,73 +208,30 @@ jobs:
         shell: cmd
         run: '"C:/Program Files/7-Zip/7z.exe" a -m0=lzma2 -mx9 Unlayered_Slicer_PDB_V${{ steps.version.outputs.ver_pure }}_for_developers_only.7z *.pdb'
 
-      - name: Collect assets and build the update manifest
-        id: manifest
+      # The installer goes to unlayered3d.com, which also builds /slicer/latest.json -- the in-app
+      # update check -- from it; nothing here makes a manifest any more.
+      - name: Collect assets
         working-directory: ${{ github.workspace }}
         shell: pwsh
         run: |
           $ver = "${{ steps.version.outputs.ver_pure }}"
-          $tag = "${{ steps.version.outputs.tag }}"
 
           # The exact name CPack produces, from CPACK_PACKAGE_FILE_NAME. Asserted rather than
           # globbed: a glob that matches nothing turns a broken build into a silently empty release.
           $installer = "build/Unlayered_Slicer_Windows_Installer_V$ver.exe"
           if (-not (Test-Path $installer)) {
-              Write-Output "::error::CPack did not produce $installer. If CPACK_PACKAGE_FILE_NAME changed in CMakeLists.txt, update this step and select_platform_asset() in src/slic3r/Utils/AppUpdater.cpp together."
+              Write-Output "::error::CPack did not produce $installer. If CPACK_PACKAGE_FILE_NAME changed in CMakeLists.txt, update this step and the Publish step below together."
               exit 1
           }
 
           New-Item -ItemType Directory -Force release-assets | Out-Null
-          $files = @(
-            $installer,
-            "build/Unlayered_Slicer_Windows_V${ver}_portable.zip",
-            "build/src/Release/Unlayered_Slicer_PDB_V${ver}_for_developers_only.7z"
-          )
-          foreach ($f in $files) {
+          foreach ($f in @($installer, "build/Unlayered_Slicer_Windows_V${ver}_portable.zip")) {
               if (Test-Path $f) { Copy-Item $f release-assets/ } else { Write-Output "::warning::missing $f" }
           }
-
-          $installerLeaf = Split-Path $installer -Leaf
           $hash = (Get-FileHash -Algorithm SHA256 $installer).Hash.ToLower()
-          $size = (Get-Item $installer).Length
-          Write-Output "installer: $installerLeaf  $size bytes  sha256=$hash"
+          Write-Output "installer: $(Split-Path $installer -Leaf)  $((Get-Item $installer).Length) bytes  sha256=$hash"
 
-          # The manifest advertises release assets only when the UNLAYERED_PUBLIC_DOWNLOADS repository
-          # variable is 'true'. Without it the manifest lists none and the in-app update dialog offers
-          # to open the download page instead; setting it switches in-app installation on with no code
-          # change.
-          $public = "${{ vars.UNLAYERED_PUBLIC_DOWNLOADS }}" -eq 'true'
-          $assets = @()
-          if ($public) {
-              $assets += [ordered]@{
-                  name                 = $installerLeaf
-                  browser_download_url = "https://github.com/${{ github.repository }}/releases/download/$tag/$installerLeaf"
-                  size                 = $size
-                  sha256               = $hash
-              }
-          }
-
-          $notesPath = "release-notes.md"
-          $notes = if (Test-Path $notesPath) { Get-Content $notesPath -Raw } else { "Unlayered Slicer $ver" }
-
-          # Shaped like a single GitHub releases entry - see VERSION_CHECK_URL in AppConfig.cpp.
-          $manifest = [ordered]@{
-              tag_name   = $tag
-              prerelease = [System.Convert]::ToBoolean("${{ steps.version.outputs.prerelease }}")
-              html_url   = "https://unlayered3d.com/slicer/download"
-              body       = $notes
-              assets     = $assets
-          }
-          $manifest | ConvertTo-Json -Depth 5 | Out-File -FilePath release-assets/latest.json -Encoding utf8
-          Get-Content release-assets/latest.json
-
-      - name: Upload the update manifest
-        uses: actions/upload-artifact@v7
-        with:
-          name: latest-json
-          path: release-assets/latest.json
-          if-no-files-found: error
-
+      # Deleted once the release is on the site (below); a dry run keeps it for inspection.
       - name: Upload release assets
         uses: actions/upload-artifact@v7
         with:
@@ -262,12 +239,21 @@ jobs:
           path: release-assets/
           if-no-files-found: error
 
+      # Debug symbols for crash reports. Not the software, so kept after a release, until the
+      # repository's artifact retention runs out.
+      - name: Upload debug symbols
+        uses: actions/upload-artifact@v7
+        with:
+          name: Unlayered_Slicer_PDB_V${{ steps.version.outputs.ver_pure }}
+          path: build/src/Release/Unlayered_Slicer_PDB_V${{ steps.version.outputs.ver_pure }}_for_developers_only.7z
+          if-no-files-found: warn
+
       # The release is the site's stable build: /software's Windows download, and -- because the
       # site builds /slicer/latest.json from it -- the update every installed copy is offered.
       # Needs the UNLAYERED_SOFTWARE_PUBLISH_TOKEN secret (the site's stable publish token; see
-      # .github/publish/README.md). The latest-json artifact above is no longer what clients read.
+      # .github/publish/README.md).
       - name: Publish to unlayered3d.com
-        if: github.ref_type == 'tag' && !inputs.dry_run
+        if: env.RELEASING == 'true'
         working-directory: ${{ github.workspace }}
         shell: bash
         env:
@@ -292,7 +278,7 @@ jobs:
       # changelog but no files -- just a link to the site. It's created after the site publish, so
       # it never points at a download that isn't there.
       - name: Publish the GitHub Release
-        if: github.ref_type == 'tag' && !inputs.dry_run
+        if: env.RELEASING == 'true'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.version.outputs.tag }}
@@ -302,15 +288,16 @@ jobs:
             **Download Unlayered Slicer from [unlayered3d.com/software](https://unlayered3d.com/software).** Installed copies are offered this update automatically.
 
       # The installer is on the site now; the run's copies would be a second, public download.
-      # A dry run keeps them, since that's how a dry run's build is inspected.
+      # A dry run keeps them, since that's how a dry run's build is inspected. The debug symbols stay.
       - name: Delete the run's artifacts
-        if: github.ref_type == 'tag' && !inputs.dry_run
+        if: env.RELEASING == 'true'
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh api --paginate "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts?per_page=100" \
             -q '.artifacts[] | "\(.id) \(.name)"' \
+            | { grep -v ' Unlayered_Slicer_PDB_' || true; } \
             | while read -r id name; do
                 echo "Deleting $name"
                 gh api -X DELETE "repos/$GITHUB_REPOSITORY/actions/artifacts/$id"

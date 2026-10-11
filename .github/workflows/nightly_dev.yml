@@ -1,0 +1,59 @@
+name: Nightly dev build
+
+# Every night, if main has a commit that isn't on unlayered3d.com's /software/beta yet, start
+# Build all on main with `publish` on. Nights with nothing new cost a minute of Linux runner time
+# instead of a full build. See .github/publish/README.md.
+
+on:
+  schedule:
+    # 08:00 UTC: the middle of the night across the US.
+    - cron: '0 8 * * *'
+  workflow_dispatch: # run the check by hand
+
+permissions:
+  contents: read
+  actions: write # start Build all
+
+jobs:
+  nightly:
+    name: Build main if it changed
+    # Dev builds only. The public repository has this file too (see .github/publish/README.md).
+    if: github.repository == 'Unlayered3D/Unlayered-Slicer-Dev'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      GH_TOKEN: ${{ github.token }}
+      UNLAYERED_SITE: ${{ vars.UNLAYERED_SITE || 'https://unlayered3d.com' }}
+      UNLAYERED_SOFTWARE_PUBLISH_TOKEN: ${{ secrets.UNLAYERED_SOFTWARE_PUBLISH_TOKEN }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          sparse-checkout: .github/publish
+          lfs: 'false'
+
+      - name: Install the publish script's dependency
+        run: npm install --prefix .github/publish --no-audit --no-fund --no-package-lock
+
+      - name: Start Build all if main's head isn't built yet
+        run: |
+          head=$(gh api "repos/$GITHUB_REPOSITORY/commits/main" -q .sha)
+          echo "main is at ${head:0:7}"
+
+          # Published already (by an earlier night, or a by-hand Build all on main).
+          published=$(node .github/publish/publish-software.mjs list --json | jq -r '.installers[].commit // empty')
+          if grep -qx "$head" <<<"$published"; then
+            echo "Already on the site. Nothing to do."
+            exit 0
+          fi
+
+          # Started by an earlier night but not published -- every platform failed, or it's still
+          # running. Don't pay for the same broken commit every night; a by-hand run retries it.
+          started=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/build_all.yml/runs?head_sha=$head&event=workflow_dispatch" \
+            -q '[.workflow_runs[] | select(.triggering_actor.login == "github-actions[bot]")] | length')
+          if [ "$started" -gt 0 ]; then
+            echo "::warning::A nightly build of ${head:0:7} already ran or is running, and nothing from it is on the site. Not starting another; run Build all with publish by hand to retry."
+            exit 0
+          fi
+
+          gh workflow run build_all.yml --ref main -f publish=true
+          echo "Started Build all on main (${head:0:7}) with publish."
