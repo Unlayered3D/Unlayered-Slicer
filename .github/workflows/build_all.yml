@@ -49,7 +49,7 @@ on:
         type: boolean
         default: false
       publish:
-        description: 'Dev repository only: publish the installers to unlayered3d.com /software/beta (see .github/publish/README.md)'
+        description: 'Dev repository only: publish the installers to unlayered3d.com's dev channel (see .github/publish/README.md)'
         type: boolean
         default: false
 

@@ -6,17 +6,20 @@
 //   node scripts/publish-software.mjs publish --platform <windows|mac|linux> [--arch <arch>] --version <v>
 //        [--commit <sha>] [--branch <name>] [--build-url <actions run url>] [--notes-file <md>] [--prerelease] <file>
 //
-//   --site <url>   default https://unlayered3d.com (or $UNLAYERED_SITE)
+//   --site <url>              default https://unlayered3d.com (or $UNLAYERED_SITE)
+//   --expect-channel <name>   fail, before uploading anything, unless the token is for this channel
 //
 // The token is read from $UNLAYERED_SOFTWARE_PUBLISH_TOKEN and is never printed. WHICH token it is
 // decides the channel: the public Unlayered-Slicer repo's token publishes stable (/software), the
-// private unlayered-slicer-dev repo's publishes dev (/software/beta). The script asks the site
-// which one it holds; there is no --channel flag to get wrong.
+// private unlayered-slicer-dev repo's publishes dev (admins only), and the staging token a release
+// run in staging mode (admins only). The script asks the site which one it holds; there is no
+// --channel flag to get wrong. --expect-channel only checks: a release run passes it so a secret
+// holding the wrong token fails instead of publishing somewhere unexpected.
 //
 // Publishing the same version, filename and size that is already live is a no-op, so re-running a
 // CI job is safe.
 //
-// Dev builds are kept (the last 30 versions) and listed on /software/beta by version, with
+// Dev builds are kept (the last 30 versions) and listed on /admin/software by version, with
 // --branch shown beside each, so builds from different branches can be told apart.
 //
 // --arch: windows x64|arm64, mac universal, linux x64|arm64. Left out, the platform's default
@@ -49,7 +52,7 @@ function die(msg) {
   throw new Fail(msg);
 }
 
-const VALUE_FLAGS = ["--site", "--platform", "--arch", "--version", "--commit", "--branch", "--build-url", "--notes-file"];
+const VALUE_FLAGS = ["--site", "--platform", "--arch", "--version", "--commit", "--branch", "--build-url", "--notes-file", "--expect-channel"];
 const BOOLEAN_FLAGS = ["--prerelease", "--json"];
 const argv = process.argv.slice(2);
 const opts = {};
@@ -105,8 +108,15 @@ function contentTypeFor(name) {
   return "application/octet-stream";
 }
 
+// The token's channel, as the site reports it, checked against --expect-channel.
+function checkChannel(channel) {
+  const want = opts["expect-channel"];
+  if (want && channel !== want) die(`this token publishes to ${channel}, not ${want}: check which secret holds it`);
+}
+
 async function list() {
   const { channel, installers } = await api("GET", "installers");
+  checkChannel(channel);
   // For CI to read, e.g. the nightly build's "is main's HEAD already published?" check.
   if (opts.json) {
     console.log(JSON.stringify({ channel, installers }));
@@ -135,6 +145,7 @@ async function publish(file) {
   if (notesFile && !fs.existsSync(notesFile)) die(`no such notes file: ${notesFile}`);
   const releaseNotes = notesFile ? fs.readFileSync(notesFile, "utf8") : undefined;
   const { channel, installers } = await api("GET", "installers");
+  checkChannel(channel);
 
   const live = installers.find((i) => i.platform === platform && i.arch === arch);
   if (live && live.version === version && live.filename === filename && live.fileSizeBytes === data.length) {

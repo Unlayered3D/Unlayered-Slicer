@@ -10,21 +10,29 @@ name: Release
 # prerelease. A single alphanumeric prerelease identifier, no dots. version.inc must already say the
 # same version, minus the leading "v".
 #
+# Three modes. A tag push is always `release`; a run by hand picks one:
+#   dry-run  build the installer and keep it as an artifact; publish nothing.
+#   staging  the whole release flow, landing where nobody downloads it: the site's staging channel
+#            (admins only on /admin/software, never /software or the update check) and a DRAFT
+#            GitHub Release, which only maintainers see. Any branch or tag. Delete the draft after.
+#   release  the real thing, from a tag.
+#
 # The same file runs in the private Dev repository and the public one, which gets it in each source
 # snapshot (see .github/publish/README.md). Releases are built and published by the public
-# repository only, where Actions minutes are free. In Dev a tag push builds nothing, and a run by
-# hand must be a dry run: Dev's publish token is the site's dev-channel one, so a release published
-# from there would land on /software/beta.
+# repository only, where Actions minutes are free. In Dev a tag push builds nothing and a run by hand
+# can't be `release`: Dev's publish token is the site's dev-channel one. Staging runs anywhere the
+# UNLAYERED_SOFTWARE_STAGING_TOKEN secret is set.
 
 on:
   push:
     tags: ['v*']
   workflow_dispatch:
     inputs:
-      dry_run:
-        description: 'Build the installer as an artifact, but publish nothing'
-        type: boolean
-        default: true
+      mode:
+        description: 'dry-run: build only. staging: publish to staging + a draft GitHub Release. release: publish for real (run it on the tag).'
+        type: choice
+        options: [dry-run, staging, release]
+        default: dry-run
 
 permissions:
   contents: write # the GitHub Release
@@ -36,9 +44,7 @@ concurrency:
 
 env:
   PUBLIC_REPO: Unlayered3D/Unlayered-Slicer
-  # A tag push, or a by-hand run on a tag with dry_run off. (On a push there are no inputs, so
-  # !inputs.dry_run is true.)
-  RELEASING: ${{ github.ref_type == 'tag' && !inputs.dry_run }}
+  MODE: ${{ github.event_name == 'push' && 'release' || inputs.mode }}
 
 jobs:
   windows:
@@ -57,9 +63,15 @@ jobs:
           exit 1
 
       - name: Guard against releasing from the Dev repository
-        if: env.RELEASING == 'true' && github.repository != env.PUBLIC_REPO
+        if: env.MODE == 'release' && github.repository != env.PUBLIC_REPO
         run: |
-          echo "::error::Releases are published from ${{ env.PUBLIC_REPO }}. Here, run this with dry_run on."
+          echo "::error::Releases are published from ${{ env.PUBLIC_REPO }}. Here, run this as dry-run or staging."
+          exit 1
+
+      - name: Guard against a release that isn't from a tag
+        if: env.MODE == 'release' && github.ref_type != 'tag'
+        run: |
+          echo "::error::A release is published from its tag: pick the tag under Use workflow from, or push it. To try a branch, use staging."
           exit 1
 
       - name: Checkout
@@ -248,49 +260,58 @@ jobs:
           path: build/src/Release/Unlayered_Slicer_PDB_V${{ steps.version.outputs.ver_pure }}_for_developers_only.7z
           if-no-files-found: warn
 
-      # The release is the site's stable build: /software's Windows download, and -- because the
-      # site builds /slicer/latest.json from it -- the update every installed copy is offered.
-      # Needs the UNLAYERED_SOFTWARE_PUBLISH_TOKEN secret (the site's stable publish token; see
-      # .github/publish/README.md).
+      # A release is the site's stable build: /software's Windows download, and -- because the site
+      # builds /slicer/latest.json from it -- the update every installed copy is offered. Staging
+      # publishes the same way to the staging channel. The token decides the channel; the secret
+      # holding it depends on the mode, and --expect-channel fails the run, before uploading, if that
+      # secret holds the wrong one. See .github/publish/README.md.
       - name: Publish to unlayered3d.com
-        if: env.RELEASING == 'true'
+        if: env.MODE != 'dry-run'
         working-directory: ${{ github.workspace }}
         shell: bash
         env:
           UNLAYERED_SITE: ${{ vars.UNLAYERED_SITE || 'https://unlayered3d.com' }}
-          UNLAYERED_SOFTWARE_PUBLISH_TOKEN: ${{ secrets.UNLAYERED_SOFTWARE_PUBLISH_TOKEN }}
+          UNLAYERED_SOFTWARE_PUBLISH_TOKEN: ${{ env.MODE == 'staging' && secrets.UNLAYERED_SOFTWARE_STAGING_TOKEN || secrets.UNLAYERED_SOFTWARE_PUBLISH_TOKEN }}
+          SECRET_NAME: ${{ env.MODE == 'staging' && 'UNLAYERED_SOFTWARE_STAGING_TOKEN' || 'UNLAYERED_SOFTWARE_PUBLISH_TOKEN' }}
+          CHANNEL: ${{ env.MODE == 'staging' && 'staging' || 'stable' }}
           VERSION: ${{ steps.version.outputs.ver_pure }}
           PRERELEASE: ${{ steps.version.outputs.prerelease }}
         run: |
           if [ -z "$UNLAYERED_SOFTWARE_PUBLISH_TOKEN" ]; then
-            echo "::error::The UNLAYERED_SOFTWARE_PUBLISH_TOKEN secret is not set, so the release can't go to unlayered3d.com (and no GitHub Release is made). See .github/publish/README.md."
+            echo "::error::The $SECRET_NAME secret is not set, so this can't go to unlayered3d.com (and no GitHub Release is made). See .github/publish/README.md."
             exit 1
           fi
           npm install --prefix .github/publish --no-audit --no-fund --no-package-lock
-          args=(--platform windows --arch x64 --version "$VERSION" --commit "$GITHUB_SHA"
+          args=(--expect-channel "$CHANNEL" --platform windows --arch x64 --version "$VERSION" --commit "$GITHUB_SHA"
                 --build-url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID")
           [ -f release-notes.md ] && args+=(--notes-file release-notes.md)
           [ "$PRERELEASE" = true ] && args+=(--prerelease)
           node .github/publish/publish-software.mjs publish "${args[@]}" "build/Unlayered_Slicer_Windows_Installer_V$VERSION.exe"
-          node .github/publish/publish-software.mjs list
+          node .github/publish/publish-software.mjs list --expect-channel "$CHANNEL"
 
       # Downloads come from unlayered3d.com only, so the GitHub Release carries the tag and the
       # changelog but no files -- just a link to the site. It's created after the site publish, so
-      # it never points at a download that isn't there.
+      # it never points at a download that isn't there. Staging makes a draft under its own tag name,
+      # so it can never be mistaken for, or collide with, the real release; publishing a draft by
+      # mistake would create that staging-* tag, nothing more.
       - name: Publish the GitHub Release
-        if: env.RELEASING == 'true'
+        if: env.MODE != 'dry-run'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.version.outputs.tag }}
+          tag_name: ${{ env.MODE == 'staging' && format('staging-{0}-run{1}', steps.version.outputs.tag, github.run_number) || steps.version.outputs.tag }}
+          name: ${{ env.MODE == 'staging' && format('STAGING {0} (run {1})', steps.version.outputs.tag, github.run_number) || steps.version.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          draft: ${{ env.MODE == 'staging' }}
           prerelease: ${{ steps.version.outputs.prerelease == 'true' }}
           generate_release_notes: true
           body: |
-            **Download Unlayered Slicer from [unlayered3d.com/software](https://unlayered3d.com/software).** Installed copies are offered this update automatically.
+            ${{ env.MODE == 'staging' && format('**Staging run, not a release.** Delete this draft once you have checked it. The build is in staging on unlayered3d.com/admin/software. [CI run]({0}/{1}/actions/runs/{2})', github.server_url, github.repository, github.run_id) || '**Download Unlayered Slicer from [unlayered3d.com/software](https://unlayered3d.com/software).** Installed copies are offered this update automatically.' }}
 
       # The installer is on the site now; the run's copies would be a second, public download.
       # A dry run keeps them, since that's how a dry run's build is inspected. The debug symbols stay.
+      # Staging deletes them too, as a release would.
       - name: Delete the run's artifacts
-        if: env.RELEASING == 'true'
+        if: env.MODE != 'dry-run'
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
