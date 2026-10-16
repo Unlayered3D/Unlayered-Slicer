@@ -1,0 +1,32 @@
+{
+	"axis_selection": "virtual",
+	"enable_nonplanar": "1",
+	"from": "system",
+	"inherits": "Elegoo Centauri Carbon 0.4 nozzle",
+	"name": "Elegoo Centauri Carbon 0.4 - Experimental nonplanar 5deg",
+	"nonplanar_approach_distance": "2",
+	"nonplanar_departure_distance": "2",
+	"nonplanar_gantry_height": "14",
+	"nonplanar_hotend_angle_xneg": "10",
+	"nonplanar_hotend_angle_xpos": "7",
+	"nonplanar_hotend_angle_yneg": "6",
+	"nonplanar_hotend_angle_ypos": "15",
+	"nonplanar_hotend_cone_height": "125",
+	"nonplanar_virtual_max_angle": "5",
+	"nonplanar_virtual_max_z": "100",
+	"printer_extruder_id": [
+		"1"
+	],
+	"printer_extruder_variant": [
+		"Direct Drive Standard"
+	],
+	"type": "machine",
+	"nozzle_diameter": [
+		"0.4"
+	],
+	"belt_printer": "0",
+	"instantiation": "true",
+	"setting_id": "hhuaVotbTT9XWTgU",
+	"default_print_profile": "0.20mm @Elegoo CC 0.4 - Experimental nonplanar",
+	"printer_notes": "Experimental fixed-upright-nozzle nonplanar trial. Fusion height check 2026-10-12: stock printable height 256 mm; raw CAD joint maximum tip-to-bed separation 260.300377 mm. Owner reports installed 0.4 mm toolhead dimensions and Z travel match CAD. No universal safe object height follows: budget the highest deposition, travel/lift, startup, parking and firmware motion for the actual job. The 100 mm setting is a software nozzle-Z ceiling, not 100 mm object height; current upstream print-height checking excludes custom startup/end scripts. Keep the first simple-ramp trial below 10 mm with 2 mm approach/departure. Gantry proxy 14 mm is relative to the nozzle, not maximum object height. See resources/profiles/Elegoo/NONPLANAR_CENTAURI.md. Prior trial reported transition/support/stringing defects; no contact noticed."
+}

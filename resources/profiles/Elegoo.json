@@ -1,6 +1,6 @@
 {
     "name": "Elegoo",
-    "version": "02.04.00.07",
+    "version": "02.04.00.09",
     "force_update": "0",
     "description": "Elegoo configurations",
     "machine_model_list": [
@@ -1161,6 +1161,14 @@
         {
             "name": "0.30mm Fine @Elegoo Giga 1.0 nozzle",
             "sub_path": "process/EOSGIGA/0.30mm Fine @Elegoo Giga 1.0 nozzle.json"
+        },
+        {
+            "name": "0.20mm @Elegoo CC 0.4 - Experimental nonplanar",
+            "sub_path": "process/ECC/0.20mm @Elegoo CC 0.4 - Experimental nonplanar.json"
+        },
+        {
+            "name": "0.10mm @Elegoo CC 0.2 - Experimental nonplanar",
+            "sub_path": "process/ECC/0.10mm @Elegoo CC 0.2 - Experimental nonplanar.json"
         }
     ],
     "filament_list": [
@@ -2541,6 +2549,14 @@
         {
             "name": "Elegoo Neptune 0.8 nozzle",
             "sub_path": "machine/EN2SERIES/Elegoo Neptune 0.8 nozzle.json"
+        },
+        {
+            "name": "Elegoo Centauri Carbon 0.4 - Experimental nonplanar 5deg",
+            "sub_path": "machine/ECC/Elegoo Centauri Carbon 0.4 - Experimental nonplanar 5deg.json"
+        },
+        {
+            "name": "Elegoo Centauri Carbon 0.2 - Experimental nonplanar 5deg",
+            "sub_path": "machine/ECC/Elegoo Centauri Carbon 0.2 - Experimental nonplanar 5deg.json"
         }
     ]
 }

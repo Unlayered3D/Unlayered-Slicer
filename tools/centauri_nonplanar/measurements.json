@@ -1,0 +1,211 @@
+{
+  "date": "2026-10-10",
+  "source": "Live imported OpenCentauri assembly in Fusion",
+  "upstream_cad_commit_observed": "c63a80d3026bf582296c6372a716c6e80fd5bbae",
+  "live_assembly_matches_commit": "Unverified",
+  "coordinates": "Nozzle tip origin; +X right, +Y back, +Z up. Physical axis verification pending.",
+  "method": "Full toolhead mesh projection with refined low cowling meshes; terminal nozzle contact band excluded from macro limits.",
+  "numerical_angle_uncertainty_deg": 0.05,
+  "physical_geometry_uncertainty": "Owner reported 2026-10-12 that installed 0.4 mm toolhead dimensions and Z travel match CAD; measurement precision and dynamic clearance were not supplied. 0.2 mm geometry remains unverified.",
+  "cardinal_collision_geometry": [
+    {
+      "uphill_direction": "+X",
+      "component": "XY_Assm:1+Toolhead:1+cowling:1+front cowling:1+挤出头磁吸风道壳:1",
+      "point_mm_from_nozzle": [
+        24.030668823884383,
+        0.6396920391873664,
+        3.7703362171881736
+      ],
+      "h_mm": 3.7703362171881736,
+      "d_mm": 24.030668823884383,
+      "nominal_first_contact_angle_deg": 8.916834029783779,
+      "same_point_angle_for_0p5mm_normal_gap_deg": 7.73902015015348
+    },
+    {
+      "uphill_direction": "-X",
+      "component": "XY_Assm:1+Toolhead:1+cowling:1+front cowling:1+挤出头磁吸风道壳:1",
+      "point_mm_from_nozzle": [
+        -17.35566607220329,
+        9.639692992861654,
+        3.6967554753058494
+      ],
+      "h_mm": 3.6967554753058494,
+      "d_mm": 17.35566607220329,
+      "nominal_first_contact_angle_deg": 12.024302254667083,
+      "same_point_angle_for_0p5mm_normal_gap_deg": 10.409668476205107
+    },
+    {
+      "uphill_direction": "+Y",
+      "component": "XY_Assm:1+Toolhead:1+cowling:1+挤出头后壳:1",
+      "point_mm_from_nozzle": [
+        32.176583679180965,
+        44.401112699526294,
+        13.06022207631861
+      ],
+      "h_mm": 13.06022207631861,
+      "d_mm": 44.401112699526294,
+      "nominal_first_contact_angle_deg": 16.390812659098692,
+      "same_point_angle_for_0p5mm_normal_gap_deg": 15.771815733517627
+    },
+    {
+      "uphill_direction": "-Y",
+      "component": "XY_Assm:1+Toolhead:1+cowling:1+front cowling:1+挤出头磁吸风道壳:1",
+      "point_mm_from_nozzle": [
+        -15.820141942335738,
+        -34.03736999541958,
+        4.196914738916746
+      ],
+      "h_mm": 4.196914738916746,
+      "d_mm": 34.03736999541958,
+      "nominal_first_contact_angle_deg": 7.02926949655295,
+      "same_point_angle_for_0p5mm_normal_gap_deg": 6.193906104820134
+    }
+  ],
+  "five_degree_front_coupon_validation": {
+    "angle_deg": 5.0,
+    "uphill_direction": "-Y (front)",
+    "machine_footprint_mm": [
+      20.0,
+      30.0
+    ],
+    "top_z_range_mm": [
+      3.0,
+      5.624659905777721
+    ],
+    "watertight": true,
+    "consistent_winding": true,
+    "volume_mm3": 2587.3980045318604,
+    "macro_toolhead_front_plane_clearance": {
+      "component_path": "XY_Assm:1+Toolhead:1+cowling:1+front cowling:1+挤出头磁吸风道壳:1",
+      "point_mm_from_nozzle": [
+        -15.199240357710494,
+        -33.95855834991177,
+        4.189576215052
+      ],
+      "normal_gap_mm": 1.2139502370598354
+    },
+    "allowance_mm": 0.5,
+    "front_plane_residual_after_allowance_mm": 0.7139502370598354,
+    "all_azimuth_5deg_minimum_gap_mm": 0.5838106488639125,
+    "simplified_envelope_worst_direction_cap_deg": 4.565150733073652,
+    "proposed_upper_cap_normal_thickness_mm": 0.6,
+    "proposed_cut_plane_z_at_coupon_center_mm": 3.710038050362852,
+    "proposed_cut_plane_equation": "z = 3.710038050 - y*tan(5 deg), coupon centered at x=y=0",
+    "substrate_assumption_nozzle_vertical_standoff_mm": 0.2,
+    "nozzle_flat_rim_gap_to_prior_solid_plane_mm": 0.1774500039314346,
+    "proposed_raised_travel_z_mm": 8,
+    "raised_travel_vertical_gap_above_top_mm": 2.3753400942222793,
+    "validation_scope": "Watertight STL and full CAD mesh plane clearance only. No Unlayered slice, G-code, actual transitions, firmware, physical fit, thermal behavior or print quality validated.",
+    "sha256": "f65373d982a684240fca7adb33277ee7d16236630be65d7ea2e06cd9abe5a94c",
+    "nozzle_0p2_clearance_status": "Macro envelope carried over conditionally; physical geometry and tip position unverified.",
+    "hypothetical_0p10_vertical_standoff_tip_rim_normal_gap_mm": 0.07783053412226001
+  },
+  "four_part_slice": {
+    "date": "2026-10-10",
+    "slicer": "Unlayered0.1.2",
+    "nozzle_mm": 0.4,
+    "material_profile": "Elegoo PETG",
+    "layer_height_mm": 0.2,
+    "native_hotend_check": "clear",
+    "physical_print": "not performed or reported",
+    "max_total_explicit_gcode_z_mm": 100,
+    "test_models_max_height_below_mm": 10,
+    "max_deposition_z_mm": 9.608,
+    "coupon_support_reduction_percent": 63.26344687665218,
+    "height_correction": "Earlier10mm total-height cap included end parking and rejected slice; corrected100mm is not100mm nonplanar object capacity.",
+    "details": "comparison/comparison_slice_results.json"
+  },
+  "curved_support_free_variant": {
+    "date": "2026-10-10",
+    "project": "comparison/Centauri_FOUR_object_AB_curved_support_free.3mf",
+    "native_hotend_check": "clear after reopen and re-slice",
+    "physical_print": "First trial reported with defects; exact project used unconfirmed. See physical_trial_report.",
+    "only_setting_change": "B curved Enable support OFF as object override",
+    "upper_layer_angle_deg": 5,
+    "layer_height_mm": 0.2,
+    "curve_support_mass_g": 0,
+    "coupon_support_reduction_percent": 63.26344687665,
+    "full_job_time_estimate": "42m2s",
+    "full_job_material_estimate_g": 11.87,
+    "transition_review": "First cap strip tip0.171–0.228mm above root deposition-tip height. Later frontiers advance about2.3mm; short bridging or sag remains possible. This is not physical success.",
+    "details": "comparison/support_free_curve_slice_results.json"
+  },
+  "physical_trial_report": {
+    "reported_date": "2026-10-10",
+    "status": "physical trial reported with defects; successful validation not established",
+    "exact_printed_project": "unconfirmed",
+    "installed_nozzle_material_firmware": "unconfirmed",
+    "broken_specimen": "planar coupon, owner correction",
+    "warping": "owner correction: no warping; seams change position between sections",
+    "issues": [
+      "nonplanar supports start in midair",
+      "excessive support adhesion",
+      "inclined block transition gap",
+      "stringing",
+      "cross-section seam discontinuity"
+    ],
+    "finish_benefit": "Inclined photo appears to show fewer, broader terrace bands; measured overall finish improvement not established.",
+    "measured_support_reduction": "not established",
+    "toolhead_contact_observations": "Owner noticed no nozzle/duct/shroud contact; fast movement made spare clearance difficult to judge. No measured running clearance.",
+    "physical_record": "comparison/Physical_Test_Record.md",
+    "followup_path_evidence": "comparison/reported_print_support_path_review.json",
+    "zero_point_two_mm_preset": "physically untested",
+    "photo_identification": {
+      "photo_6": "inclined block",
+      "photo_7": "planar block, confirmed by owner"
+    }
+  },
+  "height_check_2026_10_12": {
+    "source": "Read-only Fusion MCP inspection of saved CC version 1; no joint driven or model changed",
+    "assembly_repository_revision_verified": false,
+    "nozzle_tip_world_mm": [
+      -160.12000000007367,
+      161.34999999998234,
+      289.025
+    ],
+    "current_bed_top_world_z_mm": 119.72462301074579,
+    "current_nozzle_to_bed_separation_mm": 169.30037698925418,
+    "bed_slider_current_mm": -1.0,
+    "bed_slider_limits_mm": [
+      -175.0,
+      90.0
+    ],
+    "bed_slider_axis": [
+      0,
+      0,
+      -1
+    ],
+    "tip_to_bed_mapping": "H_mm = 170.300376989 + slider_mm",
+    "raw_joint_tip_to_bed_limits_mm": [
+      -4.69962301074582,
+      260.3003769892542
+    ],
+    "raw_joint_limit_qualification": "The negative endpoint permits nozzle/bed overlap; raw joint bounds alone do not verify an allowed motion range.",
+    "stock_printable_height_mm": 256.0,
+    "retained_software_nozzle_z_cap_mm": 100.0,
+    "approach_and_departure_mm": [
+      2.0,
+      2.0
+    ],
+    "simple_automatic_ramp_part_scope_mm": 10.0,
+    "nearby_lowest_heights_above_nozzle_mm": {
+      "carriage_pcb_fastener": 15.12292,
+      "carriage_plate": 16.74999,
+      "lower_x_rod": 34.25
+    },
+    "retained_gantry_proxy_mm": 14.0,
+    "owner_physical_report": {
+      "date": "2026-10-12",
+      "toolhead_dimensions_match_cad": true,
+      "z_travel_matches_cad": true,
+      "evidence_type": "Owner report; agent did not perform physical measurements",
+      "numerical_physical_endpoints_and_precision": "Not separately recorded"
+    },
+    "native_face_distance": "Numerical separation agrees; inconsistent witness points were not used for finite-face clearance",
+    "native_body_to_plane_check": "Failed RuntimeError 3 measurement failed; no native plane-clearance result claimed",
+    "custom_scripts": "Current upstream print-height checker excludes startup/end custom G-code; separate job/macro review required",
+    "maximum_safe_nonplanar_object_height_mm": null,
+    "height_budget_rule": "For every job motion: highest actual nozzle Z plus its required allowance must remain within verified usable travel; check whole-head collision against material already printed.",
+    "report": "tools/centauri_nonplanar/HEIGHT_CHECK_2026-10-12.md"
+  }
+}
