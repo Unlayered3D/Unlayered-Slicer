@@ -289,6 +289,18 @@ double virtual_tilt_limit_deg(const HotendEnvelope &envelope, double gantry_heig
 }
 
 // UNLAYERED_MOD — see the header.
+double virtual_tilt_limit_enforced_deg(const HotendEnvelope &envelope, double gantry_height_mm, double manual_max_deg,
+                                       double reach_mm, std::optional<double> tilt_azimuth_rad)
+{
+    const double derived = virtual_tilt_limit_deg(envelope, gantry_height_mm, reach_mm, tilt_azimuth_rad);
+    const double manual  = std::max(0., manual_max_deg);
+    // Whichever is stricter, ignoring the ones that are switched off (0 = not applied).
+    if (derived > 0. && manual > 0.)
+        return std::min(derived, manual);
+    return std::max(derived, manual);
+}
+
+// UNLAYERED_MOD — see the header.
 Vec3d bc_to_tool_axis(double angle_b, double angle_c)
 {
     const double cos_b = std::cos(angle_b);

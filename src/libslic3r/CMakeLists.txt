@@ -106,6 +106,8 @@ set(lisbslic3r_sources
     ContourZ.cpp
     CustomGCode.cpp
     CustomGCode.hpp
+    AutoPlanes.cpp
+    AutoPlanes.hpp
     CutPlaneSegmentation.cpp
     CutPlaneSegmentation.hpp
     CutUtils.cpp
@@ -249,6 +251,8 @@ set(lisbslic3r_sources
     GCode/ConflictChecker.hpp
     GCode/HotendCollisionCheck.cpp
     GCode/HotendCollisionCheck.hpp
+    GCode/MultiplanarAudit.cpp
+    GCode/MultiplanarAudit.hpp
     GCode/CoolingBuffer.cpp
     GCode/CoolingBuffer.hpp
     GCode/TimelapsePosPicker.cpp

@@ -9,6 +9,11 @@
 #include "slic3r/GUI/MsgDialog.hpp"
 #include "slic3r/GUI/Plater.hpp"
 #include "slic3r/GUI/Tab.hpp"
+#include "slic3r/GUI/Jobs/AutoPlanesJob.hpp"
+#include "slic3r/GUI/Jobs/Worker.hpp"
+#include "libslic3r/AutoPlanes.hpp"
+#include <boost/format.hpp>
+#include <boost/log/trivial.hpp>
 #include "slic3r/GUI/format.hpp"
 #include "slic3r/Utils/UndoRedo.hpp"
 #include "libslic3r/ClipperUtils.hpp"
@@ -829,6 +834,12 @@ void GLGizmoCutPlanes::on_set_state()
         // Leaving the gizmo: drop the chunk preview and make sure the real object is visible again.
         // Re-show only what on_render() hid: the unscoped form un-hides every volume (wipe tower
         // included) and resets forced colours scene-wide, which is not this gizmo's to touch.
+        // UNLAYERED_MOD -- a suggestion does not outlive the gizmo: cancel a running job, drop a pending one.
+        if (m_auto_job && ! m_auto_job->done.load())
+            wxGetApp().plater()->get_ui_job_worker().cancel();
+        m_auto_job.reset();
+        m_auto_result.reset();
+        m_auto_preview_planes.clear();
         m_preview_chunks = false;
         if (m_hidden_object != nullptr) {
             m_parent.toggle_model_objects_visibility(true, m_hidden_object, m_hidden_instance, m_hidden_volume);
@@ -855,6 +866,14 @@ void GLGizmoCutPlanes::on_set_state()
 void GLGizmoCutPlanes::data_changed(bool is_serializing)
 {
     GLGizmoCut3D::data_changed(is_serializing);
+    // Mesh edits, process/printer changes and undo/redo invalidate the private planning snapshot.
+    // A finished suggestion is subject to the same rule as a job still running.
+    if (m_auto_job) {
+        wxGetApp().plater()->get_ui_job_worker().cancel();
+        m_auto_job.reset();
+    }
+    if (m_auto_result)
+        discard_auto_planes();
     // The model may have changed under us (undo/redo, object moved/scaled, plane list edited):
     // re-derive the pose of the bound plane, or drop to free mode if it disappeared.
     sync_gizmo_from_active_plane();
@@ -867,6 +886,9 @@ void GLGizmoCutPlanes::data_changed(bool is_serializing)
 
 void GLGizmoCutPlanes::on_render()
 {
+    // UNLAYERED_MOD -- pick up a finished "Suggest planes" job (main thread, like the skeleton job).
+    poll_auto_planes();
+
     // The segment preview renders FIRST so the (translucent) plane quads drawn afterwards blend
     // over the segments instead of depth-masking them into invisibility.
     // Rebuild whenever the plane list the preview should show has changed -- which includes the
@@ -1275,6 +1297,8 @@ void GLGizmoCutPlanes::render_cut_plane_input_window(CutConnectors &connectors, 
             set_active_plane(-1); // pose stays where it is; edits were committed as they happened
     }
 
+    render_auto_planes_panel();
+
     if (! stack.planes.empty()) {
         ImGui::Separator();
 
@@ -1659,6 +1683,11 @@ std::vector<Slic3r::CutPlane> GLGizmoCutPlanes::effective_planes(bool *provision
     if (mo == nullptr)
         return {};
 
+    // UNLAYERED_MOD -- a pending automatic suggestion previews ITS partition, so the user sees the
+    // proposed sections before anything is written to the model.
+    if (! m_auto_preview_planes.empty())
+        return m_auto_preview_planes;
+
     std::vector<Slic3r::CutPlane> planes = mo->cut_planes.planes;
     if (! mo->cut_planes.enabled)
         // The stack is switched off: the slicer ignores it, and so does the preview. Note this
@@ -1761,8 +1790,10 @@ void GLGizmoCutPlanes::rebuild_segment_preview()
             }
         return;
     }
+    const AutoPlanes::Candidate *suggestion = m_auto_result ? m_auto_result->result.chosen_candidate() : nullptr;
+    const bool user_ordered = suggestion != nullptr ? suggestion->user_ordered : mo->cut_planes.user_ordered;
     segs = derive_cut_segments(merged, m_preview_planes, instance_matrix(), preview_min_segment_thickness(),
-                               mo->cut_planes.user_ordered, &m_preview_status, &pieces, mo->name);
+                               user_ordered, &m_preview_status, &pieces, mo->name);
     if (m_merged_scope == nullptr) {
         // Directed parts print as their own segments after the partition (or after a root made
         // of the undirected parts when there is no partition) -- show them the same way.
@@ -1852,6 +1883,221 @@ void GLGizmoCutPlanes::render_segment_preview()
         glsafe(::glDisable(GL_DEPTH_TEST));
     if (prev_blend)
         glsafe(::glEnable(GL_BLEND));
+}
+
+
+// ---------------------------------------------------------------------------------------------
+// UNLAYERED_MOD -- "Suggest planes": automatic, printer-aware plane selection.
+// ---------------------------------------------------------------------------------------------
+
+void GLGizmoCutPlanes::start_auto_planes()
+{
+    ModelObject *mo = selected_model_object();
+    if (mo == nullptr || mo->instances.empty())
+        return;
+    int inst = m_c->selection_info()->get_active_instance();
+    if (inst < 0 || inst >= int(mo->instances.size()))
+        inst = 0;
+
+    // A private deep copy: the worker must never touch the live model.
+    auto copy = std::make_unique<Model>();
+    copy->add_object(*mo);
+
+    AutoPlanes::Options opt;
+    opt.preference    = m_auto_preference == 1 ? AutoPlanes::Preference::Supports
+                      : m_auto_preference == 2 ? AutoPlanes::Preference::Finish
+                                               : AutoPlanes::Preference::Balanced;
+    opt.keep_existing = m_auto_keep_existing;
+
+    Worker &worker = wxGetApp().plater()->get_ui_job_worker();
+    worker.cancel();
+    discard_auto_planes();
+    m_auto_job = std::make_shared<AutoPlanesJobState>();
+    m_auto_job->source_id    = mo->id();
+    m_auto_job->instance_idx = inst;
+    m_auto_job->instance_id  = mo->instances[size_t(inst)]->id();
+    m_auto_job->source_trafo = mo->instances[size_t(inst)]->get_matrix();
+    m_auto_job->source_stack = mo->cut_planes;
+    m_auto_job->keep_existing = opt.keep_existing;
+    {
+        std::lock_guard<std::mutex> lk(m_auto_job->mtx);
+        m_auto_job->stage = _u8L("starting");
+    }
+    replace_job(worker, std::make_unique<AutoPlanesJob>(std::move(copy), mo->instances[inst]->get_matrix(),
+                                                        wxGetApp().preset_bundle->full_config(), opt, m_auto_job));
+    m_parent.request_extra_frame();
+}
+
+void GLGizmoCutPlanes::poll_auto_planes()
+{
+    if (! m_auto_result && ! m_auto_job)
+        return;
+    const ModelObject *mo = selected_model_object();
+    const auto *selection = m_c->selection_info();
+    const int instance = selection != nullptr ? selection->get_active_instance() : -1;
+    if (m_auto_result && ! m_auto_result->matches(mo, instance))
+        discard_auto_planes();
+    if (! m_auto_job)
+        return;
+    if (! m_auto_job->matches(mo, instance)) {
+        wxGetApp().plater()->get_ui_job_worker().cancel();
+        m_auto_job.reset();
+        return;
+    }
+    if (! m_auto_job->done.load()) {
+        m_parent.request_extra_frame();   // keep the progress line moving
+        return;
+    }
+    AutoPlanesJobStatePtr st;
+    st.swap(m_auto_job);
+    if (st->canceled.load())
+        return;
+    if (st->failed.load()) {
+        std::lock_guard<std::mutex> lk(st->mtx);
+        BOOST_LOG_TRIVIAL(error) << "Auto planes failed: " << st->error;
+        return;
+    }
+    // Drop a result that no longer matches what is selected, or an object edited meanwhile.
+    m_auto_result = st;
+    const AutoPlanes::Candidate *c = st->result.chosen_candidate();
+    if (c != nullptr) {
+        // Preview the suggested partition with section colours, whatever the colour setting is.
+        m_auto_prev_preview_chunks = m_preview_chunks;
+        for (const AutoPlanes::PlannedPlane &pp : c->planes)
+            m_auto_preview_planes.push_back(pp.plane);
+        m_preview_chunks = true;
+        m_preview_valid  = false;
+    }
+    m_parent.request_extra_frame();
+}
+
+void GLGizmoCutPlanes::discard_auto_planes()
+{
+    const bool had_preview = ! m_auto_preview_planes.empty();
+    m_auto_result.reset();
+    m_auto_preview_planes.clear();
+    if (had_preview) {
+        m_preview_chunks = m_auto_prev_preview_chunks;
+        if (! m_preview_chunks && m_hidden_object != nullptr) {
+            m_parent.toggle_model_objects_visibility(true, m_hidden_object, m_hidden_instance, m_hidden_volume);
+            m_hidden_object   = nullptr;
+            m_hidden_instance = -1;
+            m_hidden_volume   = nullptr;
+        }
+    }
+    m_preview_valid = false;
+    m_parent.request_extra_frame();
+}
+
+void GLGizmoCutPlanes::apply_auto_planes()
+{
+    ModelObject *mo = selected_model_object();
+    // Keep the state alive through snapshot/model callbacks, which may invalidate the member.
+    const AutoPlanesJobStatePtr state = m_auto_result;
+    const auto *selection = m_c->selection_info();
+    if (! state || ! state->matches(mo, selection != nullptr ? selection->get_active_instance() : -1)) {
+        discard_auto_planes();
+        return;
+    }
+    const AutoPlanes::Candidate *c = state->result.chosen_candidate();
+    if (c == nullptr) {
+        discard_auto_planes();
+        return;
+    }
+    {
+        // One snapshot: Undo restores exactly the stack the user had.
+        Plater::TakeSnapshot snapshot(wxGetApp().plater(), _u8L("Apply suggested cut planes"), UndoRedo::SnapshotType::GizmoAction);
+        const bool first = ! mo->cut_planes.active();
+        mo->cut_planes   = AutoPlanes::stack_for(mo->cut_planes, *c, state->keep_existing);
+        m_active_plane   = -1;
+        m_contours_dirty = true;
+        if (first)
+            offer_by_group_sequence(_L("Cut-plane printing requires the \"By group\" print sequence. Change the current process setting to \"By group\" now?"));
+    }
+    discard_auto_planes();
+    schedule_background_process();
+    if (wxGetApp().obj_list())
+        wxGetApp().obj_list()->update_info_items(size_t(std::max(0, m_parent.get_selection().get_object_idx())));
+}
+
+void GLGizmoCutPlanes::render_auto_planes_panel()
+{
+    ImGui::Separator();
+    m_imgui->text(_L("Auto planes"));
+    const float wrap = 26.f * ImGui::GetFontSize();
+
+    // Running: progress and Cancel.
+    if (m_auto_job && ! m_auto_job->done.load()) {
+        m_imgui->text(GUI::format(_L("Working: %1% (%2%%%)"), m_auto_job->stage_copy(), m_auto_job->percent.load()));
+        if (m_imgui->button(_L("Cancel")))
+            wxGetApp().plater()->get_ui_job_worker().cancel();
+        return;
+    }
+
+    // A result awaiting a decision.
+    if (m_auto_result) {
+        const AutoPlanes::PlanResult &r = m_auto_result->result;
+        m_imgui->text_wrapped(r.decision, wrap);
+        m_imgui->text_colored(ImGuiWrapper::COL_GREY_DARK,
+            GUI::format(_L("Printer: %1%"), AutoPlanes::machine_kind_name(r.machine.kind)));
+        const AutoPlanes::Candidate *c = r.chosen_candidate();
+        if (c != nullptr) {
+            for (const AutoPlanes::PlannedPlane &pp : c->planes) {
+                if (pp.from_existing)
+                    continue;
+                m_imgui->text(GUI::format(_L("New plane (%1%): layers tilt %2% deg toward %3% deg, limit %4% deg"),
+                    pp.origin, (boost::format("%.1f") % pp.tilt_deg).str(), (boost::format("%.0f") % pp.azimuth_deg).str(),
+                    (boost::format("%.1f") % pp.limit_deg).str()));
+            }
+            m_imgui->text(GUI::format(_L("Estimated vs planar: support %1% -> %2% mm3, terrace edges %3% -> %4% mm"),
+                (boost::format("%.0f") % r.planar.predicted.support_volume_mm3).str(), (boost::format("%.0f") % c->predicted.support_volume_mm3).str(),
+                (boost::format("%.0f") % r.planar.predicted.terrace_length_mm).str(), (boost::format("%.0f") % c->predicted.terrace_length_mm).str()));
+            for (const std::string &b : c->benefits)
+                m_imgui->text_wrapped("+ " + b, wrap);
+            for (const std::string &l : c->limitations)
+                ImGuiWrapper::text_colored(ImGuiWrapper::COL_ORANGE_LIGHT, "! " + l);
+            m_imgui->text_colored(ImGuiWrapper::COL_GREY_DARK,
+                _L("Estimates come from the mesh, not from slicing. Slice and check the preview before printing."));
+
+            const bool has_existing = ! m_auto_result->source_stack.empty();
+            const wxString label = ! has_existing ? _L("Apply") : m_auto_result->keep_existing ?
+                                    _L("Add to my planes") : _L("Replace my planes");
+            if (m_imgui->button(label))
+                apply_auto_planes();
+            ImGui::SameLine();
+            if (m_imgui->button(_L("Discard")))
+                discard_auto_planes();
+        } else {
+            // Planar kept: show why the best rejected candidates were rejected, if any.
+            int shown = 0;
+            for (const AutoPlanes::Candidate &cand : r.candidates) {
+                if (cand.feasible || cand.rejections.empty() || shown >= 2)
+                    continue;
+                ImGuiWrapper::text_colored(ImGuiWrapper::COL_GREY_DARK, "x " + cand.rejections.front());
+                ++ shown;
+            }
+            if (m_imgui->button(_L("OK")))
+                discard_auto_planes();
+        }
+        return;
+    }
+
+    // Idle.
+    if (m_imgui->radio_button(_L("Balanced"), m_auto_preference == 0)) m_auto_preference = 0;
+    ImGui::SameLine();
+    if (m_imgui->radio_button(_L("Fewer supports"), m_auto_preference == 1)) m_auto_preference = 1;
+    ImGui::SameLine();
+    if (m_imgui->radio_button(_L("Surface finish"), m_auto_preference == 2)) m_auto_preference = 2;
+    const ModelObject *mo = selected_model_object();
+    if (mo != nullptr && ! mo->cut_planes.empty())
+        m_imgui->checkbox(_L("Keep my existing planes"), m_auto_keep_existing);
+    if (m_imgui->button(_L("Suggest planes")))
+        start_auto_planes();
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("%s", _u8L("Look for regions that would print with less support or fewer visible steps on "
+                                     "tilted flat layers, within this printer's tilt and clearance limits. Shows a "
+                                     "preview first; nothing changes until you apply it. Keeps planar printing when "
+                                     "no plan is worth a transition.").c_str());
 }
 
 } // namespace GUI

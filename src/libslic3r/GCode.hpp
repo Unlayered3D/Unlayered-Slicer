@@ -739,6 +739,11 @@ private:
         bool               has_floor = false;         // non-root segment: object contact above its floor
         SegmentSupportBounds floor;                   // slice-frame floor planes of that segment
         double             object_band = 0.;          // object_contact_layers * thickness
+        // UNLAYERED_MOD -- floor gap fill (see floor_gap_fill_split()): the section this one rests on,
+        // when it is a root printed on a flat bed (world z = its print_z), and the map from this
+        // section's slice frame into that root's slice frame. Null = no fill for this frame.
+        const PrintObject *fill_parent = nullptr;
+        Transform3d        child_to_parent = Transform3d::Identity();
     };
     ContactFrame                        m_contact_frame;
     PathContact                         m_path_contact;
@@ -752,6 +757,14 @@ private:
     // m_path_contact for the whole path and returns false.
     bool        classify_path_contact(const ExtrusionPath &path, std::vector<std::pair<ExtrusionPath, PathContact>> &parts);
     bool                                m_path_contact_locked = false;   // emitting the pieces of a split path
+    // UNLAYERED_MOD -- floor gap fill. A tilted section's bonding layer is clipped at a cut plane that
+    // is not parallel to its layers, and the section below ends on whole layers of its own, so the
+    // first tilted beads sit up to a layer above (or into) the material they should bond to. Each such
+    // bead is split into short pieces and each piece's flow and declared height are scaled so it
+    // reaches that material. m_floor_fill_scale is the factor for the piece being emitted (0 = none).
+    double                              m_floor_fill_scale = 0.;
+    bool                                m_floor_fill_locked = false;
+    bool        floor_gap_fill_split(const ExtrusionPath &path, std::vector<std::pair<ExtrusionPath, double>> &pieces);
     // Contact-aware replacements for on_first_layer() / layer_id() inside _extrude.
     bool        path_on_first_layer() const;
     int         path_first_layer_index() const;
