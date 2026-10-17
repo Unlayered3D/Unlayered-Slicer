@@ -1712,6 +1712,8 @@ bool PrintObject::invalidate_state_by_config_options(
             steps.emplace_back(posPerimeters);
         } else if (
                opt_key == "layer_height"
+            || opt_key == "curved_layer_blend"
+            || opt_key == "automatic_layer_strategy"
             || opt_key == "mmu_segmented_region_max_width"
             || opt_key == "mmu_segmented_region_interlocking_depth"
             || opt_key == "raft_layers"
@@ -1754,7 +1756,7 @@ bool PrintObject::invalidate_state_by_config_options(
             steps.emplace_back(posSlice);
         } else if (opt_key == "enable_support") {
             steps.emplace_back(posSupportMaterial);
-            if (m_config.support_top_z_distance == 0.) {
+            if (m_config.automatic_layer_strategy.value || m_config.support_top_z_distance == 0.) {
             	// Enabling / disabling supports while soluble support interface is enabled.
             	// This changes the bridging logic (bridging enabled without supports, disabled with supports).
             	// Reset everything.
@@ -1816,6 +1818,10 @@ bool PrintObject::invalidate_state_by_config_options(
             || opt_key == "tree_support_angle_slow"
             || opt_key == "tree_support_wall_count") {
             steps.emplace_back(posSupportMaterial);
+            // Automatic selection's underside report depends on this angle,
+            // even when the selected deposition field remains planar.
+            if(opt_key=="support_threshold_angle" && m_config.automatic_layer_strategy.value)
+                steps.emplace_back(posSlice);
         } else if (
                opt_key == "bottom_shell_layers"
             || opt_key == "top_shell_layers") {

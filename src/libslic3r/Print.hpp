@@ -8,6 +8,7 @@
 
 #include "BoundingBox.hpp"
 #include "CutPlaneSegmentation.hpp"
+#include "CurvedRamp.hpp"
 #include "Support/SupportDirection.hpp"
 #include "BeltBrim.hpp"   // BELT_MOD
 #include "ExtrusionEntityCollection.hpp"
@@ -499,6 +500,13 @@ public:
     // The height is snug.
     coord_t 				     height() const         { return m_size.z(); }
     double                      max_z() const         { return m_max_z; }
+    const std::shared_ptr<const CurvedTransition::Field>& curved_field() const { return m_curved_field; }
+    const std::optional<CurvedTransition::Ramp>& curved_ramp() const { return m_curved_ramp; }
+    const std::optional<CurvedTransition::ModelDomain>& curved_domain() const { return m_curved_domain; }
+    std::string curved_blend_error(bool automatic = false) const;
+    size_t curved_nozzle_index() const;
+    bool refine_curved_regions_for_paths();
+    const std::string& layer_strategy_decision() const { return m_layer_strategy_decision; }
     // Centering offset of the sliced mesh from the scaled and rotated mesh of the model.
     const Point& 			     center_offset() const  { return m_center_offset; }
 
@@ -727,6 +735,13 @@ private:
     // See object_to_slice(). Kept in sync with m_post_trafo by update_slice_frame().
     Transform3d m_object_to_slice = Transform3d::Identity();
     Transform3d m_slice_to_object = Transform3d::Identity();
+    std::shared_ptr<const CurvedTransition::Field> m_curved_field;
+    std::optional<CurvedTransition::Ramp> m_curved_ramp;
+    std::optional<CurvedTransition::ModelDomain> m_curved_domain;
+    std::shared_ptr<const indexed_triangle_set> m_curved_mesh;
+    std::string m_layer_strategy_decision;
+    std::vector<Vec2d> m_curved_rejected_centres;
+    bool m_curved_planning_retry=false;
 
     // Declarative cut planes: segment descriptor, set by Print::apply right after construction.
     std::optional<CutSegmentDescriptor> m_segment;

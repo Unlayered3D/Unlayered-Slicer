@@ -233,6 +233,7 @@ private:
     // See GCodeProcessorResult::tool_axis_fixed.
     bool  m_tool_axis_fixed{ false };
     Vec3f m_fixed_tool_axis{ Vec3f::UnitZ() };
+    std::vector<std::string> m_layer_strategy_decisions;
 
     ConfigOptionMode m_user_mode;
     bool m_fold = {false};

@@ -266,7 +266,7 @@ GCodeInputData convert(const Slic3r::GCodeProcessorResult& result, const std::ve
                 // Declarative cut planes: a section boundary must start a new path too, or the
                 // first move of a section renders as one line continuing out of the previous
                 // section -- one colour spanning the cut plane.
-                || prev.cut_segment_id != curr.cut_segment_id) {
+                || prev.cut_segment_id != curr.cut_segment_id || prev.layer_mode != curr.layer_mode) {
                 // to allow libvgcode to properly detect the start/end of a path we need to add a 'phantom' vertex
                 // equal to the current one with the exception of the position, which should match the previous move position,
                 // and the times, which are set to zero
@@ -279,7 +279,8 @@ GCodeInputData convert(const Slic3r::GCodeProcessorResult& result, const std::ve
                     /* ORCA: Add Acceleration visualization support */ curr.acceleration,
                     /* ORCA: Add Jerk visualization support */ curr.jerk,
                     /* UNLAYERED_MOD: tilted-layer tool axis */ curr.tool_axis_id,
-                    /* cut planes: section id */ to_section_id(curr.cut_segment_id) };
+                    /* cut planes: section id */ to_section_id(curr.cut_segment_id),
+                    /* Native layer classification */ curr.layer_mode };
 #else
               const libvgcode::PathVertex vertex = { position(prev.position), curr.height, curr.width, curr.feedrate, prev.actual_feedrate,
                     curr.mm3_per_mm, curr.fan_speed, curr.temperature, convert(curr.extrusion_role), curr_type,
@@ -289,7 +290,8 @@ GCodeInputData convert(const Slic3r::GCodeProcessorResult& result, const std::ve
                     /* ORCA: Add Acceleration visualization support */ curr.acceleration,
                     /* ORCA: Add Jerk visualization support */ curr.jerk,
                     /* UNLAYERED_MOD: tilted-layer tool axis */ curr.tool_axis_id,
-                    /* cut planes: section id */ to_section_id(curr.cut_segment_id) };
+                    /* cut planes: section id */ to_section_id(curr.cut_segment_id),
+                    /* Native layer classification */ curr.layer_mode };
 #endif // VGCODE_ENABLE_COG_AND_TOOL_MARKERS
                 ret.vertices.emplace_back(vertex);
             }
@@ -305,7 +307,8 @@ GCodeInputData convert(const Slic3r::GCodeProcessorResult& result, const std::ve
             /* ORCA: Add Acceleration visualization support */ curr.acceleration,
             /* ORCA: Add Jerk visualization support */ curr.jerk,
             /* UNLAYERED_MOD: tilted-layer tool axis */ curr.tool_axis_id,
-            /* cut planes: section id */ to_section_id(curr.cut_segment_id) };
+            /* cut planes: section id */ to_section_id(curr.cut_segment_id),
+                    /* Native layer classification */ curr.layer_mode };
 #else
         const libvgcode::PathVertex vertex = { position(curr.position), curr.height, curr.width, curr.feedrate, curr.actual_feedrate,
             curr.mm3_per_mm, curr.fan_speed, curr.temperature, convert(curr.extrusion_role), curr_type,
@@ -315,7 +318,8 @@ GCodeInputData convert(const Slic3r::GCodeProcessorResult& result, const std::ve
             /* ORCA: Add Acceleration visualization support */ curr.acceleration,
             /* ORCA: Add Jerk visualization support */ curr.jerk,
             /* UNLAYERED_MOD: tilted-layer tool axis */ curr.tool_axis_id,
-            /* cut planes: section id */ to_section_id(curr.cut_segment_id) };
+            /* cut planes: section id */ to_section_id(curr.cut_segment_id),
+                    /* Native layer classification */ curr.layer_mode };
 #endif // VGCODE_ENABLE_COG_AND_TOOL_MARKERS
         ret.vertices.emplace_back(vertex);
     }

@@ -21,6 +21,10 @@ on:
           required: false
           type: boolean
           default: false
+        portable-review:
+          required: false
+          type: boolean
+          default: false
 
 jobs:
   build_orca:
@@ -176,7 +180,7 @@ jobs:
         shell: bash
         # The bundle was already packed from resources/, so the caches have to be
         # installed into it here; the source tree keeps its JSONs for later jobs.
-        run: ./scripts/build_preset_cache.sh -b build/${{ inputs.arch }} build/${{ inputs.arch }}/UnlayeredSlicer/UnlayeredSlicer.app/Contents/Resources/profiles
+        run: ./scripts/build_preset_cache.sh --keep-json -b build/${{ inputs.arch }} build/${{ inputs.arch }}/UnlayeredSlicer/UnlayeredSlicer.app/Contents/Resources/profiles
 
       - name: Pack macOS app bundle ${{ inputs.arch }}
         if: runner.os == 'macOS' && !inputs.macos-combine-only
@@ -402,7 +406,36 @@ jobs:
         shell: cmd
         # Shipped into both the already-installed tree (portable zip, MSIX) and
         # the checkout cpack re-installs from when it builds the NSIS installer.
-        run: scripts\build_preset_cache.bat --prune-source "%BUILD_DIR%" "resources\profiles" "%BUILD_DIR%\UnlayeredSlicer\resources\profiles"
+        run: scripts\build_preset_cache.bat --keep-json "%BUILD_DIR%" "resources\profiles" "%BUILD_DIR%\UnlayeredSlicer\resources\profiles"
+
+      - name: Verify portable CLI preset inheritance Win
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $profileRoot = Join-Path $env:BUILD_DIR 'UnlayeredSlicer/resources/profiles'
+          foreach ($relative in @('Elegoo.json', 'Elegoo/machine/ECC/Elegoo Centauri Carbon 0.4 nozzle.json', 'Elegoo/process/ECC/0.20mm Standard @Elegoo CC 0.4 nozzle.json')) {
+            $presetPath = Join-Path $profileRoot $relative
+            if (!(Test-Path -LiteralPath $presetPath -PathType Leaf)) { throw "Missing stock profile required by CLI inheritance: $relative" }
+            Get-Content -LiteralPath $presetPath -Raw | ConvertFrom-Json | Out-Null
+          }
+
+      - name: Verify every stock catalog reference Win
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $profileRoot = Join-Path $env:BUILD_DIR 'UnlayeredSlicer/resources/profiles'
+          foreach ($catalog in Get-ChildItem -LiteralPath $profileRoot -Filter '*.json' -File -Force) {
+            $vendor = $catalog.BaseName
+            $document = Get-Content -LiteralPath $catalog.FullName -Raw | ConvertFrom-Json
+            foreach ($kind in @('machine_list','process_list','filament_list')) {
+              foreach ($entry in $document.$kind) {
+                if (-not $entry.sub_path) { continue }
+                $presetPath = Join-Path (Join-Path $profileRoot $vendor) $entry.sub_path
+                if (-not (Test-Path -LiteralPath $presetPath -PathType Leaf)) { throw "Missing stock preset: $vendor/$($entry.sub_path)" }
+                Get-Content -LiteralPath $presetPath -Raw | ConvertFrom-Json | Out-Null
+              }
+            }
+          }
 
       - name: Pack unit tests Win
         if: runner.os == 'Windows'
@@ -423,19 +456,19 @@ jobs:
       # NSIS is x86-only; it runs (and the installer it emits runs) under ARM64's
       # x86 emulation, packaging the native arm64 payload from build-arm64.
       - name: Create installer Win
-        if: runner.os == 'Windows' && !vars.SELF_HOSTED
+        if: runner.os == 'Windows' && !vars.SELF_HOSTED && !inputs.portable-review
         working-directory: ${{ github.workspace }}/${{ env.BUILD_DIR }}
         run: |
           cpack -G NSIS
 
       - name: Pack app
-        if: runner.os == 'Windows'
+        if: runner.os == 'Windows' && !inputs.portable-review
         working-directory: ${{ github.workspace }}/${{ env.BUILD_DIR }}
         shell: cmd
         run: '"C:/Program Files/7-Zip/7z.exe" a -tzip Unlayered_Slicer_Windows_${{ env.ver }}${{ env.ARCH_SUFFIX }}_portable.zip ${{ github.workspace }}/${{ env.BUILD_DIR }}/UnlayeredSlicer'
 
       - name: Pack PDB
-        if: runner.os == 'Windows' && inputs.arch != 'arm64' && !vars.SELF_HOSTED
+        if: runner.os == 'Windows' && inputs.arch != 'arm64' && !vars.SELF_HOSTED && !inputs.portable-review
         working-directory: ${{ github.workspace }}/${{ env.BUILD_DIR }}/src/Release
         shell: cmd
         run: '"C:/Program Files/7-Zip/7z.exe" a -m0=lzma2 -mx9 Debug_PDB_${{ env.ver }}_for_developers_only.7z  *.pdb'
@@ -446,9 +479,12 @@ jobs:
         with:
           name: Unlayered_Slicer_Windows_${{ env.ver }}${{ env.ARCH_SUFFIX }}_portable
           path: ${{ github.workspace }}/${{ env.BUILD_DIR }}/UnlayeredSlicer
+          # Dremel's stock preset filenames begin with a dot. The default
+          # artifact filter drops them and breaks the CLI's catalog loading.
+          include-hidden-files: true
 
       - name: Upload artifacts Win installer
-        if: runner.os == 'Windows' && !vars.SELF_HOSTED
+        if: runner.os == 'Windows' && !vars.SELF_HOSTED && !inputs.portable-review
         uses: actions/upload-artifact@v7
         with:
           name: Unlayered_Slicer_Windows_${{ env.ver }}${{ env.ARCH_SUFFIX }}
@@ -459,7 +495,7 @@ jobs:
           if-no-files-found: error
 
       - name: Upload artifacts Win PDB
-        if: runner.os == 'Windows' && inputs.arch != 'arm64' && !vars.SELF_HOSTED
+        if: runner.os == 'Windows' && inputs.arch != 'arm64' && !vars.SELF_HOSTED && !inputs.portable-review
         uses: actions/upload-artifact@v7
         with:
           name: PDB
@@ -476,7 +512,7 @@ jobs:
 
 
       - name: Build MSIX Store package Win
-        if: runner.os == 'Windows' && !vars.SELF_HOSTED
+        if: runner.os == 'Windows' && !vars.SELF_HOSTED && !inputs.portable-review
         working-directory: ${{ github.workspace }}
         shell: pwsh
         run: |
@@ -489,7 +525,7 @@ jobs:
             -PublisherDisplayName "${{ vars.ORCA_MSIX_PUBLISHER_DISPLAY_NAME || 'Unlayered 3D' }}"
 
       - name: Upload artifacts Win MSIX
-        if: runner.os == 'Windows' && !vars.SELF_HOSTED
+        if: runner.os == 'Windows' && !vars.SELF_HOSTED && !inputs.portable-review
         uses: actions/upload-artifact@v7
         with:
           name: Unlayered_Slicer_Windows_MSIX_${{ env.ver }}${{ env.ARCH_SUFFIX }}

@@ -711,6 +711,14 @@ void ConfigManipulation::apply_null_fff_config(DynamicPrintConfig *config, std::
 
 void ConfigManipulation::toggle_print_fff_options(DynamicPrintConfig *config, int variant_index, const bool is_global_config)
 {
+    // Match slicing precedence without rewriting a saved manual preference.
+    // This also uses the merged effective config for object/plate overrides.
+    const bool automatic_layers = config->opt_bool("automatic_layer_strategy");
+    toggle_field("curved_layer_blend", !automatic_layers);
+    set_option_label("curved_layer_blend", automatic_layers ?
+        _L("Manual curved layers (inactive: automatic is on)") :
+        _L("Manual curved layers (experimental)"));
+
     PresetBundle *preset_bundle  = wxGetApp().preset_bundle;
 
     const GCodeFlavor gcflavor = preset_bundle->printers.get_edited_preset().config.option<ConfigOptionEnum<GCodeFlavor>>("gcode_flavor")->value;

@@ -2554,6 +2554,7 @@ void GCodeProcessorResult::reset() {
     moves.clear();
     // UNLAYERED_MOD: index 0 must always exist and always be straight up.
     tool_axes.assign(1, Vec3f(0.0f, 0.0f, 1.0f));
+    layer_strategy_decisions.clear();
     virtual_5axis = false;
     lines_ends.clear();
     printable_area = Pointfs();
@@ -3378,8 +3379,11 @@ void GCodeProcessor::apply_config(const DynamicPrintConfig& config)
     const ConfigOptionPoints* extruder_offset = config.option<ConfigOptionPoints>("extruder_offset");
     const ConfigOptionBool* single_extruder_multi_material = config.option<ConfigOptionBool>("single_extruder_multi_material");
     if (extruder_offset != nullptr) {
-        //BBS: for single extruder multi material, only use the offset of first extruder
-        if (single_extruder_multi_material != nullptr && single_extruder_multi_material->getBool()) {
+        // A multi-nozzle machine may inherit the single-nozzle material flag.
+        // Its physical offsets must follow the filament map, as in live Preview.
+        // Retain the first-offset convention only for an actual single nozzle.
+        if (single_extruder_multi_material != nullptr && single_extruder_multi_material->getBool() &&
+            (nozzle_diameter == nullptr || nozzle_diameter->size() <= 1) && !extruder_offset->values.empty()) {
             Vec2f offset = extruder_offset->values[0].cast<float>();
             m_extruder_offsets.resize(m_result.filaments_count);
             for (size_t i = 0; i < m_result.filaments_count; ++i) {
@@ -3387,10 +3391,15 @@ void GCodeProcessor::apply_config(const DynamicPrintConfig& config)
             }
         }
         else {
-            m_extruder_offsets.resize(extruder_offset->values.size());
-            for (size_t i = 0; i < extruder_offset->values.size(); ++i) {
-                Vec2f offset = extruder_offset->values[i].cast<float>();
-                m_extruder_offsets[i] = { offset(0), offset(1), 0.0f };
+            // Preview indexes offsets by filament, while the profile stores
+            // them by physical nozzle. Apply the already zero-based map once.
+            m_extruder_offsets.assign(m_result.filaments_count,DEFAULT_EXTRUDER_OFFSET);
+            for(size_t i=0;i<m_result.filaments_count;++i) {
+                const int nozzle=i<m_filament_maps.size()?m_filament_maps[i]:int(i);
+                if(nozzle>=0 && size_t(nozzle)<extruder_offset->values.size()) {
+                    const Vec2f offset=extruder_offset->values[nozzle].cast<float>();
+                    m_extruder_offsets[i]={offset.x(),offset.y(),0.f};
+                }
             }
         }
     }
@@ -3635,6 +3644,8 @@ void GCodeProcessor::reset()
     // UNLAYERED_MOD
     m_tool_axis_id = 0;
     m_has_tool_axis_tag = false;
+    m_layer_mode = 0;
+    m_has_layer_mode_tag = false;
     m_last_bc_deg = { -90.0f, 0.0f };
     m_mm3_per_mm = 0.0f;
     m_travel_dist = 0.0f;
@@ -3730,6 +3741,11 @@ DynamicConfig GCodeProcessor::export_config_for_render() const
 void GCodeProcessor::process_file(const std::string& filename, std::function<void()> cancel_callback)
 {
     CNumericLocalesSetter locales_setter;
+
+    // Stand-alone, producer-unknown G-code has no embedded profile. Initialize
+    // its filament/nozzle tables before motion parsing, just as configured
+    // imports do. Keep an explicitly applied config intact.
+    if(m_result.filaments_count==0) apply_config(FullPrintConfig{});
 
     // pre-processing
     // parse the gcode file to detect its producer
@@ -4316,6 +4332,12 @@ bool GCodeProcessor::tool_axis_is_vertical() const
 
 void GCodeProcessor::process_tags(const std::string_view comment, bool producers_enabled)
 {
+    if(boost::starts_with(comment," layer_strategy: ")) {
+        // Untrusted G-code text is display data. Bound it before retaining it.
+        if(m_result.layer_strategy_decisions.size()<256)
+            m_result.layer_strategy_decisions.emplace_back(comment.substr(17,2048));
+        return;
+    }
     // producers tags
     if (producers_enabled && process_producers_tags(comment))
         return;
@@ -4455,6 +4477,14 @@ void GCodeProcessor::process_tags(const std::string_view comment, bool producers
     // since the last extrusion, which on nonplanar G-code jumping between islands is tens of mm, and
     // the viewer drew each bead that tall along the tool axis: giant blades sticking out of the part.
     if (!producers_enabled || m_producer == EProducer::OrcaSlicer || m_producer == EProducer::Unknown) {
+        // Native curved fields tag their mode explicitly. Invalid input resets
+        // to unknown so a stale curved state cannot bleed into later paths.
+        if (boost::starts_with(comment, "LAYER_MODE:")) {
+            unsigned int mode=0;
+            m_layer_mode=parse_number(comment.substr(11),mode) && mode<=2?uint8_t(mode):uint8_t(255);
+            m_has_layer_mode_tag=true;
+            return;
+        }
         // height tag
         if (boost::starts_with(comment, reserved_tag(ETags::Height))) {
             if (!parse_number(comment.substr(reserved_tag(ETags::Height).size()), m_forced_height))
@@ -6909,12 +6939,8 @@ void GCodeProcessor::ensure_nozzle_group_result(int min_filament_count)
         filament_map.resize(filament_count, filament_map.front());
     }
 
-    int min_value = *std::min_element(filament_map.begin(), filament_map.end());
-    if (min_value >= 1) {
-        for (int &value : filament_map) {
-            value -= 1;
-        }
-    }
+    // Both apply_config overloads already converted the stored 1-based map
+    // to zero-based nozzle indices. A job using only nozzle 2 must remain on 1.
 
     for (int &value : filament_map) {
         value = std::max(0, value);
@@ -7254,7 +7280,7 @@ void GCodeProcessor::store_move_vertex(EMoveType type, EMovePathType path_type, 
                                                                     get_acceleration(normal_mode));
     const float junction_deviation = get_option_value(m_time_processor.machine_limits.machine_max_junction_deviation, normal_mode_id);
     const bool use_jd_jerk = (m_flavor == gcfMarlinFirmware && junction_deviation > 0.0f);
-    const auto axis_jerk_for_preview = [this, use_jd_jerk, move_acceleration](Axis axis) {
+    const auto axis_jerk_for_preview = [this, use_jd_jerk, move_acceleration, normal_mode](Axis axis) {
         return use_jd_jerk ? get_axis_max_jerk_with_jd(normal_mode, axis, move_acceleration) : get_axis_max_jerk(normal_mode, axis);
     };
     const float jerk_x = axis_jerk_for_preview(X);
@@ -7311,7 +7337,8 @@ void GCodeProcessor::store_move_vertex(EMoveType type, EMovePathType path_type, 
         m_object_label_id,
         m_print_z,
         m_tool_axis_id,
-        m_cut_segment_id
+        m_cut_segment_id,
+        m_has_layer_mode_tag?m_layer_mode:(m_tool_axis_id==0?uint8_t(0):uint8_t(255))
     });
 
     if (type == EMoveType::Seam) {

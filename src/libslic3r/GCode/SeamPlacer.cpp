@@ -1495,6 +1495,128 @@ void SeamPlacer::init(const Print &print, std::function<void(void)> throw_if_can
     debug_export_points(m_seam_per_object[po].layers, po->bounding_box(), comparator);
 #endif
   }
+
+  continue_seams_across_sections(print);
+}
+
+// UNLAYERED_MOD -- see the header. For each non-root section, the seam the section BELOW it ended with
+// (its topmost layer that has one) defines a vertical line in the WORLD -- the physical seam line of
+// the part. On every layer of the section above, each loop's seam moves to the candidate nearest where
+// that line crosses the layer, so the seam continues up the part instead of restarting wherever the
+// section's own placement put it. Guards, so this never trades a seam the placer avoided for a worse
+// one: blocked points are never taken, a candidate overhanging more than the placer's own choice is
+// skipped, and a loop with no candidate within kMaxReach of the line keeps its own seam. Only for the placements that produce a deliberate seam line (aligned,
+// aligned back, rear); nearest and random are left alone.
+std::optional<size_t> SeamPlacerImpl::continuation_seam_candidate(
+    const PrintObjectSeamData::LayerSeams &layer, const Perimeter &per,
+    const std::vector<Vec2f> &targets, float max_reach)
+{
+    if (per.end_index > layer.points.size() || per.end_index < per.start_index + 3)
+        return std::nullopt;
+    // The regular seam placer gives painting top priority and may finalize a point
+    // at the centre of an enforced patch. Keep that decision on painted loops.
+    for (size_t i = per.start_index; i < per.end_index; ++ i)
+        if (layer.points[i].type == EnforcedBlockedSeamPoint::Enforced)
+            return std::nullopt;
+
+    size_t own = per.seam_index;
+    if (per.finalized) {
+        float dmin = std::numeric_limits<float>::max();
+        for (size_t i = per.start_index; i < per.end_index; ++ i) {
+            const float d = (layer.points[i].position - per.final_seam_position).squaredNorm();
+            if (d < dmin) { dmin = d; own = i; }
+        }
+    }
+    const float own_overhang = own < layer.points.size() ? layer.points[own].overhang : 0.f;
+    std::optional<size_t> best;
+    float best_d = max_reach;
+    for (size_t i = per.start_index; i < per.end_index; ++ i) {
+        const SeamCandidate &c = layer.points[i];
+        if (c.type == EnforcedBlockedSeamPoint::Blocked || c.overhang > own_overhang + 0.1f)
+            continue;
+        for (const Vec2f &tg : targets) {
+            const float d = (c.position.head<2>() - tg).norm();
+            if (d < best_d) { best_d = d; best = i; }
+        }
+    }
+    return best;
+}
+
+void SeamPlacer::continue_seams_across_sections(const Print &print)
+{
+  using namespace SeamPlacerImpl;
+  // How far from the seam line a loop may be and still be pulled toward it. Generous on purpose: the
+  // first layers of a tilted section are strips that may only reach the line many layers later, and
+  // the point of the strip nearest the line keeps the seam on the same side of the part meanwhile.
+  constexpr float kMaxReach = 60.f;   // mm, in the layer plane
+
+  auto seam_of = [](const PrintObjectSeamData::LayerSeams &layer, const Perimeter &p) -> Vec3f {
+    return p.finalized ? p.final_seam_position : layer.points[p.seam_index].position;
+  };
+
+  for (const PrintObject *child : print.objects()) {
+    if (! child->is_segment() || child->is_root_segment() || child->segment()->is_part())
+      continue;
+    const SeamPosition mode = child->config().seam_position.value;
+    if (mode != spAligned && mode != spAlignedBack && mode != spRear)
+      continue;
+    // The section this one rests on: same model object, same instance transform, parent index.
+    const PrintObject *parent = nullptr;
+    for (const PrintObject *po : print.objects())
+      if (po != child && po->is_segment() && po->model_object() == child->model_object() &&
+          po->trafo().isApprox(child->trafo(), 0.) && po->segment_index() == child->segment()->parent)
+        parent = po;
+    if (parent == nullptr)
+      continue;
+    auto pit = m_seam_per_object.find(parent);
+    auto cit = m_seam_per_object.find(child);
+    if (pit == m_seam_per_object.end() || cit == m_seam_per_object.end())
+      continue;
+
+    // Seam points of the parent's topmost layer that has any, in the OBJECT frame.
+    std::vector<Vec3d> refs;
+    // (The parent can end in EMPTY layers -- it slices up to support_z_max so support can reach the
+    // section above -- which carry no candidates; skip those.)
+    for (auto l = pit->second.layers.rbegin(); l != pit->second.layers.rend() && refs.empty(); ++ l) {
+      // end_index is EXCLUSIVE (pick_seam_point() steps current = end_index), whatever the struct
+      // comment says. A loop needs at least three candidates: the empty layers carry degenerate ones.
+      for (const Perimeter &p : l->perimeters)
+        if (p.end_index <= l->points.size() && p.end_index >= p.start_index + 3 &&
+            (p.finalized || (p.seam_index >= p.start_index && p.seam_index < p.end_index)))
+          refs.push_back(parent->slice_to_object() * seam_of(*l, p).cast<double>());
+    }
+    if (refs.empty())
+      continue;
+
+    // World vertical, in the object frame, then in the child's slice frame.
+    const Vec3d up_obj   = (child->trafo().linear().inverse() * Vec3d::UnitZ()).normalized();
+    const Vec3d up_slice = child->object_to_slice().linear() * up_obj;
+    if (std::abs(up_slice.z()) < 1e-6)
+      continue;   // world vertical lies in the child's layers: no meaningful crossing
+    std::vector<Vec3d> refs_slice;
+    for (const Vec3d &r : refs)
+      refs_slice.push_back(child->object_to_slice() * r);
+
+    for (PrintObjectSeamData::LayerSeams &layer : cit->second.layers) {
+      for (Perimeter &per : layer.perimeters) {
+        if (per.end_index > layer.points.size() || per.end_index < per.start_index + 3)
+          continue;
+        const float z = layer.points[per.start_index].position.z();
+        // Where each reference line crosses this layer.
+        std::vector<Vec2f> targets;
+        for (const Vec3d &r : refs_slice) {
+          const double t = (double(z) - r.z()) / up_slice.z();
+          targets.emplace_back((r + t * up_slice).head<2>().cast<float>());
+        }
+        const auto best = continuation_seam_candidate(layer, per, targets, kMaxReach);
+        if (best) {
+          per.seam_index          = *best;
+          per.finalized           = true;
+          per.final_seam_position = layer.points[*best].position;
+        }
+      }
+    }
+  }
 }
 
 void SeamPlacer::place_seam(const Layer *layer, ExtrusionLoop &loop,

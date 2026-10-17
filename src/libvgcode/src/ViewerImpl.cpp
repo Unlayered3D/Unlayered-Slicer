@@ -1731,6 +1731,11 @@ Color ViewerImpl::get_vertex_color(const PathVertex& v) const
         assert(static_cast<size_t>(v.extruder_id) < m_tool_colors.size());
         return m_tool_colors[v.extruder_id];
     }
+    case EViewType::LayerMode:
+    {
+        if(v.is_travel()) return get_option_color(move_type_to_option(v.type));
+        return layer_mode_color(v.layer_mode);
+    }
     case EViewType::CutSegment:
     {
         // Moves that belong to no segment (an ordinary object, or anything emitted outside an

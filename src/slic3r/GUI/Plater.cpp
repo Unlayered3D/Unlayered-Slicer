@@ -7378,7 +7378,7 @@ Plater::priv::priv(Plater *q, MainFrame *main_frame)
         "enable_support", "support_filament", "support_interface_filament",
         // UNLAYERED_MOD: enable_nonplanar gates layer_rotation_b/c, and the variable layer height
         // editor derives object_max_z from the rotated box (PrintObject::slicing_parameters).
-        "test_input", "layer_rotation_b", "layer_rotation_c", "enable_nonplanar",
+        "test_input", "layer_rotation_b", "layer_rotation_c", "curved_layer_blend", "automatic_layer_strategy", "enable_nonplanar",
         "support_top_z_distance", "support_bottom_z_distance", "raft_layers",
         "wipe_tower_rotation_angle", "wipe_tower_cone_angle", "wipe_tower_extra_spacing", "wipe_tower_extra_flow", "wipe_tower_max_purge_speed",
         "wipe_tower_wall_type", "wipe_tower_extra_rib_length","wipe_tower_rib_width","wipe_tower_fillet_wall",

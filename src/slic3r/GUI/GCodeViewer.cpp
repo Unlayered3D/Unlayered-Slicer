@@ -94,6 +94,8 @@ static std::string get_view_type_string(libvgcode::EViewType view_type)
         return _u8L("Actual Flow");
     else if (view_type == libvgcode::EViewType::Tool)
         return _u8L("Tool");
+    else if (view_type == libvgcode::EViewType::LayerMode)
+        return _u8L("Layer mode");
     else if (view_type == libvgcode::EViewType::CutSegment)
         return _u8L("Section");
     else if (view_type == libvgcode::EViewType::ColorPrint)
@@ -448,6 +450,16 @@ void GCodeViewer::SequentialView::Marker::render_position_window(const libvgcode
 
         char detail_buf[1024];
         switch (view_type) {
+            case libvgcode::EViewType::LayerMode:
+                if(is_extrusion) {
+                    const auto axis=viewer->get_tool_axis(vertex.tool_axis_id);
+                    const double slope=std::atan2(std::hypot(axis[0],axis[1]),std::abs(axis[2]))*180./PI;
+                    const std::string mode=vertex.layer_mode==1?_u8L("Transition"):
+                        vertex.layer_mode==2?_u8L("Nonplanar"):
+                        vertex.layer_mode==0?_u8L("Planar"):_u8L("Unclassified");
+                    std::snprintf(detail_buf,sizeof(detail_buf),"%s | %.2f deg",mode.c_str(),slope);
+                } else std::snprintf(detail_buf,sizeof(detail_buf),"%s",_u8L("Travel").c_str());
+                break;
             case libvgcode::EViewType::FeatureType:
                 if (is_extrusion)
                     strcpy(detail_buf, to_string(vertex.role).c_str());
@@ -1222,6 +1234,7 @@ void GCodeViewer::update_by_mode(ConfigOptionMode mode)
     view_type_items.push_back(libvgcode::EViewType::Temperature);
 // ORCA: Add Pressure Advance visualization support
     view_type_items.push_back(libvgcode::EViewType::PressureAdvance);
+    view_type_items.push_back(libvgcode::EViewType::LayerMode);
     // Declarative cut planes: colour toolpaths by the section they belong to. Only worth offering
     // when the print actually has sections -- on an ordinary print every move would be neutral.
     if (m_viewer.get_used_cut_segments_count() > 1)
@@ -1508,6 +1521,7 @@ void GCodeViewer::load_as_gcode(const GCodeProcessorResult& gcode_result, const 
         m_custom_gcode_per_print_z = gcode_result.custom_gcode_per_print_z;
 
     m_max_print_height = gcode_result.printable_height;
+    m_layer_strategy_decisions=gcode_result.layer_strategy_decisions;
     m_z_offset = gcode_result.z_offset;
 
     // load_toolpaths(gcode_result, build_volume, exclude_bounding_box);
@@ -4272,6 +4286,28 @@ void GCodeViewer::render_legend(float &legend_height, int canvas_width, int canv
     case libvgcode::EViewType::LayerTimeLogarithmic:     { append_range(m_viewer.get_color_range(libvgcode::EViewType::LayerTimeLogarithmic), true); break; }
     case libvgcode::EViewType::VolumetricFlowRate:       { append_range(m_viewer.get_color_range(libvgcode::EViewType::VolumetricFlowRate), 2); break; }
     case libvgcode::EViewType::ActualVolumetricFlowRate: { append_range(m_viewer.get_color_range(libvgcode::EViewType::ActualVolumetricFlowRate), 2); break; }
+    case libvgcode::EViewType::LayerMode:
+    {
+        // This categorical view has one column and no earlier header case to
+        // populate offsets. Indexing the default-empty vector crashes Preview.
+        offsets={0.f};
+        append_headers({{_u8L("Layer mode"),offsets[0]}});
+        const std::array<std::string,3> names={_u8L("Planar"),_u8L("Transition"),_u8L("Nonplanar")};
+        for(size_t i=0;i<names.size();++i)
+            append_item(EItemType::Rect,libvgcode::convert(libvgcode::layer_mode_color(uint8_t(i))),{{names[i],offsets[0]}});
+        append_item(EItemType::Rect,libvgcode::convert(libvgcode::layer_mode_color(255)),{{_u8L("Unclassified (older G-code)"),offsets[0]}});
+        if(ImGui::CollapsingHeader(_u8L("Selection details").c_str())) {
+            if(m_layer_strategy_decisions.empty())
+                ImGui::TextWrapped("%s",_u8L("No automatic selection report in this file.").c_str());
+            for(size_t i=0;i<m_layer_strategy_decisions.size();++i) {
+                ImGui::Separator();
+                ImGui::TextWrapped("%s %u",_u8L("Selection").c_str(),unsigned(i+1));
+                ImGui::TextWrapped("%s",m_layer_strategy_decisions[i].c_str());
+            }
+        }
+        ImGui::TextWrapped("%s",_u8L("Colours describe generated layers. They do not certify physical clearance or finish.").c_str());
+        break;
+    }
     case libvgcode::EViewType::CutSegment:
     {
         // One entry per section actually present, in the same colours as the Prepare tab. Each row

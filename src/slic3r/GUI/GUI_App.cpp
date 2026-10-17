@@ -10693,16 +10693,11 @@ double virtual_max_tilt_deg(double reach_mm, std::optional<double> tilt_azimuth_
         return opt == nullptr ? 0. : opt->value;
     };
 
-    // The geometry-derived limit, identical to the one Print::validate() enforces -- one definition
-    // in libslic3r so a drag can never stop somewhere the slicer would have accepted, or vice versa.
-    const double derived = virtual_tilt_limit_deg(HotendEnvelope::from_config(cfg), get("nonplanar_gantry_height"),
-                                                  reach_mm, tilt_azimuth_rad);
-    // The optional hand-set ceiling on top. 0 means "not applied" for either of them, so this is
-    // "the stricter of the two that are switched on", not a plain min.
-    const double manual = std::max(0., get("nonplanar_virtual_max_angle"));
-    if (derived > 0. && manual > 0.)
-        return std::min(derived, manual);
-    return std::max(derived, manual);
+    // The limit Print::validate() enforces -- the geometry-derived one with the optional hand-set
+    // ceiling on top -- from the one definition in libslic3r, so a drag can never stop somewhere the
+    // slicer would have accepted, or vice versa.
+    return virtual_tilt_limit_enforced_deg(HotendEnvelope::from_config(cfg), get("nonplanar_gantry_height"),
+                                           get("nonplanar_virtual_max_angle"), reach_mm, tilt_azimuth_rad);
 }
 
 bool has_filaments(const std::vector<string>& model_filaments) {

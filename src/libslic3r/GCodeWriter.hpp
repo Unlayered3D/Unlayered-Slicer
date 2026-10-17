@@ -9,9 +9,11 @@
 #include "Point.hpp"
 #include "Polygon.hpp"
 #include "PrintConfig.hpp"
+#include "CurvedRamp.hpp"
 #include "GCode/CoolingBuffer.hpp"
 #include "GCode/MachineKinematics.hpp"
 #include <memory>
+#include <limits>
 
 namespace Slic3r {
 
@@ -113,14 +115,35 @@ public:
     void        set_min_extrusion_z(double z) { m_min_extrusion_z = z; }
     double      min_extrusion_z() const { return m_min_extrusion_z; }
     // UNLAYERED_MOD — highest MACHINE-frame Z at which this file has laid material so far. The
-    // nozzle tip sits on top of the bead it is extruding, so this is an upper bound on the height
-    // of everything printed, in the frame travels are emitted in. GCode::m_max_layer_z cannot serve
+    // nozzle tip follows the top path centre; curved travel additionally bounds
+    // tilted bead-edge rise. GCode::m_max_layer_z cannot serve
     // that role for multiplanar prints: it tracks Layer::print_z, which for a tilted chunk is a
     // distance along that chunk's build normal, not a bed-frame height.
     double      max_extrusion_z() const { return m_max_extrusion_z; }
 
     //BBS: set offset for gcode writer
     void set_xy_offset(double x, double y) { m_x_offset = x; m_y_offset = y; }
+    void set_curved_blend(std::shared_ptr<const CurvedTransition::Field> field,
+                          const CurvedTransition::ModelDomain& domain, const Vec2d& origin,
+                          double travel_clearance, double z_speed, int fixed_nozzle = -1);
+    bool has_curved_blend() const { return bool(m_curved_field); }
+    void set_curved_plate_bound(double safe_z) {m_curved_plate_safe_z=safe_z;}
+    // Preserve a planned XY detour with one raised traverse, then approach only
+    // its final physical layer point. Intermediate points are not deposition.
+    std::string travel_to_curved_path(const std::vector<Vec3d>& slice_points,
+                                     const std::string& comment = std::string());
+    double curved_slope_bound() const {return m_curved_field?m_curved_field->slope_bound():0.;}
+    bool curved_path_is_planar(const Vec2d& lo,const Vec2d& hi,double z,double height) const {
+        return m_curved_field && m_curved_field->identity_on_box(lo.x()-m_curved_origin.x(),hi.x()-m_curved_origin.x(),
+            lo.y()-m_curved_origin.y(),hi.y()-m_curved_origin.y(),z-height,z);
+    }
+    bool curved_maps_supports() const { return m_curved_field && m_curved_field->maps_supports(); }
+    bool curved_path_is_affine(const Vec2d& lo,const Vec2d& hi,double z,double height) const {
+        return m_curved_field && m_curved_field->affine_on_box(lo.x()-m_curved_origin.x(),hi.x()-m_curved_origin.x(),
+            lo.y()-m_curved_origin.y(),hi.y()-m_curved_origin.y(),z-height,z);
+    }
+    void set_curved_path(double w, double width, double height, bool round_bead=false);
+    double curved_max_flow_scale() const;
     Vec2f get_xy_offset() { return Vec2f{m_x_offset, m_y_offset}; };
 
     // UNLAYERED_MOD — the active extruder's XY nozzle offset, in the MACHINE frame.
@@ -226,6 +249,23 @@ public:
     // Returns whether this flavor supports separate print and travel acceleration.
     static bool supports_separate_travel_acceleration(GCodeFlavor flavor);
   private:
+    Vec3d curved_physical_point(const Vec3d& p) const;
+    double curved_travel_height(const Vec3d& physical_target) const;
+    std::string curved_travel(const Vec3d& physical_target, const std::string& comment);
+    std::string curved_travel(const std::vector<Vec3d>& physical_points, const std::string& comment);
+    std::string curved_extrude(const Vec3d& slice_target, double dE, const std::string& comment, bool no_extrusion);
+    std::shared_ptr<const CurvedTransition::Field> m_curved_field;
+    int m_curved_fixed_nozzle=-1;
+    bool m_fixed_dual_enabled=false;
+    std::optional<CurvedTransition::ModelDomain> m_curved_domain;
+    Vec2d m_curved_origin = Vec2d::Zero(); // same placed frame as point_to_gcode, BEFORE plate offset
+    double m_curved_safe_z=0., m_curved_plate_safe_z=0., m_curved_z_speed=0., m_curved_w=0., m_curved_width=0., m_curved_height=0.;
+    double m_curved_travel_clearance=0., m_curved_max_bead_rise=0.;
+    double m_curved_common_max_z=std::numeric_limits<double>::infinity();
+    double m_curved_max_z=std::numeric_limits<double>::infinity();
+    std::vector<double> m_curved_nozzle_heights;
+    int m_curved_preview_mode=-1;
+    bool m_curved_round_bead=false;
 	// Extruders are sorted by their ID, so that binary search is possible.
     std::vector<Extruder> m_filament_extruders;
     bool            m_single_extruder_multi_material;

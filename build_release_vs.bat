@@ -152,10 +152,14 @@ REM Set minimum CMake policy to avoid <3.5 errors
 set CMAKE_POLICY_VERSION_MINIMUM=3.5
 if "%USE_NINJA%"=="1" (
     cmake ../ -G %CMAKE_GENERATOR% %CLANG_ARG% -DCMAKE_BUILD_TYPE=%build_type%
+    if errorlevel 1 goto :build_failed
     cmake --build . --config %build_type% --target deps
+    if errorlevel 1 goto :build_failed
 ) else (
     cmake ../ -G %CMAKE_GENERATOR% -A %arch% -DCMAKE_BUILD_TYPE=%build_type%
+    if errorlevel 1 goto :build_failed
     cmake --build . --config %build_type% --target deps -- -m
+    if errorlevel 1 goto :build_failed
 )
 @echo off
 
@@ -171,16 +175,21 @@ echo on
 set CMAKE_POLICY_VERSION_MINIMUM=3.5
 if "%USE_NINJA%"=="1" (
     cmake .. -G %CMAKE_GENERATOR% %CLANG_ARG% -DORCA_TOOLS=ON %SIG_FLAG% -DBUILD_TESTS=%BUILD_TESTS% -DCMAKE_BUILD_TYPE=%build_type%
+    if errorlevel 1 goto :build_failed
     cmake --build . --config %build_type% --target all
+    if errorlevel 1 goto :build_failed
 ) else (
     cmake .. -G %CMAKE_GENERATOR% -A %arch% %TOOLSET_ARG% -DORCA_TOOLS=ON %SIG_FLAG% -DBUILD_TESTS=%BUILD_TESTS% -DCMAKE_BUILD_TYPE=%build_type%
+    if errorlevel 1 goto :build_failed
     cmake --build . --config %build_type% --target ALL_BUILD -- -m
+    if errorlevel 1 goto :build_failed
 )
 @echo off
 cd ..
 call scripts/run_gettext.bat
 cd %build_dir%
 cmake --build . --target install --config %build_type%
+if errorlevel 1 goto :build_failed
 
 :done
 @echo off
@@ -194,3 +203,9 @@ set /a "_mins=_remainder / 60"
 set /a "_secs=_remainder - _mins * 60"
 echo.
 echo Build completed in %_hours%h %_mins%m %_secs%s
+exit /b 0
+
+:build_failed
+@echo off
+echo ERROR: Windows build stopped before packaging. 1>&2
+exit /b 1
