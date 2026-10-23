@@ -1169,7 +1169,7 @@ static std::vector<std::string> s_Preset_print_options{
     "support_interface_pattern",
     "support_interface_spacing",
     "support_interface_loop_pattern",
-    "test_input", "layer_rotation_b", "layer_rotation_c", "print_group",
+    "test_input", "layer_rotation_b", "layer_rotation_c", "curved_layer_blend", "automatic_layer_strategy", "print_group",
     "support_direction", "support_direction_b", "support_direction_c", "support_direction_max_lean", "support_section_overlap",
     "support_top_z_distance",
     "support_on_build_plate_only",
@@ -1392,7 +1392,7 @@ static std::vector<std::string> s_Preset_print_options{
     "zaa_min_z",
     "ironing_expansion",
     // Multi-Axis
-    "test_input", "layer_rotation_b", "layer_rotation_c", "print_group",
+    "test_input", "layer_rotation_b", "layer_rotation_c", "curved_layer_blend", "automatic_layer_strategy", "print_group",
     "support_direction", "support_direction_b", "support_direction_c", "support_direction_max_lean", "support_section_overlap",
 };
 
@@ -1522,7 +1522,9 @@ static std::vector<std::string> s_Preset_printer_options {
     "first_layer_plane", "first_layer_plane_offset", "first_layer_plane_thickness", "belt_initial_temperature_length",
     "nonplanar_virtual_max_angle", "nonplanar_virtual_max_z",
     "ac_pivot_height", "ac_c_axis_offset_x", "ac_c_axis_offset_y", "ac_solution", "ac_table_radius",
-    "ac_transition_clearance", "ac_rotation_speed"
+    "ac_transition_clearance", "ac_rotation_speed",
+    "nonplanar_fixed_nozzle", "nonplanar_clearance_nozzle",
+    "nonplanar_fixed_clearance_recorded", "nonplanar_fixed_clearance_source"
     };
 
 static std::vector<std::string> s_Preset_sla_print_options {

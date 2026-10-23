@@ -74,6 +74,7 @@
 #include "libslic3r/SLA/ReprojectPointsOnMesh.hpp"
 #include "libslic3r/Polygon.hpp"
 #include "libslic3r/Print.hpp"
+#include "libslic3r/GCode/ImportedPrintStatistics.hpp"
 #include "libslic3r/PrintConfig.hpp"
 #include "libslic3r/SLAPrint.hpp"
 #include "libslic3r/Utils.hpp"
@@ -7385,7 +7386,7 @@ Plater::priv::priv(Plater *q, MainFrame *main_frame)
         "enable_support", "support_filament", "support_interface_filament",
         // UNLAYERED_MOD: enable_nonplanar gates layer_rotation_b/c, and the variable layer height
         // editor derives object_max_z from the rotated box (PrintObject::slicing_parameters).
-        "test_input", "layer_rotation_b", "layer_rotation_c", "enable_nonplanar",
+        "test_input", "layer_rotation_b", "layer_rotation_c", "curved_layer_blend", "automatic_layer_strategy", "enable_nonplanar",
         "support_top_z_distance", "support_bottom_z_distance", "raft_layers",
         "wipe_tower_rotation_angle", "wipe_tower_cone_angle", "wipe_tower_extra_spacing", "wipe_tower_extra_flow", "wipe_tower_max_purge_speed",
         "wipe_tower_wall_type", "wipe_tower_extra_rib_length","wipe_tower_rib_width","wipe_tower_fillet_wall",
@@ -17595,11 +17596,13 @@ void Plater::load_gcode(const wxString& filename)
 
     // process gcode
     GCodeProcessor processor;
+    PrintStatistics imported_statistics;
     processor.init_filament_maps_and_nozzle_type_when_import_only_gcode();
     try
     {
         GCodeProcessor::s_IsBBLPrinter = wxGetApp().preset_bundle->is_bbl_vendor();
         processor.process_file(filename.ToUTF8().data());
+        imported_statistics = imported_print_statistics(processor.get_result());
     }
     catch (const std::exception& ex)
     {
@@ -17620,17 +17623,10 @@ void Plater::load_gcode(const wxString& filename)
 
     current_print.apply_config_for_render(processor.export_config_for_render());
 
-    //BBS: add cost info when drag in gcode
-    auto& ps = current_result->print_statistics;
-    double total_cost = 0.0;
-    for (auto volume : ps.total_volumes_per_extruder) {
-        size_t extruder_id = volume.first;
-        double density = current_result->filament_densities.at(extruder_id);
-        double cost = current_result->filament_costs.at(extruder_id);
-        double weight = volume.second * density * 0.001;
-        total_cost += weight * cost * 0.001;
-    }
-    current_print.print_statistics().total_cost = total_cost;
+    // Populate length and weight as well as cost. An imported file has no
+    // native slice to fill them; leaving zero totals made Model Filament
+    // negative when Preview subtracted support, flush or wipe-tower usage.
+    current_print.print_statistics() = std::move(imported_statistics);
 
     current_print.set_gcode_file_ready();
 

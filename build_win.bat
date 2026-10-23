@@ -538,7 +538,9 @@ set "DEP_TREE_FLAG="
 if not "%deps_dir%" == "" (
     set "DEP_TREE=%deps_dir%"
     set "DEP_TREE_PACK=%deps_dir%"
-    set "DEP_TREE_FLAG=-DDEP_BUILD_DIR="%deps_dir%""
+    REM find_package() also runs from src/; a relative prefix is then resolved
+    REM against that subdirectory. Give CMake one absolute dependency origin.
+    for %%p in ("%deps_dir%") do set "DEP_TREE_FLAG=-DDEP_BUILD_DIR="%%~fp""
 )
 
 REM CMakeLists derives DEP_BUILD_DIR from the build directory NAME, which is

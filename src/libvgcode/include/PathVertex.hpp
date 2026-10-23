@@ -112,12 +112,13 @@ struct PathVertex
     // Declarative cut planes: index of the segment ("section") this move belongs to, -1 for an
     // ordinary object. Drives EViewType::CutSegment.
     //
-    // KEEP THESE TWO LAST, IN THIS ORDER: PathVertex is aggregate-initialised positionally in
+    // KEEP THESE IN THIS ORDER; append new fields after them. PathVertex is initialised positionally in
     // LibVGCodeWrapper.cpp, so inserting a field earlier -- or swapping these two -- silently
     // shifts every value after it. tool_axis_id and cut_segment_id were added independently on
     // two branches, each believing itself last; the initialisers there now pass both, in this order.
     //
     int16_t cut_segment_id{ -1 };
+    uint8_t layer_mode{0}; // Planar / transition / curved; appended for aggregate compatibility.
 
     //
     // Return true if the segment is an extrusion move

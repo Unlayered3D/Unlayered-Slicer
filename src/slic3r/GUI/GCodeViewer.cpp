@@ -94,6 +94,8 @@ static std::string get_view_type_string(libvgcode::EViewType view_type)
         return _u8L("Actual Flow");
     else if (view_type == libvgcode::EViewType::Tool)
         return _u8L("Tool");
+    else if (view_type == libvgcode::EViewType::LayerMode)
+        return _u8L("Layer mode");
     else if (view_type == libvgcode::EViewType::CutSegment)
         return _u8L("Section");
     else if (view_type == libvgcode::EViewType::ColorPrint)
@@ -448,6 +450,16 @@ void GCodeViewer::SequentialView::Marker::render_position_window(const libvgcode
 
         char detail_buf[1024];
         switch (view_type) {
+            case libvgcode::EViewType::LayerMode:
+                if(is_extrusion) {
+                    const auto axis=viewer->get_tool_axis(vertex.tool_axis_id);
+                    const double slope=std::atan2(std::hypot(axis[0],axis[1]),std::abs(axis[2]))*180./PI;
+                    const std::string mode=vertex.layer_mode==1?_u8L("Transition"):
+                        vertex.layer_mode==2?_u8L("Nonplanar"):
+                        vertex.layer_mode==0?_u8L("Planar"):_u8L("Unclassified");
+                    std::snprintf(detail_buf,sizeof(detail_buf),"%s | %.2f deg",mode.c_str(),slope);
+                } else std::snprintf(detail_buf,sizeof(detail_buf),"%s",_u8L("Travel").c_str());
+                break;
             case libvgcode::EViewType::FeatureType:
                 if (is_extrusion)
                     strcpy(detail_buf, to_string(vertex.role).c_str());
@@ -1222,6 +1234,7 @@ void GCodeViewer::update_by_mode(ConfigOptionMode mode)
     view_type_items.push_back(libvgcode::EViewType::Temperature);
 // ORCA: Add Pressure Advance visualization support
     view_type_items.push_back(libvgcode::EViewType::PressureAdvance);
+    view_type_items.push_back(libvgcode::EViewType::LayerMode);
     // Declarative cut planes: colour toolpaths by the section they belong to. Only worth offering
     // when the print actually has sections -- on an ordinary print every move would be neutral.
     if (m_viewer.get_used_cut_segments_count() > 1)
@@ -1508,6 +1521,13 @@ void GCodeViewer::load_as_gcode(const GCodeProcessorResult& gcode_result, const 
         m_custom_gcode_per_print_z = gcode_result.custom_gcode_per_print_z;
 
     m_max_print_height = gcode_result.printable_height;
+    m_layer_strategy_decisions=gcode_result.layer_strategy_decisions;
+    m_planning_regions.clear();m_highlight_planning_region=-1;
+    for(const auto& record:gcode_result.layer_region_records) {
+        CurvedTransition::RegionDecision region;
+        if(m_planning_regions.size()<1024 && CurvedTransition::RegionDecision::decode(record,region))
+            m_planning_regions.push_back(std::move(region));
+    }
     m_z_offset = gcode_result.z_offset;
 
     // load_toolpaths(gcode_result, build_volume, exclude_bounding_box);
@@ -1813,6 +1833,7 @@ void GCodeViewer::reset_shell()
 
 void GCodeViewer::reset()
 {
+    m_planning_regions.clear();m_layer_strategy_decisions.clear();m_highlight_planning_region=-1;
     //BBS: should also reset the result id
     BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(": current result id %1% ")%m_last_result_id;
     m_last_result_id = -1;
@@ -1843,6 +1864,46 @@ void GCodeViewer::reset()
     m_fixed_tool_axis = Vec3f::UnitZ();
 }
 
+void GCodeViewer::render_planning_regions(int width,int height)
+{
+    const auto& camera=wxGetApp().plater()->get_camera();
+    const Matrix4d projection=camera.get_projection_matrix().matrix()*camera.get_view_matrix().matrix();
+    auto* draw=ImGui::GetBackgroundDrawList();
+    const auto screen=[&](double x,double y,double z,ImVec2& point) {
+        const Vec4d clip=projection*Vec4d(x,y,z,1.);
+        if(!clip.allFinite() || clip.w()<=1e-8 || clip.z() < -clip.w() || clip.z()>clip.w()) return false;
+        point=ImVec2(float((clip.x()/clip.w()+1.)*.5*width),float((1.-clip.y()/clip.w())*.5*height));return true;
+    };
+    for(const auto& r:m_planning_regions) {
+        if(!r.selected && !m_show_rejected_planning_regions) continue;
+        if(m_highlight_planning_region>=0 && r.id!=m_highlight_planning_region) continue;
+        const ImU32 colour=r.selected?(r.kind==0?IM_COL32(195,130,255,230):IM_COL32(70,220,170,230)):
+            IM_COL32(255,165,60,180);
+        ImVec2 centre;if(!screen(r.x,r.y,r.z,centre)) continue;
+        // Rings are explicitly XY planning footprints at their transition
+        // height, drawn through the solid so rejection locations remain visible.
+        for(int i=0;i<64;++i) {
+            if(!r.selected && i%2) continue;
+            const double a=2.*PI*i/64.,b=2.*PI*(i+1)/64.;ImVec2 p,q;
+            if(screen(r.x+r.radius*std::cos(a),r.y+r.radius*std::sin(a),r.z,p) &&
+               screen(r.x+r.radius*std::cos(b),r.y+r.radius*std::sin(b),r.z,q))
+                draw->AddLine(p,q,colour,r.selected?2.f:1.f);
+        }
+        const std::string label="R"+std::to_string(r.id+1)+(r.kind==0?" roof":r.kind==1?" underside":" planar");
+        const ImVec2 size=ImGui::CalcTextSize(label.c_str());
+        const ImVec2 lo(centre.x-3.f,centre.y-3.f),hi(centre.x+size.x+3.f,centre.y+size.y+3.f);
+        draw->AddRectFilled(lo,hi,IM_COL32(20,20,20,190),3.f);draw->AddText(centre,colour,label.c_str());
+        if(ImGui::IsMouseHoveringRect(lo,hi)) {
+            ImGui::BeginTooltip();ImGui::PushTextWrapPos(350.f*m_scale);
+            ImGui::TextUnformatted(r.reason.c_str());
+            ImGui::Text("%.2f deg | net score %.3f",r.angle,r.gain);
+            ImGui::Text("Motion estimate %.1f s | generated support %.1f mm3",r.motion_seconds,r.support_mm3);
+            ImGui::TextUnformatted("XY planning footprint; not a collision or print-quality certificate.");
+            ImGui::PopTextWrapPos();ImGui::EndTooltip();
+        }
+    }
+}
+
 //BBS: GUI refactor: add canvas width and height
 void GCodeViewer::render(int canvas_width, int canvas_height, int right_margin)
 {
@@ -1853,6 +1914,8 @@ void GCodeViewer::render(int canvas_width, int canvas_height, int right_margin)
         return;
 
     render_toolpaths();
+    if(m_viewer.get_view_type()==libvgcode::EViewType::LayerMode && m_show_planning_regions)
+        render_planning_regions(canvas_width,canvas_height);
 
     float legend_height = 0.0f;
     render_legend(legend_height, canvas_width, canvas_height, right_margin);
@@ -4272,6 +4335,47 @@ void GCodeViewer::render_legend(float &legend_height, int canvas_width, int canv
     case libvgcode::EViewType::LayerTimeLogarithmic:     { append_range(m_viewer.get_color_range(libvgcode::EViewType::LayerTimeLogarithmic), true); break; }
     case libvgcode::EViewType::VolumetricFlowRate:       { append_range(m_viewer.get_color_range(libvgcode::EViewType::VolumetricFlowRate), 2); break; }
     case libvgcode::EViewType::ActualVolumetricFlowRate: { append_range(m_viewer.get_color_range(libvgcode::EViewType::ActualVolumetricFlowRate), 2); break; }
+    case libvgcode::EViewType::LayerMode:
+    {
+        // This categorical view has one column and no earlier header case to
+        // populate offsets. Indexing the default-empty vector crashes Preview.
+        offsets={0.f};
+        append_headers({{_u8L("Layer mode"),offsets[0]}});
+        const std::array<std::string,3> names={_u8L("Planar"),_u8L("Transition"),_u8L("Nonplanar")};
+        for(size_t i=0;i<names.size();++i)
+            append_item(EItemType::Rect,libvgcode::convert(libvgcode::layer_mode_color(uint8_t(i))),{{names[i],offsets[0]}});
+        append_item(EItemType::Rect,libvgcode::convert(libvgcode::layer_mode_color(255)),{{_u8L("Unclassified (older G-code)"),offsets[0]}});
+        ImGui::Checkbox(_u8L("Region overlay").c_str(),&m_show_planning_regions);
+        if(m_show_planning_regions) ImGui::Checkbox(_u8L("Include rejected regions").c_str(),&m_show_rejected_planning_regions);
+        if(ImGui::CollapsingHeader(_u8L("Region decisions").c_str())) {
+            if(m_planning_regions.empty()) ImGui::TextWrapped("%s",_u8L("No regional benefit/cost report in this file.").c_str());
+            ImGui::BeginChild("PlanningRegionRows",ImVec2(0.f,180.f*m_scale),true);
+            for(const auto& r:m_planning_regions) {
+                if(!r.selected && !m_show_rejected_planning_regions) continue;
+                ImGui::PushID(r.id);
+                const std::string label=std::string(r.selected?"Chosen ":"Rejected ")+"R"+std::to_string(r.id+1)+
+                    (r.kind==0?" Roof":r.kind==1?" Underside":" Planar");
+                if(ImGui::Selectable(label.c_str(),m_highlight_planning_region==r.id))
+                    m_highlight_planning_region=m_highlight_planning_region==r.id?-1:r.id;
+                ImGui::TextWrapped("%s",r.reason.c_str());
+                ImGui::Text("%.2f deg | score %.3f | candidate %.1f s, %.1f mm3 support",r.angle,r.gain,r.motion_seconds,r.support_mm3);
+                ImGui::PopID();
+            }
+            ImGui::EndChild();
+            ImGui::TextWrapped("%s",_u8L("Scores compare generated paths with a planar control. Time and surface benefit are estimates. Footprints are planning regions, not cut planes or collision bounds.").c_str());
+        }
+        if(ImGui::CollapsingHeader(_u8L("Selection details").c_str())) {
+            if(m_layer_strategy_decisions.empty())
+                ImGui::TextWrapped("%s",_u8L("No automatic selection report in this file.").c_str());
+            for(size_t i=0;i<m_layer_strategy_decisions.size();++i) {
+                ImGui::Separator();
+                ImGui::TextWrapped("%s %u",_u8L("Selection").c_str(),unsigned(i+1));
+                ImGui::TextWrapped("%s",m_layer_strategy_decisions[i].c_str());
+            }
+        }
+        ImGui::TextWrapped("%s",_u8L("Colours describe generated layers. They do not certify physical clearance or finish.").c_str());
+        break;
+    }
     case libvgcode::EViewType::CutSegment:
     {
         // One entry per section actually present, in the same colours as the Prepare tab. Each row

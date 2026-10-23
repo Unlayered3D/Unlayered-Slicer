@@ -9,6 +9,11 @@ add_executable(${_TEST_NAME}_tests
 	test_gcode_baseline.cpp
 	test_hotend_collision.cpp
 	test_virtual_tilt_limit.cpp
+	test_auto_planes.cpp
+	test_auto_planes_stack.cpp
+	test_multiplanar_audit.cpp
+	test_seam_continuation.cpp
+	auto_planes_fixtures.hpp
 	test_max_layer_z_multiplanar.cpp
 	test_segment_support_cascade.cpp
 	test_skeleton_containment.cpp
@@ -19,6 +24,7 @@ add_executable(${_TEST_NAME}_tests
 	test_flow.cpp
 	test_gcode_timing.cpp
 	test_gcodewriter.cpp
+	test_curved_layer_engine.cpp
 	test_model.cpp
 	test_multifilament.cpp
 	test_perimeters.cpp

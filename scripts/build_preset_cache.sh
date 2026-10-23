@@ -31,6 +31,9 @@
 #               the build tree's CMAKE_BUILD_TYPE)
 #   -n          skip the rebuild and run the tool already in the build tree
 #   -l <level>  tool log level (default: 2)
+#   --keep-json
+#               ship source JSONs alongside caches for the CLI's read-only
+#               preset loader, which resolves user-preset inheritance from JSON.
 #   --prune-source
 #               allow a target that is the directory the caches were generated
 #               into (resources/profiles). Pruning it deletes the checkout's own
@@ -45,11 +48,14 @@ config=""
 build_tool=1
 log_level=2
 prune_source=0
+keep_json=0
 
-# getopts does not do long options; pull this one out first.
+# getopts does not do long options; pull these out first.
 args=()
 for arg in "$@"; do
-    if [ "$arg" = "--prune-source" ]; then prune_source=1; else args+=("$arg"); fi
+    if [ "$arg" = "--prune-source" ]; then prune_source=1
+    elif [ "$arg" = "--keep-json" ]; then keep_json=1
+    else args+=("$arg"); fi
 done
 set -- ${args+"${args[@]}"}
 
@@ -140,6 +146,10 @@ for target in "$@"; do
     fi
     if [ "$resolved" != "$profiles_dir" ]; then
         cp "$profiles_dir"/*.opc "$resolved"/
+    fi
+    if [ "$keep_json" -eq 1 ]; then
+        echo "$resolved: caches shipped; stock preset JSONs retained for CLI inheritance."
+        continue
     fi
 
     pruned=0

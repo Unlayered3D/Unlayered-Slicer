@@ -1,0 +1,54 @@
+name: Nonplanar review Windows
+
+# Focused verification on the contribution branches; upstream release workflows
+# retain their existing manual dispatch policy.
+on:
+  push:
+    branches: [codex/upstream-auto-planes, codex/upstream-curved-transitions, codex/nonplanar-usability-and-planning]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: nonplanar-review-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  planner_geometry:
+    # No GUI/dependency build is needed for field, score and metadata checks.
+    # Keep this independent of the portable leg for quick feedback.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: Configure focused planner tests
+        run: cmake -S tools/curved_transition -B build-planner -DCMAKE_BUILD_TYPE=Release
+      - name: Build and test planner
+        run: |
+          cmake --build build-planner --parallel 2
+          ctest --test-dir build-planner --output-on-failure
+  calibration_geometry:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: Test generated calibration geometry
+        run: |
+          python3 -m venv .model-test-venv
+          .model-test-venv/bin/python -m pip install -r tools/multiplanar_test_totem/requirements.txt
+          .model-test-venv/bin/python -m unittest discover -s tools/multiplanar_test_totem -p 'test_*.py' -v
+  build_windows:
+    uses: ./.github/workflows/build_check_cache.yml
+    with:
+      os: windows-latest
+      arch: x64
+      compiler: clang
+      portable-review: true
+    secrets: inherit
+  tests:
+    needs: build_windows
+    if: ${{ !cancelled() && needs.build_windows.result != 'cancelled' }}
+    uses: ./.github/workflows/unit_tests.yml
+    with:
+      os: windows-latest
+      artifact: ${{ github.sha }}-tests-windows-x64

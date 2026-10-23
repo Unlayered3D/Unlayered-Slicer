@@ -2237,6 +2237,12 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
 
                 if (!world_vol_offset.isApprox(world_inst_offset)) {
                     const Slic3r::Geometry::Transformation &vol_trafo = v->get_transformation();
+                    // Moving the volume offset into the instance changes the
+                    // object's local origin. Keep declarative planes at their
+                    // original world positions in that new local frame.
+                    const Vec3d local_shift = vol_trafo.get_offset();
+                    for (CutPlane& plane : o->cut_planes.planes)
+                        plane.point -= local_shift;
                     for (int inst_id = 0; inst_id < int(o->instances.size()); ++inst_id) {
                         ModelInstance *                         i          = o->instances[inst_id];
                         const Slic3r::Geometry::Transformation &inst_trafo = i->get_transformation();

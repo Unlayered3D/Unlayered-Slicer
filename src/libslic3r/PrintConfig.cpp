@@ -289,6 +289,18 @@ double virtual_tilt_limit_deg(const HotendEnvelope &envelope, double gantry_heig
 }
 
 // UNLAYERED_MOD — see the header.
+double virtual_tilt_limit_enforced_deg(const HotendEnvelope &envelope, double gantry_height_mm, double manual_max_deg,
+                                       double reach_mm, std::optional<double> tilt_azimuth_rad)
+{
+    const double derived = virtual_tilt_limit_deg(envelope, gantry_height_mm, reach_mm, tilt_azimuth_rad);
+    const double manual  = std::max(0., manual_max_deg);
+    // Whichever is stricter, ignoring the ones that are switched off (0 = not applied).
+    if (derived > 0. && manual > 0.)
+        return std::min(derived, manual);
+    return std::max(derived, manual);
+}
+
+// UNLAYERED_MOD — see the header.
 Vec3d bc_to_tool_axis(double angle_b, double angle_c)
 {
     const double cos_b = std::cos(angle_b);
@@ -5593,6 +5605,32 @@ void PrintConfigDef::init_fff_params()
     def->mode = comAdvanced;
     def->set_default_value(new ConfigOptionFloat(0.0));
 
+    def = this->add("nonplanar_fixed_nozzle", coInt);
+    def->label = L("Fixed active nozzle for curved printing");
+    def->category = L("Non-planar Printing");
+    def->tooltip = L("0 keeps ordinary single-nozzle mode. On a supported two-nozzle shared carriage, choose nozzle 1 or 2 and manually map the one used filament to it. The other nozzle remains parked throughout deposition. No in-print nozzle or material changes are supported.");
+    def->min=0;def->max=2;def->mode=comAdvanced;
+    def->set_default_value(new ConfigOptionInt(0));
+
+    def = this->add("nonplanar_clearance_nozzle", coInt);
+    def->label = L("Active nozzle used for clearance measurements");
+    def->category = L("Non-planar Printing");
+    def->tooltip = L("The nozzle number used as the origin for the common hotend angles, envelope, gantry and Z bounds. Must match the fixed active nozzle. Include the parked nozzle and the complete moving toolhead.");
+    def->min=0;def->max=2;def->mode=comAdvanced;
+    def->set_default_value(new ConfigOptionInt(0));
+
+    def = this->add("nonplanar_fixed_clearance_recorded", coBool);
+    def->label = L("Whole toolhead clearance recorded for fixed nozzle");
+    def->category = L("Non-planar Printing");
+    def->tooltip = L("Set only after establishing conservative whole-toolhead bounds with this nozzle active and the other nozzle parked. This declaration does not measure or certify clearance.");
+    def->mode=comAdvanced;def->set_default_value(new ConfigOptionBool(false));
+
+    def = this->add("nonplanar_fixed_clearance_source", coString);
+    def->label = L("Fixed-nozzle clearance measurement source");
+    def->category = L("Non-planar Printing");
+    def->tooltip = L("Record the installed active tip, parked nozzle position, complete toolhead, method, uncertainty and clearance allowance. Recheck after hardware or active-nozzle changes.");
+    def->mode=comAdvanced;def->set_default_value(new ConfigOptionString(""));
+
     // ---- BELT_MOD: belt printer ----
     // Key names, enum values and defaults are OrcaSlicer's so its belt printer profiles import.
     def = this->add("belt_printer", coBool);
@@ -7755,6 +7793,33 @@ void PrintConfigDef::init_fff_params()
     def->enum_labels.push_back(L("Per object"));
     def->mode = comAdvanced;
     def->set_default_value(new ConfigOptionEnum<SkirtType>(stCombined));
+
+    def = this->add("automatic_layer_strategy", coBool);
+    def->label = L("Automatic layer mode (experimental)");
+    def->category = L("Others");
+    def->mode = comAdvanced;
+    def->tooltip = L("Automatically choose curved or planar layers when Slice plate runs. The manual curved layers option is inactive while this is enabled. "
+                     "Try continuous curved transitions through existing planes or infer independent local roof regions. Bridge and support contacts remain planar. "
+                     "Choose planar slicing when the model, current process or configured printer limits do not qualify. "
+                     "Supports and other settings are preserved; clearance limits are never raised. "
+                     "The selected strategy and fallback reason appear in slicing messages and the G-code header. "
+                     "Multiple models and copies may share a plate with separate layer fields and plate-wide clearance checks. Each object needs one closed mesh volume, a Virtual printer and zero layer rotations. "
+                     "Later path-generation safety failures stop slicing; review Preview before exporting. "
+                     "When enabled this takes precedence over the manual curved blend switch and ignores cut sections on planar fallback.");
+    def->set_default_value(new ConfigOptionBool(false));
+
+    def = this->add("curved_layer_blend", coBool);
+    def->label = L("Manual curved layers (experimental)");
+    def->category = L("Others");
+    def->mode = comAdvanced;
+    def->tooltip = L("Use curved layers without automatic planar fallback. Available only when Automatic layer mode is off; its saved value is ignored while automatic mode is on. "
+                     "Blend layer directions continuously through the selected nonintersecting, height-ordered planes, slicing the original closed mesh without separate cut sections. "
+                     "With no planes, a rectangular ramp can blend from its flat foundation into its roof. "
+                     "Experimental: Virtual printer only, one closed volume per object, no supports, modifiers or variable layer heights. Multiple objects/copies require plate-wide clearance. "
+                     "Requires classic walls, no scarf seam, ironing, wipe, arcs, bridge paths or custom layer motion. "
+                     "The engine checks the printer layer-height and clearance limits and may reduce the layer step. "
+                     "Review the physical paths in Preview before printing.");
+    def->set_default_value(new ConfigOptionBool(false));
 
     def = this->add("layer_rotation_b", coFloat);
     // def->gui_type = ConfigOptionDef::GUIType::f_enum_open;

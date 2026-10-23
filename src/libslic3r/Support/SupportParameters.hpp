@@ -4,6 +4,7 @@
 #include <boost/log/trivial.hpp>
 #include "../libslic3r.h"
 #include "../Flow.hpp"
+#include "../CurvedTransition.hpp"
 
 namespace Slic3r {
 
@@ -73,6 +74,14 @@ struct SupportParameters {
             this->support_layer_height_min = std::min(this->support_layer_height_min, std::max(0.01, lh));
         for (auto layer : object.layers())
             this->support_layer_height_min = std::min(this->support_layer_height_min, std::max(0.01, layer->height));
+        if(object.curved_field() && object.curved_field()->maps_supports()) {
+            const auto& field=*object.curved_field();
+            // A logical support step may compress in the physical field.
+            // Merge contacts using the active nozzle's minimum NORMAL spacing.
+            this->support_layer_height_min=std::max(this->support_layer_height_min,
+                print_config.min_layer_height.get_at(object.curved_nozzle_index())*field.jacobian_max()*
+                std::sqrt(1.+field.slope_bound()*field.slope_bound()));
+        }
         
         if (this->num_top_interface_layers == 0 && this->num_bottom_interface_layers == 0) {
             // No interface layers allowed, print everything with the base support pattern.
