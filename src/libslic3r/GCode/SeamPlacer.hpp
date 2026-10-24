@@ -41,7 +41,7 @@ enum class EnforcedBlockedSeamPoint {
 // struct representing single perimeter loop
 struct Perimeter {
   size_t start_index{};
-  size_t end_index{}; //inclusive!
+  size_t end_index{}; // exclusive, matching the candidate range [start_index, end_index)
   size_t seam_index{};
   float flow_width{};
 
@@ -108,6 +108,14 @@ struct PrintObjectSeamData
   }
 };
 
+namespace SeamPlacerImpl {
+// Choose a continuation seam without overriding a painted enforcer or the existing
+// overhang/blocker constraints. A missing result means keep the placer's own seam.
+std::optional<size_t> continuation_seam_candidate(const PrintObjectSeamData::LayerSeams &layer,
+                                                 const Perimeter &perimeter,
+                                                 const std::vector<Vec2f> &targets, float max_reach);
+}
+
 class SeamPlacer {
 public:
   // Number of samples generated on the mesh. There are sqr_rays_per_sample_point*sqr_rays_per_sample_point rays casted from each samples
@@ -149,6 +157,10 @@ private:
   void calculate_candidates_visibility(const PrintObject *po,
                                        const SeamPlacerImpl::GlobalModelInfo &global_model_info);
   void calculate_overhangs_and_layer_embedding(const PrintObject *po);
+  // UNLAYERED_MOD -- carry the seam across declarative cut-plane sections: every non-root section
+  // places its seams independently in its own (tilted) slice frame, so the seam jumped between the
+  // planar and tilted parts of one physical object (measured 36.8 mm on a saved Centauri project).
+  void continue_seams_across_sections(const Print &print);
   void align_seam_points(const PrintObject *po, const SeamPlacerImpl::SeamComparator &comparator);
   std::vector<std::pair<size_t, size_t>> find_seam_string(const PrintObject *po,
                                                           std::pair<size_t, size_t> start_seam,

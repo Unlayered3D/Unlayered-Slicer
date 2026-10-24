@@ -1582,10 +1582,10 @@ StringObjectException Print::validate(std::vector<StringObjectException> *warnin
             }
             const double reach   = object->effective_build_reach();
             const double derived = virtual_tilt_limit_deg(envelope, m_config.nonplanar_gantry_height.value, reach, azimuth);
-            // Whichever is stricter, ignoring the ones that are switched off (0 = not applied).
-            double limit = 0.;
-            if (derived > 0. && manual > 0.) limit = std::min(derived, manual);
-            else                             limit = std::max(derived, manual);
+            // Whichever is stricter, ignoring the ones that are switched off (0 = not applied). The one
+            // shared definition, also used by the GUI drag limit and the automatic plane planner.
+            const double limit = virtual_tilt_limit_enforced_deg(envelope, m_config.nonplanar_gantry_height.value,
+                                                                 manual, reach, azimuth);
             if (limit <= 0. || tilt <= limit + EPSILON)
                 continue;
 
@@ -2609,19 +2609,42 @@ SegmentFootprint segment_support_footprint(const PrintObject *child)
     Polygons     body;
     const double lh = std::max(0.01, child->config().layer_height.value);
 
+    // UNLAYERED_MOD -- a floor that is TILTED in the child's slice frame (a cut plane whose build
+    // direction is overridden, e.g. a horizontal cut under 5-degree layers) rises across the child's
+    // layers, so the child's support reaches it in a different layer at every XY. The fixed window
+    // above the lowest layer then sees only the strip where the floor is lowest: on a 10 mm overhang
+    // at 5 degrees the floor climbs ~0.9 mm (4-5 layers) and everything landing on the higher part
+    // was never handed down -- the parent printed no column under it and the child's support started
+    // in mid-air (measured: 533 unfounded support samples, gaps to 2.5 mm, on a saved Centauri
+    // project; 84 / 0.075 mm planar). Collect, in addition, whatever lies in each layer's floor band:
+    // where the floor actually passes through that layer. For a floor parallel to the layers the band
+    // is the lowest slab only, so this adds nothing there.
+    const SegmentSupportBounds bounds(*child);
+    const bool                 floor_bands = bounds.is_active() && child->is_segment() && ! child->is_root_segment();
+    auto                       band_of     = [&bounds, lh](coordf_t bottom_z, coordf_t print_z) {
+        return bounds.floor_band(bottom_z - lh, print_z + lh);
+    };
+
     const ConstSupportLayerPtrsAdaptor support_layers = child->support_layers();
     if (! support_layers.empty()) {
         coordf_t z_lo = support_layers.front()->print_z;
         for (const SupportLayer *sl : support_layers)
             z_lo = std::min(z_lo, sl->print_z);
         const coordf_t z_threshold = z_lo + coordf_t(2. * lh);
-        for (const SupportLayer *sl : support_layers)
+        for (const SupportLayer *sl : support_layers) {
+            // Normal/grid support records its footprint in support_islands; classic tree
+            // leaves that empty and uses base_areas. Take both so either style cascades.
             if (sl->print_z <= z_threshold) {
-                // Normal/grid support records its footprint in support_islands; classic tree
-                // leaves that empty and uses base_areas. Take both so either style cascades.
                 append(out,       to_polygons(sl->support_islands));
                 append(tree_base, to_polygons(sl->base_areas));
+            } else if (floor_bands) {
+                const Polygons band = band_of(sl->bottom_z(), sl->print_z);
+                if (! band.empty()) {
+                    append(out,       intersection(to_polygons(sl->support_islands), band));
+                    append(tree_base, intersection(to_polygons(sl->base_areas), band));
+                }
             }
+        }
     }
 
     // A tree roots in a wide base pad. Handing the full pad down makes the parent mirror it as a
@@ -2641,9 +2664,15 @@ SegmentFootprint segment_support_footprint(const PrintObject *child)
         const coordf_t z_lo = child->get_layer(0)->print_z;
         for (size_t i = 0; i < child->layer_count(); ++ i) {
             const Layer *layer = child->get_layer(int(i));
-            if (layer->print_z > z_lo + coordf_t(2. * lh))
+            if (layer->print_z <= z_lo + coordf_t(2. * lh)) {
+                append(body, to_polygons(layer->lslices));
+            } else if (floor_bands) {
+                // Same reason as above: on a tilted floor the body rests on it layer by layer.
+                const Polygons band = band_of(layer->bottom_z(), layer->print_z);
+                if (! band.empty())
+                    append(body, intersection(to_polygons(layer->lslices), band));
+            } else
                 break;              // layers are sorted by print_z
-            append(body, to_polygons(layer->lslices));
         }
     }
 

@@ -2868,6 +2868,17 @@ double virtual_tilt_limit_deg(const HotendEnvelope &envelope, double gantry_heig
 double                virtual_tilt_hotend_term_deg(const HotendEnvelope &envelope, std::optional<double> tilt_azimuth_rad);
 HotendEnvelope::Side  virtual_tilt_binding_face(const HotendEnvelope &envelope, std::optional<double> tilt_azimuth_rad);
 
+// UNLAYERED_MOD -- the tilt limit actually ENFORCED on a virtual 5-axis printer: the stricter of the
+// geometry-derived limit above and the hand-set ceiling `manual_max_deg`
+// (nonplanar_virtual_max_angle), ignoring whichever of the two is switched off (<= 0). Returns 0 =
+// NO LIMIT only when both are off. Print::validate(), the GUI's drag limit and the automatic plane
+// planner all go through this one function, so none of them can disagree about what is allowed.
+//
+// A caller that PROPOSES tilts (rather than checking a user's) must not read 0 as permission: it
+// means nothing about the machine was characterised, not that any tilt is safe.
+double virtual_tilt_limit_enforced_deg(const HotendEnvelope &envelope, double gantry_height_mm, double manual_max_deg,
+                                       double reach_mm, std::optional<double> tilt_azimuth_rad = std::nullopt);
+
 } // namespace Slic3r
 
 // Serialization through the Cereal library

@@ -14,6 +14,8 @@ struct CutPlane;
 
 namespace GUI {
 
+struct AutoPlanesJobState;
+
 // Declarative cut-plane authoring: edits ModelObject::cut_planes, a non-destructive per-object
 // list of planes consumed at slice time. Unlike GLGizmoCut3D / GLGizmoCutChunks3D it NEVER splits
 // the object.
@@ -83,6 +85,24 @@ public:
     std::string get_tooltip() const override;
 
 private:
+    // UNLAYERED_MOD -- "Suggest planes": the automatic, printer-aware planner (libslic3r/AutoPlanes).
+    // Runs as a background job (AutoPlanesJob) with cancellation. Its result is a PENDING suggestion:
+    // while one is pending the chunk preview is built from the suggested planes instead of the stored
+    // ones, and the panel shows the decision, expected benefits, rejections and limitations. Nothing
+    // in the model changes until the user applies it (one undo snapshot); discarding restores the
+    // previous preview. Add/replace is chosen before planning so both modes preview a validated plan.
+    std::shared_ptr<AutoPlanesJobState> m_auto_job;
+    std::shared_ptr<AutoPlanesJobState> m_auto_result;          // finished, valid, awaiting a decision
+    std::vector<Slic3r::CutPlane>       m_auto_preview_planes;  // planes the chunk preview shows while pending
+    bool                                m_auto_prev_preview_chunks { false };
+    int                                 m_auto_preference { 0 }; // 0 balanced, 1 fewer supports, 2 finish
+    bool                                m_auto_keep_existing { true };
+    void start_auto_planes();
+    void poll_auto_planes();
+    void render_auto_planes_panel();
+    void apply_auto_planes();
+    void discard_auto_planes();
+
     // "Select face": while armed, the next click on the object snaps the editing plane to the
     // clicked triangle (hit point + face normal), then commits it if a stored plane is bound.
     // Works on the real merged mesh, so any face qualifies -- concave pockets included -- unlike

@@ -8806,6 +8806,16 @@ void GCode::update_contact_frame(const PrintObject *object, const Transform3d &t
         // object-contact fan on for the bonding layer of every existing cut-plane print, which
         // needs the AsFirstLayer semantics settled first -- left as is, see belt-printer.md.
         f.object_band = std::max(0, m_config.object_contact_layers.value) * f.thickness;
+        // Floor gap fill: only above a root that prints on a flat bed, where the root's print_z is a
+        // world height and its top layer is the material the bonding layer has to reach.
+        if (object->print() != nullptr && object->is_segment() && ! object->segment()->is_part())
+            for (const PrintObject *po : object->print()->objects())
+                if (po != object && po->is_root_segment() && po->segment()->root_builds_up &&
+                    po->model_object() == object->model_object() && po->trafo().isApprox(object->trafo(), 0.) &&
+                    po->segment_index() == object->segment()->parent) {
+                    f.fill_parent     = po;
+                    f.child_to_parent = po->object_to_slice() * object->slice_to_object();
+                }
     }
     // Beyond the largest "first N layers" any consumer reads, the index no longer matters, so the
     // path splitter need not cut there.
@@ -8977,6 +8987,102 @@ int GCode::path_first_layer_index() const
     return m_contact_frame.active ? m_path_contact.index : this->layer_id();
 }
 
+// UNLAYERED_MOD -- see GCode.hpp (m_floor_fill_scale).
+bool GCode::floor_gap_fill_split(const ExtrusionPath &path, std::vector<std::pair<ExtrusionPath, double>> &pieces)
+{
+    const ContactFrame &f = m_contact_frame;
+    pieces.clear();
+    // Not keyed on the contact class: that needs object_contact_layers > 0, which defaults to 0. The
+    // parent-top search below already limits the fill to beads within a few layer heights of the
+    // section below, and anything not over its material is left alone.
+    if (! f.active || f.fill_parent == nullptr || path.polyline.points.size() < 2 || path.height <= 0.f ||
+        is_bridge(path.role()) || path.role() == erSupportMaterial || path.role() == erSupportMaterialInterface ||
+        path.role() == erSupportTransition)
+        return false;
+    constexpr double kMinScale = 0.75, kMaxScale = 1.6, kStep = 1.0 /* mm */, kBin = 0.05 /* scale quantum */;
+    const double cos_t = std::max(0.5, std::abs(f.bed_n.z()));
+    const PrintObject &parent = *f.fill_parent;
+
+    // Top of the parent's material under a child slice-frame point (world height), or NaN where the
+    // parent has none (the bead then spans empty space: a bridge, not a bond -- leave it alone).
+    auto parent_top = [&](const Vec3d &p_child) -> double {
+        const Vec3d q  = f.child_to_parent * p_child;
+        const Point qp = Point::new_scale(q.x(), q.y());
+        for (int i = int(parent.layer_count()) - 1; i >= 0; -- i) {
+            const Layer *l = parent.get_layer(i);
+            if (l->lslices.empty())
+                continue;
+            if (l->print_z > q.z() + 2. * double(path.height))
+                continue;                      // well above this point: belongs to elsewhere on the part
+            for (const ExPolygon &ex : l->lslices)
+                if (ex.contains(qp))
+                    return l->print_z;
+            if (l->print_z < q.z() - 3. * double(path.height))
+                break;                         // searched far enough below
+        }
+        return std::numeric_limits<double>::quiet_NaN();
+    };
+    // Scale for a point: the vertical gap between the bead's nominal bottom and the parent's top,
+    // converted to a thickness factor along the layer normal.
+    auto scale_at = [&](const Point3 &p) -> double {
+        const Vec2d  g     = this->point_to_gcode(Point(p.x(), p.y()));
+        const double z     = m_nominal_z + unscale<double>(p.z());
+        const double top_w = f.bed_n.dot(Vec3d(g.x(), g.y(), z)) + f.bed_k;      // world height of the bead top
+        const double ptop  = parent_top(Vec3d(unscale<double>(p.x()), unscale<double>(p.y()), z));
+        if (! std::isfinite(ptop))
+            return 1.;
+        const double need  = (top_w - ptop) * cos_t;                             // thickness needed along the normal
+        double s = need / double(path.height);
+        // Only a bead that can actually reach the material below is a bonding bead. One farther away
+        // is a later layer of this section resting on its own earlier layers (the section below is
+        // simply the nearest thing found under it): leave its flow alone. Without this every bead
+        // above the section below came out at the cap.
+        if (s > kMaxScale * 1.25 || s <= 0.)
+            return 1.;
+        s = std::clamp(s, kMinScale, kMaxScale);
+        return std::round(s / kBin) * kBin;
+    };
+
+    // Resample at kStep and group consecutive pieces of equal scale.
+    Points3 run { path.polyline.points.front() };
+    double  cur = -1.;
+    bool    any = false;
+    auto flush = [&](double s) {
+        if (run.size() >= 2) {
+            ExtrusionPath sub(path);
+            sub.polyline = Polyline3(run);
+            pieces.emplace_back(std::move(sub), s);
+            any = any || std::abs(s - 1.) > 1e-6;
+        }
+        const Point3 last = run.back();
+        run.clear();
+        run.push_back(last);
+    };
+    for (size_t i = 0; i + 1 < path.polyline.points.size(); ++ i) {
+        const Point3 &a = path.polyline.points[i], &b = path.polyline.points[i + 1];
+        const double  len = unscale<double>((b - a).cast<double>().norm());
+        const int     n   = std::max(1, int(std::ceil(len / kStep)));
+        for (int k = 1; k <= n; ++ k) {
+            const Vec3d  m  = a.cast<double>() + (double(k) - 0.5) / double(n) * (b - a).cast<double>();
+            const double sc = scale_at(Point3(Vec3crd(coord_t(std::lround(m.x())), coord_t(std::lround(m.y())), coord_t(std::lround(m.z())))));
+            if (cur < 0.)
+                cur = sc;
+            else if (std::abs(sc - cur) > 1e-9) {
+                flush(cur);
+                cur = sc;
+            }
+            const Vec3d e = a.cast<double>() + double(k) / double(n) * (b - a).cast<double>();
+            run.push_back(k == n ? b : Point3(Vec3crd(coord_t(std::lround(e.x())), coord_t(std::lround(e.y())), coord_t(std::lround(e.z())))));
+        }
+    }
+    flush(cur);
+    if (! any) {
+        pieces.clear();
+        return false;
+    }
+    return true;
+}
+
 double GCode::path_object_contact_speed() const
 {
     return (m_contact_frame.active && m_path_contact.cls == PathContact::Object) ? m_config.object_contact_speed.value : 0.;
@@ -9063,6 +9169,26 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
         }
     } else {
         m_path_contact = PathContact();
+    }
+
+    // UNLAYERED_MOD -- floor gap fill: a bonding-layer bead over the section below is written as short
+    // pieces whose flow and height reach down (or up) to that section's actual top.
+    if (! m_floor_fill_locked && dynamic_cast<const ExtrusionPathSloped*>(&path) == nullptr) {
+        std::vector<std::pair<ExtrusionPath, double>> pieces;
+        if (this->floor_gap_fill_split(path, pieces)) {
+            std::string out;
+            const bool was_locked = m_path_contact_locked;
+            m_path_contact_locked = true;     // pieces keep the class already assigned
+            m_floor_fill_locked   = true;
+            for (const auto &[sub, sc] : pieces) {
+                m_floor_fill_scale = sc;
+                out += this->_extrude(sub, description, speed, trafo);
+            }
+            m_floor_fill_scale    = 0.;
+            m_floor_fill_locked   = false;
+            m_path_contact_locked = was_locked;
+            return out;
+        }
     }
 
     // Orca: wave-overhang debug-gcode markers (per-path scope).
@@ -9298,6 +9424,11 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
     // flow down to that sub-layer's share of the nominal layer height and report the sub-height
     // as the effective extrusion height. Inert (ratio == 0) outside the sublayer emission block.
     float effective_height = path.height;
+    // UNLAYERED_MOD -- floor gap fill: the bead reaches down to the material below (see GCode.hpp).
+    if (m_floor_fill_scale > 0.) {
+        _mm3_per_mm      *= m_floor_fill_scale;
+        effective_height  = float(effective_height * m_floor_fill_scale);
+    }
     if (m_sub_layer_flow_ratio > 0.0) {
         _mm3_per_mm *= m_sub_layer_flow_ratio;
         effective_height = static_cast<float>(m_sub_layer_height);

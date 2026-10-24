@@ -1,0 +1,41 @@
+name: Nonplanar review Windows
+
+# Focused verification on the contribution branches; upstream release workflows
+# retain their existing manual dispatch policy.
+on:
+  push:
+    branches: [codex/upstream-auto-planes, codex/upstream-curved-transitions]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: nonplanar-review-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  calibration_geometry:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: Test generated calibration geometry
+        run: |
+          python3 -m venv .model-test-venv
+          .model-test-venv/bin/python -m pip install -r tools/multiplanar_test_totem/requirements.txt
+          .model-test-venv/bin/python -m unittest discover -s tools/multiplanar_test_totem -p 'test_*.py' -v
+  build_windows:
+    uses: ./.github/workflows/build_check_cache.yml
+    with:
+      os: windows-latest
+      arch: x64
+      compiler: clang
+    secrets: inherit
+  tests:
+    needs: build_windows
+    if: ${{ !cancelled() && needs.build_windows.result != 'cancelled' }}
+    uses: ./.github/workflows/unit_tests.yml
+    with:
+      os: windows-latest
+      artifact: ${{ github.sha }}-tests-windows-x64
