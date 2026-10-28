@@ -2,6 +2,7 @@
 
 #include "libslic3r/libslic3r.h"
 #include "libslic3r/GCode/GCodeProcessor.hpp"
+#include "libslic3r/GCode/ImportedPrintStatistics.hpp"
 #include "libslic3r/MultiNozzleUtils.hpp"
 #include "libslic3r/PrintConfig.hpp"
 
@@ -10,6 +11,7 @@
 #include <cmath>
 #include <fstream>
 #include <iomanip>
+#include <limits>
 #include <map>
 #include <memory>
 #include <sstream>
@@ -18,6 +20,106 @@
 
 using namespace Slic3r;
 using Catch::Matchers::WithinAbs;
+
+TEST_CASE("Imported filament summary includes planar and moving-Z deposition", "[GCodeStatistics]")
+{
+    const bool absolute_e = GENERATE(false, true);
+    const bool moving_z = GENERATE(false, true);
+    FullPrintConfig config;
+    config.gcode_flavor.value = gcfMarlinFirmware;
+    config.filament_diameter.values = {1.75};
+    config.filament_density.values = {1.25};
+    config.filament_cost.values = {20.0};
+    config.filament_map.values = {1};
+    GCodeProcessor::s_IsBBLPrinter = true;
+    ScopedTemporaryFile temp(".gcode");
+    {
+        std::ofstream out(temp.string());
+        out << "G21\nG90\n" << (absolute_e ? "M82\n" : "M83\n")
+            << "G92 E0\nT0\n; FEATURE: Outer wall\nG1 X10 Y0 Z0.2 E5 F1200\n"
+            << "G1 E" << (absolute_e ? 4 : -1) << "\n"
+            << "G1 E" << (absolute_e ? 5 : 1) << "\nG1 X11\n"
+            << "; FEATURE: Support\nG1 X20 Y1 Z" << (moving_z ? 0.6 : 0.2)
+            << " E" << (absolute_e ? 10 : 5) << "\n"
+            << "; FEATURE: Prime tower\nG1 X30 Y2 Z" << (moving_z ? 1.0 : 0.2)
+            << " E" << (absolute_e ? 15 : 5) << "\n";
+    }
+    GCodeProcessor processor;
+    processor.apply_config(config);
+    processor.process_file(temp.string());
+    const auto& result = processor.get_result();
+    const auto& paths = result.print_statistics;
+    const double area = PI * sqr(1.75 / 2.0);
+    REQUIRE_THAT(paths.model_volumes_per_extruder.at(0), WithinAbs(5.0 * area, 1e-4));
+    REQUIRE_THAT(paths.support_volumes_per_extruder.at(0), WithinAbs(5.0 * area, 1e-4));
+    REQUIRE_THAT(paths.wipe_tower_volumes_per_extruder.at(0), WithinAbs(5.0 * area, 1e-4));
+
+    const auto stats = imported_print_statistics(result);
+    CHECK_THAT(stats.total_used_filament, WithinAbs(15.0, 1e-4));
+    CHECK_THAT(stats.total_extruded_volume, WithinAbs(15.0 * area, 1e-4));
+    CHECK_THAT(stats.total_weight, WithinAbs(15.0 * area * 1.25 * 0.001, 1e-6));
+    CHECK_THAT(stats.total_cost, WithinAbs(stats.total_weight * 20.0 * 0.001, 1e-8));
+    CHECK(stats.filament_stats == paths.model_volumes_per_extruder);
+    const double excluded = paths.support_volumes_per_extruder.at(0) + paths.wipe_tower_volumes_per_extruder.at(0);
+    CHECK_THAT(stats.total_used_filament - excluded / area, WithinAbs(5.0, 1e-4));
+    CHECK_THAT(stats.total_weight - excluded * 1.25 * 0.001, WithinAbs(5.0 * area * 1.25 * 0.001, 1e-6));
+}
+
+TEST_CASE("Imported filament summary converts each material with its own diameter and density", "[GCodeStatistics]")
+{
+    GCodeProcessorResult result;
+    result.filament_diameters = {1.75f, 2.85f};
+    result.filament_densities = {1.25f, 1.0f};
+    result.filament_costs = {20.0f, 30.0f};
+    result.print_statistics.total_volumes_per_extruder = {{0, 1000.0}, {1, 2000.0}};
+    result.print_statistics.model_volumes_per_extruder = {{0, 700.0}, {1, 1500.0}};
+    const auto stats = imported_print_statistics(result);
+    const double length_mm = 1000.0 / (PI * sqr(0.875)) + 2000.0 / (PI * sqr(double(2.85f) / 2.0));
+    CHECK_THAT(stats.total_extruded_volume, WithinAbs(3000.0, 1e-9));
+    CHECK_THAT(stats.total_used_filament, WithinAbs(length_mm, 1e-9));
+    CHECK_THAT(stats.total_weight, WithinAbs(3.25, 1e-9));
+    CHECK_THAT(stats.total_cost, WithinAbs(0.085, 1e-9));
+    CHECK(stats.filament_stats == result.print_statistics.model_volumes_per_extruder);
+    // Internal values stay metric. Preview's inches/ounces conversion must
+    // happen once, after aggregation, including when support is subtracted.
+    CHECK_THAT(stats.total_used_filament / 25.4, WithinAbs(length_mm / 25.4, 1e-9));
+}
+
+TEST_CASE("Reloading an imported filament summary replaces prior totals", "[GCodeStatistics]")
+{
+    GCodeProcessorResult result;
+    result.filament_diameters = {1.75f};
+    result.filament_densities = {1.25f};
+    result.filament_costs = {20.0f};
+    result.print_statistics.total_volumes_per_extruder = {{0, 1000.0}};
+    result.print_statistics.model_volumes_per_extruder = {{0, 900.0}};
+    auto stats = imported_print_statistics(result);
+    const auto first_weight = stats.total_weight;
+    stats = imported_print_statistics(result);
+    CHECK(stats.total_weight == first_weight);
+    result.print_statistics.reset();
+    stats = imported_print_statistics(result);
+    CHECK(stats.total_used_filament == 0.0);
+    CHECK(stats.total_extruded_volume == 0.0);
+    CHECK(stats.total_weight == 0.0);
+    CHECK(stats.total_cost == 0.0);
+    CHECK(stats.filament_stats.empty());
+}
+
+TEST_CASE("Imported filament summary rejects incomplete or invalid material data", "[GCodeStatistics]")
+{
+    GCodeProcessorResult result;
+    result.filament_diameters = {1.75f};
+    result.filament_densities = {1.25f};
+    result.filament_costs = {20.0f};
+    result.print_statistics.total_volumes_per_extruder = {{0, 1000.0}};
+    SECTION("missing material") { result.filament_diameters.clear(); }
+    SECTION("zero diameter") { result.filament_diameters[0] = 0.0f; }
+    SECTION("nonfinite density") { result.filament_densities[0] = std::numeric_limits<float>::quiet_NaN(); }
+    SECTION("negative cost") { result.filament_costs[0] = -1.0f; }
+    SECTION("nonfinite volume") { result.print_statistics.total_volumes_per_extruder[0] = std::numeric_limits<double>::infinity(); }
+    CHECK_THROWS_AS(imported_print_statistics(result), std::invalid_argument);
+}
 
 // Regression coverage for filament/tool-change time being folded into the first
 // pending motion block (an extrusion move) instead of the tool-change move, and

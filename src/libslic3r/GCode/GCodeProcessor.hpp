@@ -253,10 +253,12 @@ class Print;
             // Declarative cut planes: index of the segment ("section") this move belongs to, -1
             // for an ordinary object. Drives the section view in the preview.
             //
-            // KEEP THESE TWO LAST, IN THIS ORDER: this struct is brace-initialised positionally in
+            // KEEP THESE IN THIS ORDER; append new fields after them. This struct is initialised positionally in
             // store_move_vertex(), so an insert in the middle -- or swapping these two -- silently
             // shifts every later field.
             int  cut_segment_id{-1};
+            // Appended to preserve existing positional aggregate initializers.
+            uint8_t layer_mode{0}; // 0 planar, 1 transition, 2 curved
 
             float volumetric_rate() const { return feedrate * mm3_per_mm; }
             float actual_volumetric_rate() const { return actual_feedrate * mm3_per_mm; }
@@ -276,6 +278,8 @@ class Print;
         // always +Z, so a planar print has exactly one entry and every move points at it. The
         // multiplanar orientation is piecewise constant per chunk, so this stays tiny.
         std::vector<Vec3f> tool_axes;
+        std::vector<std::string> layer_strategy_decisions;
+        std::vector<std::string> layer_region_records;
         // UNLAYERED_MOD: the print was sliced for virtual-5-axis (3-axis) output -- B/C words are
         // suppressed and the physical nozzle stays vertical, so the preview's hotend marker must
         // not tilt even though tool_axes carries the layers' (tilted) build directions.
@@ -370,6 +374,8 @@ class Print;
             // and move assignments, so every new member has to be added here by hand or it silently
             // stays at its default in the destination (which is how the tilted preview first broke).
             tool_axes = other.tool_axes;
+            layer_strategy_decisions = other.layer_strategy_decisions;
+            layer_region_records = other.layer_region_records;
             virtual_5axis = other.virtual_5axis;
             lines_ends = other.lines_ends;
             printable_area = other.printable_area;
@@ -1214,6 +1220,8 @@ class Print;
         // externally produced 5-axis G-code still previews; once true the tags win outright (they are
         // exact, and virtual_5axis exports carry the tags but no B/C words at all).
         bool m_has_tool_axis_tag{ false };
+        uint8_t m_layer_mode{0};
+        bool m_has_layer_mode_tag{false};
         // Last B/C seen as G-code words, degrees. Seeded with the identity datum (B = -90, C = 0) so a
         // line that moves only one of the two keeps the other.
         std::array<float, 2> m_last_bc_deg{ -90.0f, 0.0f };

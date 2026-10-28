@@ -1,0 +1,5 @@
+numpy>=1.21
+trimesh>=4
+manifold3d>=3
+scipy>=1.9
+matplotlib>=3.6

@@ -17,6 +17,8 @@ rem               allow a target that is the directory the caches were generated
 rem               into (resources\profiles). Pruning it deletes the checkout's
 rem               own preset JSONs, which is a packaging step - not something a
 rem               build should do to a working tree by surprise. CI passes it.
+rem   --keep-json
+rem               keep stock JSONs alongside caches for CLI preset inheritance.
 rem
 rem Shipping deletes, so it is a CI packaging step. A vendor's own <vendor>.json
 rem goes along with its preset JSONs: the cache carries the vendor profile and
@@ -32,7 +34,13 @@ setlocal enabledelayedexpansion
 set "REPO_ROOT=%~dp0.."
 
 set "PRUNE_SOURCE="
+set "KEEP_JSON="
 :parse_flags
+if /i "%~1"=="--keep-json" (
+    set "KEEP_JSON=1"
+    shift
+    goto :parse_flags
+)
 if /i "%~1"=="--prune-source" (
     set "PRUNE_SOURCE=1"
     shift
@@ -112,6 +120,10 @@ if /i "%TARGET%"=="%PROFILES%" if not defined PRUNE_SOURCE (
     exit /b 0
 )
 if /i not "%TARGET%"=="%PROFILES%" copy /y "%PROFILES%\*.opc" "%TARGET%\" >nul
+if defined KEEP_JSON (
+    echo %TARGET%: caches shipped; stock preset JSONs retained for CLI inheritance.
+    exit /b 0
+)
 
 set /a SHIPPED=0
 set /a PRUNED=0

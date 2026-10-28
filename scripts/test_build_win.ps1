@@ -447,6 +447,8 @@ $cases = @(
        NotContains = @('-DDEP_BUILD_DIR') }
     @{ Name = '--deps-dir tells the slicer where the deps are'; Args = @('-s', '--deps-dir', 'D:\orca-deps')
        Contains = @('-DDEP_BUILD_DIR="D:\orca-deps"') }
+    @{ Name = 'a relative dependency path has an absolute CMake origin'; Args = @('-s', '--deps-dir', 'deps/build')
+       Match = @('-DDEP_BUILD_DIR="[A-Za-z]:\\.*\\deps\\build"') }
     @{ Name = '--deps-dir also redirects the deps build'; Args = @('-d', '--deps-dir', 'D:\orca-deps')
        Contains = @('cmake -S deps -B "D:\orca-deps"', 'cmake --build "D:\orca-deps"')
        NotContains = @('deps/build') }

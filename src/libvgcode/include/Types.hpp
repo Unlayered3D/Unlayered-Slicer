@@ -55,6 +55,15 @@ using Mat4x4 = std::array<float, 16>;
 //
 using Color = std::array<uint8_t, 3>;
 
+inline Color layer_mode_color(uint8_t mode) {
+    switch(mode) {
+    case 1:return Color{245,168,66};
+    case 2:return Color{165,107,239};
+    case 0:return Color{66,161,218};
+    default:return Color{155,155,155};
+    }
+}
+
 //
 // Color palette
 //
@@ -103,6 +112,7 @@ enum class EViewType : uint8_t
     // matching the Prepare tab's chunk preview. Appended last so previously stored view-type
     // indices keep pointing at the same view.
     CutSegment,
+    LayerMode,
     COUNT
 };
 

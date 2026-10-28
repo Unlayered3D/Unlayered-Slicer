@@ -7,6 +7,7 @@
 #include "IMSlider.hpp"
 #include "GLModel.hpp"
 #include "I18N.hpp"
+#include "libslic3r/CurvedPlanningReport.hpp"
 
 #include <boost/iostreams/device/mapped_file.hpp>
 
@@ -233,6 +234,11 @@ private:
     // See GCodeProcessorResult::tool_axis_fixed.
     bool  m_tool_axis_fixed{ false };
     Vec3f m_fixed_tool_axis{ Vec3f::UnitZ() };
+    std::vector<std::string> m_layer_strategy_decisions;
+    std::vector<CurvedTransition::RegionDecision> m_planning_regions;
+    bool m_show_planning_regions=true,m_show_rejected_planning_regions=false;
+    int m_highlight_planning_region=-1;
+    void render_planning_regions(int width,int height);
 
     ConfigOptionMode m_user_mode;
     bool m_fold = {false};

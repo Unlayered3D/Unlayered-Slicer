@@ -1895,6 +1895,10 @@ Print::ApplyStatus Print::apply(const Model &model, DynamicPrintConfig new_full_
         // Walk over all new model objects and check, whether there are matching PrintObjects.
         for (ModelObject *model_object : m_model.objects) {
             ModelObjectStatus &model_object_status = const_cast<ModelObjectStatus&>(model_object_status_db.reuse(*model_object));
+            const auto* curved_option=static_cast<const ConfigOptionBool*>(model_object->config.option("curved_layer_blend"));
+            const auto* automatic_option=static_cast<const ConfigOptionBool*>(model_object->config.option("automatic_layer_strategy"));
+            const bool automatic=automatic_option?automatic_option->value:m_default_object_config.automatic_layer_strategy.value;
+            const bool curved=automatic || (curved_option?curved_option->value:m_default_object_config.curved_layer_blend.value);
             // Declarative cut planes: derive the segment partition. Gated on the canonical
             // non-planar switch and an active stack; ordinary objects derive nothing and follow
             // the legacy path bit-for-bit. Derivation is deterministic, so an unchanged stack
@@ -1902,7 +1906,7 @@ Print::ApplyStatus Print::apply(const Model &model, DynamicPrintConfig new_full_
             // Orca: Updated for XYZ filament shrink compensation
             model_object_status.print_instances = print_objects_from_model_object(
                 *model_object, this->shrinkage_compensation(),
-                m_config.enable_nonplanar.value && (model_object->cut_planes.active() || object_has_directed_parts(*model_object)),
+                !curved && m_config.enable_nonplanar.value && (model_object->cut_planes.active() || object_has_directed_parts(*model_object)),
                 m_config.initial_layer_print_height.value,
                 // ... and a cut-plane object: its non-root segments un-rotate about the instance
                 // placement too, so its copies cannot share one PrintObject either.
