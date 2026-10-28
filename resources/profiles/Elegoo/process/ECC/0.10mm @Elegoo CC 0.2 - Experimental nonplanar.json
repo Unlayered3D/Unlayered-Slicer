@@ -1,0 +1,19 @@
+{
+	"from": "system",
+	"inherits": "0.10mm Standard @Elegoo CC 0.2 nozzle",
+	"name": "0.10mm @Elegoo CC 0.2 - Experimental nonplanar",
+	"print_extruder_id": [
+		"1"
+	],
+	"print_extruder_variant": [
+		"Direct Drive Standard"
+	],
+	"print_sequence": "by group",
+	"type": "process",
+	"instantiation": "true",
+	"setting_id": "1W6Zk2dTyasjA2jI",
+	"compatible_printers": [
+		"Elegoo Centauri Carbon 0.2 - Experimental nonplanar 5deg"
+	],
+	"notes": "Experimental fixed-upright-nozzle nonplanar trial. Fusion height check 2026-10-12 on the 0.4 mm assembly: stock printable height 256 mm; raw CAD joint maximum tip-to-bed separation 260.300377 mm. The 0.2 mm exterior envelope and installed tip position remain unverified. The 100 mm setting is a software nozzle-Z ceiling, not 100 mm object height; current upstream print-height checking excludes custom startup/end scripts. No universal safe object height is established. Keep commissioning objects below 10 mm and budget every move separately. Gantry proxy 14 mm is relative to the nozzle, not maximum object height. See resources/profiles/Elegoo/NONPLANAR_CENTAURI.md. Prior trial reported transition/support/stringing defects; no contact noticed."
+}
