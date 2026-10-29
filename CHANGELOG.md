@@ -2,10 +2,17 @@
 
 All notable changes to Unlayered Slicer are listed here, newest first.
 
-## 0.1.8 — 2026-10-24
+## 0.1.8 — 2026-10-28
 
 ### Added
 
+- **Nonplanar layers (experimental).** Gently sloped top surfaces can print as curved layers that
+  follow the model, so they come out smooth instead of stair-stepped. The nozzle moves up and down
+  while it prints them; this works on ordinary 3-axis printers. Turn it on in Quality > Nonplanar
+  layers, with a maximum angle (12° by default) and height (5 mm by default). Everything under the
+  curved layers prints exactly as a normal slice, with your full walls, and the curved layers count
+  as the top layers. A top that cannot be printed safely this way stays flat, and the slicer says
+  why. Check the preview before printing: this is a first version.
 - **Update your Unlayered printer** in the setup wizard: after the printer picker, when an Unlayered
   printer is picked or already set up. Check for updates reads the printer and the published firmware and
   printer settings and says what is waiting; when you finish setup, the "Printer update available"
