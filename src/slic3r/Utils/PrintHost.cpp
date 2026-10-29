@@ -384,6 +384,14 @@ void PrintHostJobQueue::priv::perform_job(PrintHostJob the_job)
 
 void PrintHostJobQueue::enqueue(PrintHostJob job)
 {
+    // The slicing thread queues the upload it was asked for (BackgroundSlicingProcess::prepare_upload),
+    // but append_job adds a row to the queue dialog and pushes a notification: main thread only.
+    // Queued whole, so the upload thread never sees a job before its row exists.
+    if (!wxIsMainThread()) {
+        auto holder = std::make_shared<PrintHostJob>(std::move(job));
+        wxTheApp->CallAfter([this, holder]() { enqueue(std::move(*holder)); });
+        return;
+    }
     p->start_bg_thread();
     p->queue_dialog->append_job(job);
     p->channel_jobs.push(std::move(job));

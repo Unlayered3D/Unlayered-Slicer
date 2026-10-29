@@ -127,9 +127,14 @@ ZUserLogin::ZUserLogin(std::shared_ptr<ICloudServiceAgent> cloud_agent)
         m_message->SetForegroundColour(*wxBLACK);
         m_message->Wrap(FromDIP(360));
 
-        // Unlayered: this used to carry a "Click here to download it." link that opened the Bambu
-        // network plug-in installer. The plug-in is not installable, so the message stands alone.
+        // ORCA standardized HyperLink
+        auto m_download_hyperlink = new HyperLink(this, _L("Click here to download it."));
+        m_download_hyperlink->Bind(wxEVT_LEFT_DOWN, [this](wxMouseEvent& event) {
+            this->Close();
+            wxGetApp().ShowDownNetPluginDlg();
+        });
         m_sizer_main->Add(m_message, 0, wxALIGN_CENTER | wxALL, FromDIP(15));
+        m_sizer_main->Add(m_download_hyperlink, 0, wxALIGN_CENTER | wxALL, FromDIP(10));
         m_sizer_main->Add(0, 0, 1, wxBOTTOM, 10);
 
         SetSizer(m_sizer_main);

@@ -5194,3 +5194,84 @@ TEST_CASE("Config import confines zip entries, preset names and bundle ids to th
         CHECK_FALSE(any_filename_contains(temp_dir.path(), "bundle-escape"));
     }
 }
+
+// A filament preset holds one value per extruder variant for each per-variant option. A list of
+// another length is resized to the variant count: a short one repeats its first value, a long one
+// is cut, and the list it is measured against is left alone.
+TEST_CASE("Per-variant filament lists are resized to one value per extruder variant", "[Preset][Variant]")
+{
+    PresetBundle       bundle;
+    DynamicPrintConfig config = bundle.filaments.default_preset().config;
+    config.option<ConfigOptionStrings>("filament_extruder_variant")->values = { "Direct Drive Standard", "Direct Drive High Flow" };
+    config.option<ConfigOptionInts>("nozzle_temperature")->values           = { 330 };
+    config.option<ConfigOptionFloatsNullable>("filament_flow_ratio")->values = { 0.98, 1.02 };
+    config.option<ConfigOptionFloats>("filament_max_volumetric_speed")->values = { 10., 12., 14. };
+
+    const std::vector<std::string> resized = normalize_filament_variant_lengths(config, "Test PPS");
+
+    CHECK(config.option<ConfigOptionInts>("nozzle_temperature")->values == std::vector<int>{ 330, 330 });
+    check_double_vector(config.option<ConfigOptionFloatsNullable>("filament_flow_ratio")->values, { 0.98, 1.02 });
+    check_double_vector(config.option<ConfigOptionFloats>("filament_max_volumetric_speed")->values, { 10., 12. });
+    CHECK(config.option<ConfigOptionStrings>("filament_extruder_variant")->values.size() == 2);
+    CHECK(contains_key(resized, "nozzle_temperature"));
+    CHECK(contains_key(resized, "filament_max_volumetric_speed"));
+    CHECK_FALSE(contains_key(resized, "filament_flow_ratio"));
+    CHECK_FALSE(contains_key(resized, "filament_extruder_variant"));
+    for (const std::string &key : filament_options_with_variant) {
+        const auto *values = dynamic_cast<const ConfigOptionVectorBase *>(config.option(key));
+        if (values == nullptr)
+            continue;
+        INFO(key);
+        CHECK(values->size() == 2);
+    }
+
+    // A second pass has nothing left to change.
+    CHECK(normalize_filament_variant_lengths(config, "Test PPS").empty());
+}
+
+TEST_CASE("A config without an extruder variant list is not resized", "[Preset][Variant]")
+{
+    DynamicPrintConfig config;
+    config.option<ConfigOptionInts>("nozzle_temperature", true)->values = { 220, 230, 240 };
+
+    CHECK(normalize_filament_variant_lengths(config, "No variants").empty());
+    CHECK(config.option<ConfigOptionInts>("nozzle_temperature")->values == std::vector<int>{ 220, 230, 240 });
+}
+
+// The project config appends every filament's per-variant lists and finds each filament's values
+// again by counting its variants (filament_self_index). One filament with a single value for two
+// variants used to shift the option for every filament after it (a PPS printed at the PLA's
+// temperature); the joined list now has one value per variant and each filament keeps its own.
+TEST_CASE("A short per-variant filament list does not shift later filaments in the project config", "[Preset][Bundle][Variant][Regression]")
+{
+    const std::vector<std::string> variants = { "Direct Drive Standard", "Direct Drive High Flow" };
+    PresetBundle bundle;
+    auto add_filament = [&bundle, &variants](const std::string &name, const std::vector<int> &temperatures) {
+        Preset &preset = add_inmemory_preset(bundle.filaments, name);
+        preset.config.option<ConfigOptionStrings>("filament_extruder_variant")->values = variants;
+        normalize_filament_variant_lengths(preset.config, name); // a well-formed two-variant preset...
+        preset.config.option<ConfigOptionInts>("nozzle_temperature")->values = temperatures; // ...but this list
+    };
+    add_filament("Test PLA", { 220, 225 });
+    add_filament("Test PPS", { 330 }); // one value for two variants
+    add_filament("Test PETG", { 250, 255 });
+    bundle.filament_presets = { "Test PLA", "Test PPS", "Test PETG" };
+
+    const DynamicPrintConfig full = bundle.full_config(false);
+
+    const ConfigOptionStrings *joined_variants = full.option<ConfigOptionStrings>("filament_extruder_variant");
+    const ConfigOptionInts    *self_index      = full.option<ConfigOptionInts>("filament_self_index");
+    const ConfigOptionInts    *temperatures    = full.option<ConfigOptionInts>("nozzle_temperature");
+    REQUIRE(joined_variants != nullptr);
+    REQUIRE(self_index != nullptr);
+    REQUIRE(temperatures != nullptr);
+    REQUIRE(joined_variants->values.size() == 6);
+    CHECK(self_index->values == std::vector<int>{ 1, 1, 2, 2, 3, 3 });
+    CHECK(temperatures->values.size() == joined_variants->values.size());
+    CHECK(temperatures->values == std::vector<int>{ 220, 225, 330, 330, 250, 255 });
+
+    // Building the project config resizes a copy; the stored preset is untouched.
+    const Preset *pps = bundle.filaments.find_preset("Test PPS", false);
+    REQUIRE(pps != nullptr);
+    CHECK(pps->config.option<ConfigOptionInts>("nozzle_temperature")->values == std::vector<int>{ 330 });
+}

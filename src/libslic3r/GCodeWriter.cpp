@@ -10,6 +10,7 @@
 #include <iostream>
 #include <map>
 #include <assert.h>
+#include <boost/format.hpp>
 #include <GCode/GCodeProcessor.hpp>
 
 #ifdef __APPLE__
@@ -1491,7 +1492,9 @@ std::string GCodeWriter::extrude_to_xyz(const Vec3d &point, double dE, const std
     // UNLAYERED_MOD: the limit scales with a thin first layer (see set_min_extrusion_z); found by
     // fuzzing, every belt print with a 0.1 mm first layer and a brim was refused here.
     if (! force_no_extrusion && m_pos.z() < m_min_extrusion_z && point.z() < m_min_extrusion_z)
-        throw RuntimeError("GCode: very low z");
+        // Say where: without the coordinates a refused move cannot be traced back to its path.
+        throw RuntimeError((boost::format("GCode: very low z (%1$.3f, %2$.3f, %3$.3f -> %4$.3f, %5$.3f, %6$.3f; floor %7$.3f)")
+                            % m_pos.x() % m_pos.y() % m_pos.z() % point.x() % point.y() % point.z() % m_min_extrusion_z).str());
     m_lifted = 0;
     if (!force_no_extrusion) {
         filament()->extrude(dE);

@@ -983,6 +983,46 @@ TEST_CASE("Multi-planar: copies of a rotated object each land on their own footp
     boost::filesystem::remove(temp);
 }
 
+// UNLAYERED_MOD -- a tilted object on a printer with a negative Z offset (a Prusa MINI at -0.63)
+// was refused with "GCode: very low z" for most orientations: the floor test included z_offset,
+// the printer's own calibration, so the first tilted layer looked 0.4 mm into the bed.
+TEST_CASE("Multi-planar: a negative Z offset does not make a tilted object very low z", "[Print][multiplanar][z_offset]")
+{
+    auto slice = [](double z_offset, double b) {
+        DynamicPrintConfig config = DynamicPrintConfig::full_print_config();
+        config.set_deserialize_strict({
+            { "enable_nonplanar", 1 },
+            { "layer_rotation_b", b },
+            { "layer_rotation_c", 90 },
+            { "layer_height", 0.2 }, { "initial_layer_print_height", 0.2 },
+            { "skirt_loops", 0 }, { "brim_type", "no_brim" }, { "enable_prime_tower", 0 }, { "enable_support", 0 },
+            { "printable_area", "0x0,180x0,180x180,0x180" }, { "printable_height", 180 },
+        });
+        config.set_key_value("z_offset", new ConfigOptionFloat(z_offset));
+        config.set_key_value("layer_change_gcode", new ConfigOptionString("G92 E0\n"));
+        Slic3r::Print print;
+        Slic3r::Model model;
+        ModelObject *object = model.add_object();
+        object->add_volume(cube(20));
+        object->add_instance()->set_offset(Vec3d(90., 90., 0.));
+        object->ensure_on_bed();
+        print.auto_assign_extruders(object);
+        print.apply(model, config);
+        print.set_status_silent();
+        REQUIRE(print.validate().string.empty());
+        print.process();
+        const boost::filesystem::path temp = boost::filesystem::temp_directory_path() / boost::filesystem::unique_path("mp-zoffset-%%%%-%%%%.gcode");
+        GCodeProcessorResult result;
+        INFO("z_offset " << z_offset << " B " << b);
+        CHECK_NOTHROW(print.export_gcode(temp.string(), &result, nullptr));
+        boost::filesystem::remove(temp);
+    };
+    for (double b : { -10., -45., -175. }) {
+        slice(0., b);
+        slice(-0.63, b);
+    }
+}
+
 TEST_CASE("Belt printer: material on the belt is not a floating region", "[Print][belt][overhang]")
 {
     {

@@ -1,0 +1,50 @@
+/* Unlayered 0.1.8: the printer update step (guide 21update), styled like 13signin. */
+#Content
+{
+	padding: 0% 15%;
+}
+
+.FeatureText
+{
+	line-height: 26px;
+	margin-top: 4mm;
+}
+
+#CheckArea
+{
+	margin-top: 8mm;
+	text-align: center;
+}
+
+#CheckBtn
+{
+	display: inline-block;
+	min-width: 220px;
+	height: 44px;
+	line-height: 44px;
+	font-size: 16px;
+	cursor: pointer;
+}
+
+#CheckBtn.Busy
+{
+	opacity: 0.6;
+	pointer-events: none;
+}
+
+#ResultText
+{
+	white-space: pre-line;
+}
+
+#SignInLink
+{
+	cursor: pointer;
+	text-decoration: underline;
+	margin-left: 4px;
+}
+
+[hidden]
+{
+	display: none !important;
+}

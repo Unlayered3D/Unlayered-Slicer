@@ -2,6 +2,9 @@
 
 var m_Busy=false;
 var m_Left=false;
+// Unlayered 0.1.8: opened from "Update your Unlayered printer" (guide 21update) to sign in for the
+// printer settings; Next, Skip and Back all return there.
+var m_From=GetQueryString("from");
 
 function OnInit()
 {
@@ -67,6 +70,11 @@ function GoNext()
 {
 	if( m_Busy || m_Left )
 		return;
+	if( m_From=='21update' )
+	{
+		Leave('21update');
+		return;
+	}
 	Send({'command':'request_page_after_signin'});
 	// Should no answer come, the printer picker anyway.
 	setTimeout(function(){ Leave('21'); }, 15000);
@@ -76,7 +84,7 @@ function GoBack()
 {
 	if( m_Busy || m_Left )
 		return;
-	Leave('13');
+	Leave(m_From=='21update' ? '21update' : '13');
 }
 
 function Leave( page )
@@ -84,6 +92,6 @@ function Leave( page )
 	if( m_Left )
 		return;
 	m_Left=true;
-	let known={'13':1,'5import':1,'21':1};
+	let known={'13':1,'5import':1,'21':1,'21update':1};
 	window.location.href="../"+(known[page] ? page : '21')+"/index.html";
 }

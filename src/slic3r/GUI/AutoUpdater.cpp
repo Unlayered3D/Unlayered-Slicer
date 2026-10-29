@@ -13,10 +13,13 @@
 
 #include <boost/algorithm/string/case_conv.hpp>
 #include <boost/algorithm/string/predicate.hpp>
+#include <boost/algorithm/string/trim.hpp>
 #include <boost/format.hpp>
 #include <boost/log/trivial.hpp>
 
 #include "libslic3r_version.h"
+#include "libslic3r/libslic3r.h"
+#include "libslic3r/AppConfig.hpp"
 #include "libslic3r/Semver.hpp"
 #include "libslic3r/Utils.hpp"
 #include "GUI.hpp"
@@ -36,14 +39,30 @@ namespace fs = boost::filesystem;
 namespace Slic3r {
 namespace GUI {
 
+wxString app_title_name()
+{
+    AutoUpdater *u = wxGetApp().auto_updater();
+    const auto   p = u != nullptr ? u->account().profile() : std::nullopt;
+    // profile() is empty once signed out, so a sign-out drops the label.
+    if (p && !p->edition_label.empty())
+        return wxString(SLIC3R_APP_FULL_NAME) + " " + wxString::FromUTF8(p->edition_label);
+    return SLIC3R_APP_FULL_NAME;
+}
+
+void refresh_app_title()
+{
+    if (Plater *plater = wxGetApp().plater())
+        plater->update_title_dirty_status();
+}
+
 namespace {
 
-// Where the application signs in. The key is undocumented and has no UI, like "version_check_url":
-// it exists to point a test build at a local copy of the site.
+// Where the application signs in: the configured account provider (Preferences > Advanced >
+// "Web apps & services"; AppConfig seeds Unlayered's site when the key is absent). Blank means no
+// account at all. Read once at start-up, so a change applies after a restart.
 std::string site_url_from(AppConfig *config)
 {
-    std::string url = config ? config->get("unlayered_site_url") : std::string();
-    return url.empty() ? std::string("https://unlayered3d.com") : url;
+    return config ? boost::algorithm::trim_copy(config->get(SETTING_ACCOUNT_PROVIDER_URL)) : std::string();
 }
 
 // The app config key that carries "an update to X was about to be installed" across the restart,
@@ -344,11 +363,23 @@ void AutoUpdater::on_startup()
         return;
     // Confirms the stored sign-in still works (the person may have signed out on the website).
     // Off the GUI thread; the result only changes what the menus and the next update do.
+    refresh_profile_in_background();
+}
+
+void AutoUpdater::refresh_profile_in_background()
+{
     auto account = m_account;
     auto alive   = m_alive;
     std::thread([account, alive]() {
-        if (*alive)
-            account->refresh();
+        if (!*alive)
+            return;
+        account->refresh();
+        // The answer carries the account's edition label, which the window title shows. Through the
+        // app, not m_app: this object may be gone by the time the site answers.
+        wxGetApp().CallAfter([alive]() {
+            if (*alive && !wxGetApp().is_closing()) // the main frame may already be gone
+                refresh_app_title();
+        });
     }).detach();
 }
 
@@ -435,6 +466,8 @@ void AutoUpdater::sign_in(wxWindow *parent, std::function<void(bool)> done)
     if (ok) {
         const auto p = m_account->profile();
         notify((boost::format(_u8L("Signed in to Unlayered as %1%.")) % (p ? p->email : std::string())).str());
+        // The sign-in answer carries no edition label; ask for it (for the window title).
+        refresh_profile_in_background();
     } else if (!dlg.error().empty()) {
         BOOST_LOG_TRIVIAL(warning) << "account: sign-in failed: " << dlg.error();
     }
@@ -515,8 +548,10 @@ void AutoUpdater::sign_out()
                                               "sign in again."),
                                            wxString::FromUTF8(p ? p->email : std::string()), SLIC3R_APP_FULL_NAME),
                           _L("Sign Out"), wxYES_NO | wxNO_DEFAULT | wxICON_QUESTION);
-    if (confirm.ShowModal() == wxID_YES)
+    if (confirm.ShowModal() == wxID_YES) {
         m_account->sign_out();
+        refresh_app_title();
+    }
 }
 
 bool AutoUpdater::handle_new_version(const std::string &version, const std::string &notes, const std::string &page_url,

@@ -15,6 +15,7 @@
 //	   Slic3r::GUI::Tab::Preset;
 //	       - Single preset item: name, file is default or external.
 
+#include <nlohmann/json.hpp>
 #include <wx/panel.h>
 #include <wx/notebook.h>
 #include <wx/listbook.h>
@@ -413,6 +414,13 @@ public:
     TabPresetComboBox *  get_combo_box() { return m_presets_choice; }
 
 	virtual void    on_value_change(const std::string& opt_key, const boost::any& value);
+
+    // One entry of slicer.settingsChanged's `changes` (WEB_APP_BRIDGE.md 4.5) for `opt_key`, which
+    // m_config already holds the new value of: label, category, tooltip, value, previous, saved,
+    // system. `previous` is the value just before the edit: pass it when the caller knows it (a
+    // bridge write), else the last value reported for this key in this preset, else the saved one.
+    // Either way it becomes the last reported value, so user edits and bridge writes stay in step.
+    nlohmann::json  describe_setting_change(const std::string& opt_key, const nlohmann::json& previous = nullptr);
 
     void            update_wiping_button_visibility();
 	void			activate_option(const std::string& opt_key, const wxString& category);

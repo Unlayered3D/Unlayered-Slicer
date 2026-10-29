@@ -33,7 +33,7 @@ void Layers::update(const PathVertex& vertex, uint32_t vertex_id)
         // Z was meaningless to begin with.
         if (item.tool_axis_id == 0)
             item.tool_axis_id = vertex.tool_axis_id;
-        if (item.tool_axis_id != 0)
+        if (item.tool_axis_id != 0 || item.z_max - item.z_min > NONPLANAR_Z_SPAN)
             m_all_planar = false;
     };
 

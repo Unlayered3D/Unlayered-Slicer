@@ -1,5 +1,7 @@
 #pragma once
 
+#include "unlayered_edition.h" // UNLAYERED_SIDE_PANEL, UNLAYERED_SLICE_SERVICE (public)
+
 namespace Slic3r {
 namespace GUI {
 
@@ -11,12 +13,16 @@ namespace GUI {
 // Deliberately free of wx and of anything heavier than const char*: WebAppBridge, Tab and
 // Preferences all need to name a slot without pulling the panel's headers in.
 //
-// The three slots, of which two ship switched on:
-//   agent()    -- the second slot. Off in release builds (development edition only).
-//   universe() -- the "Universe" tab: browse models and open one straight onto the plate, and
-//                 publish what is on the plate back. Holds the export permission, not settings.
-//   generic()  -- the "Web application" tab: application-agnostic, hosts whatever a developer
-//                 points ORCA_WEB_APP_URL at (WEB_APP_BRIDGE.md). Ships off, with no address.
+// The three slots. Each shows when it is enabled and has an address (Preferences > Advanced >
+// "Web apps & services", or the ORCA_*_URL overrides); none hosts anything in particular:
+//   side_panel() -- a page hosted by MainFrame as a persistent sidebar beside the tabs rather
+//                   than as a tab (WebAppPanel::set_hosted_as_sidebar). Keeps its page across a
+//                   theme toggle (live_theme), because a sidebar page may hold state a reload
+//                   would lose (a conversation, a form).
+//   universe()   -- the "Universe" tab: browse models and open one straight onto the plate, and
+//                   publish what is on the plate back. Holds the export permission, not settings.
+//   generic()    -- the "Web application" tab: whatever address is configured for it
+//                   (WEB_APP_BRIDGE.md). Ships with no address.
 //
 // A slot's shipped values are the default_* fields below rather than resources/web/webapp/*.json,
 // because those files are excluded from the installer; see ensure_seeded in WebAppPanel.cpp.
@@ -43,6 +49,11 @@ struct WebAppSlot
     // letting it read settings or take the plate away -- and even with it on, every install waits
     // on a native confirmation the page cannot skip or pre-answer.
     const char* key_allow_install;
+    // Gate for the printer family (WEB_APP_BRIDGE.md 4.6): listPrinters, printerStatus, exportGcode,
+    // print, printerControl. Its own key because reaching a machine is a different consent from
+    // editing settings; even with it on, every export, print and control waits on a native
+    // confirmation the page cannot press (pause and stop excepted). Off for every slot.
+    const char* key_allow_printer;
     // Records the last one-shot visibility change applied to this slot, in either direction.
     // Deliberately not defaulted in AppConfig, so "never applied" stays distinguishable from any
     // tag. The key is named *_disable_once for the configurations already carrying it.
@@ -69,6 +80,15 @@ struct WebAppSlot
     bool default_allow_settings;
     bool default_allow_export;
     bool default_allow_install;
+    bool default_allow_printer;
+    // Non-null to give default_url ONCE to a configuration that holds a blank address: the case
+    // where an earlier release seeded this slot's keys without one. 0.1.7 did that for the side
+    // panel (address blank, settings off) and its visibility tag already matches, so neither the
+    // one-shot above nor the per-key defaults would ever reach it. Fills only a blank, together
+    // with the switch and the settings family as this build ships them; applied a single time per
+    // tag and recorded in key_reseed_once, so a blank the user sets afterwards stands.
+    const char* key_reseed_once;
+    const char* reseed_once;
     // Hosts this tab may download from beyond the page's own, used when the configuration
     // names none. A leading dot matches any sub-domain. It exists because object storage
     // hands out a host belonging to the deployment rather than to the product, so no fixed
@@ -93,7 +113,7 @@ struct WebAppSlot
     bool live_theme;
 
     static const WebAppSlot& generic();
-    static const WebAppSlot& agent();
+    static const WebAppSlot& side_panel();
     static const WebAppSlot& universe();
 };
 

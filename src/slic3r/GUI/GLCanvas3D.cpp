@@ -4133,6 +4133,14 @@ void GLCanvas3D::on_set_color_timer(wxTimerEvent& evt)
 
 void GLCanvas3D::schedule_extra_frame(int milliseconds)
 {
+    // wx timers may only be started and stopped on the main thread: their map is not locked
+    // (wxMSWTimerImpl::Stop crashed when a worker got here). Defer to it; the canvas window owns
+    // the call, so it is dropped if the canvas is gone by then.
+    if (!wxIsMainThread()) {
+        if (m_canvas != nullptr)
+            m_canvas->CallAfter([this, milliseconds]() { schedule_extra_frame(milliseconds); });
+        return;
+    }
     // Schedule idle event right now
     if (milliseconds == 0)
     {

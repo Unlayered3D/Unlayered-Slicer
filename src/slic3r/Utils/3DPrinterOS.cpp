@@ -269,7 +269,8 @@ private:
                         wxQueueEvent(this, new wxThreadEvent(wxEVT_THREAD, wxID_OK));
                     } else if (m_resp.get<bool>("result", false)) {
                         if (m_attempt < m_max_retries)
-                            m_timer.StartOnce(m_retry_delay_ms);
+                            // This runs on the Http thread; a wx timer is started on the main thread only.
+                            CallAfter([this]() { m_timer.StartOnce(m_retry_delay_ms); });
                         else
                             wxQueueEvent(this, new wxThreadEvent(wxEVT_THREAD, wxID_ABORT));
                     } else {

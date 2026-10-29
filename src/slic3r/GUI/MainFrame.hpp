@@ -40,6 +40,7 @@
 #include "PrinterWebView.hpp"
 #include "calib_dlg.hpp"
 #include "MultiMachinePage.hpp"
+#include "SlicePrepare.hpp" // complete type for the unique_ptr: ~MainFrame is defaulted here
 #include "slic3r/plugin/host/PluginPages.hpp"
 
 // Stable identifiers for MainFrame::m_tabpanel's built-in pages. These are
@@ -57,10 +58,8 @@
 #define TAB_ID_CALIBRATION   "calibration"
 // Unlayered: optional trailing tab hosting an embedded web application (WebAppPanel).
 #define TAB_ID_WEB_APP       "web_app"
-// Unlayered: the second WebAppPanel slot (off in release builds). Sits just before
-// TAB_ID_WEB_APP when both are present.
-#define TAB_ID_AGENT         "agent_app"
-// Unlayered: the third WebAppPanel slot, home of the Unlayered Universe tab.
+// Unlayered: the third WebAppPanel slot, home of the Unlayered Universe tab. (The second slot,
+// the side panel, is not a tab: it is the sidebar beside the notebook, m_side_panel_view.)
 #define TAB_ID_UNIVERSE      "universe_app"
 
 #define ENABEL_PRINT_ALL 0
@@ -80,7 +79,9 @@ class Plater;
 class MainFrame;
 class ParamsDialog;
 class WebAppPanel;
+class SidebarSash;
 struct WebAppSlot;
+class SlicePrepare;
 #ifdef __WXGTK__
 class ResizeEdgePanel;
 #endif
@@ -263,7 +264,7 @@ class MainFrame : public DPIFrame
         eSliceAll = 0,
         eSlicePlate = 1,
         // Hand the plate to the external nonplanar slicing service instead of slicing locally
-        // (NONPLANAR_SLICE_SERVICE.md). Offered only when a service address is configured.
+        // (SLICE_SERVICE_PROTOCOL.md). Offered only when a service address is configured.
         eSliceNonplanar = 2,
     };
 
@@ -382,6 +383,9 @@ public:
     // Select tab in m_tabpanel
     // When tab == -1, will be selected last selected tab
     //BBS: GUI refactor
+    // "Slice with <web-app tab title>": hand the current plate to the web-app tab and show it.
+    void        hand_off_to_web_app();
+    wxString    slice_with_label() const;
     void        select_tab(wxPanel* panel);
     void        select_tab(const wxString& id = wxString());
     void        request_select_tab(const wxString& id);
@@ -393,7 +397,14 @@ public:
     // One place knows the mapping, so adding a fourth slot is a single entry rather than another
     // ternary in every caller. False when the slot is unknown; `panel` is still null when the
     // slot is known but its tab is disabled, which callers must treat as "nothing to do".
+    // `tab_id` is null for the side panel slot, which is the sidebar and not a page.
     bool        web_app_slot_view(const WebAppSlot& slot, WebAppPanel*& panel, const char*& tab_id);
+    // Unlayered: the side panel -- a WebAppPanel hosted beside the notebook, visible in every
+    // tab, collapsible and resizable (see init_tabpanel / update_layout). State is persisted in
+    // SETTING_SIDE_PANEL_SIDEBAR_OPEN / _WIDTH.
+    void        toggle_side_panel();
+    void        toggle_side_panel(bool open);
+    bool        is_side_panel_shown() const;
     int         get_calibration_curr_tab();
     void        select_view(const std::string& direction);
     // Propagate changed configuration from the Tab to the Plater and save changes to the AppConfig
@@ -433,6 +444,14 @@ public:
     bool is_prepare_or_preview_tab() const;
     // Ctrl+Tab / Ctrl+Shift+Tab: step m_tabpanel by `direction` (+1 / -1), wrapping.
     void select_adjacent_tab(int direction);
+    // Side panel internals (toggle_side_panel is the public entry).
+    void   apply_side_panel_state(bool layout);
+    void   on_side_panel_sash_drag(int dx);
+    int    clamp_side_panel_width_dip(int width_dip) const;
+    void   persist_side_panel_width();
+    // The frame's minimum size, widened while the side panel is open so the 3D canvas can
+    // never be squeezed to nothing between the two sidebars.
+    wxSize frame_min_size() const;
     PluginPages& plugin_pages() { return m_plugin_pages; }
 
     PA_Calibration_Dlg* m_pa_calib_dlg{ nullptr };
@@ -460,8 +479,15 @@ public:
     WebViewPanel*         m_webview { nullptr };
     PrinterWebView*       m_printer_view{nullptr};
     WebAppPanel*          m_web_app_view{nullptr};
-    WebAppPanel*          m_agent_view{nullptr};
+    WebAppPanel*          m_side_panel_view{nullptr};     // the side panel: a frame child, not a page
     WebAppPanel*          m_universe_view{nullptr};
+    // Side panel: the horizontal sizer [notebook | sash | side panel] under m_main_sizer, the drag
+    // sash, the tab-bar toggle, the View-menu check item and the width (DIP, clamped live).
+    wxBoxSizer*           m_content_sizer{nullptr};
+    SidebarSash*          m_side_panel_sash{nullptr};
+    SideButton*           m_side_panel_toggle_btn{nullptr};
+    wxMenuItem*           m_side_panel_menu_item{nullptr};
+    int                   m_side_panel_width_dip{380};
     PluginPages           m_plugin_pages;
     wxLogWindow*          m_log_window { nullptr };
     // BBS
@@ -486,12 +512,61 @@ public:
     SideButton* m_print_option_btn{ nullptr };
 
     SidePopup*  m_slice_option_pop_up{ nullptr };
+    // Prepares the plate on the slicing service while a service mode is selected (SlicePrepare).
+    std::unique_ptr<SlicePrepare> m_slice_prepare;
+    void set_slice_prepare_active(bool active);
+    // A service mode preselected by automation (select_slice_mode): its background prepare upload
+    // waits for the person to act on it (activate_deferred_slice_prepare), so automation never
+    // starts slicing-service work (decision D7).
+    bool m_slice_prepare_deferred{ false };
+    // What picking a Slice dropdown entry does to the button and the slicing state. `by_person`
+    // false (automation) leaves a service mode's background prepare deferred.
+    void apply_slice_mode(int select, const wxString& label, const std::string& mode = std::string(), bool by_person = true);
 
     FilamentGroupPopup* m_filament_group_popup{ nullptr };
     mutable bool          m_slice_enable{ true };
     mutable bool          m_print_enable{ true };
     bool get_enable_slice_status();
     bool get_enable_print_status();
+    // A slicing-service mode is selected in the Slice dropdown: Plater::reslice() slices the plate
+    // there instead of here.
+    bool slice_mode_is_service() const { return m_slice_select == eSliceNonplanar; }
+    // The Slice dropdown's slicing modes, for the web-app bridge (slicer.getSliceModes): "local"
+    // (Slice plate), "local_all" (Slice all), then one per layer mode the slicing service offers
+    // on this printer -- its own value from the service's form, labelled as the dropdown labels it
+    // -- or a single "service" entry while no form is cached. None without a configured service.
+    struct SliceModeChoice
+    {
+        std::string id;
+        wxString    label;
+        bool        service = false;
+    };
+    std::vector<SliceModeChoice> slice_mode_choices() const;
+    std::string                  selected_slice_mode() const;
+    // Selects a dropdown entry by id exactly as picking it does, minus every dialog, and slices
+    // nothing. "" on success, else "unknown_mode".
+    // A service mode picked this way does not start the background prepare upload (SlicePrepare):
+    // that waits until the person presses Slice or picks the mode themselves (decision D7).
+    std::string select_slice_mode(const std::string& id);
+    // The person asked to slice (Plater::note_user_slice_request): a service mode preselected by
+    // automation now prepares in the background as if the person had picked it.
+    void activate_deferred_slice_prepare();
+    // The slicing service's options changed (the slicing-service options dialog, or slice.setOptions): while a
+    // service mode is selected the button takes the (possibly new) mode's name and Slice is available
+    // again (the plate's service result is now out of date). A mode changed by automation
+    // (`by_person` false) defers the background prepare again, as select_slice_mode does.
+    void slice_service_options_changed(bool by_person, bool mode_changed = false);
+    // A service mode is selected and its background prepare is waiting for the person (see above).
+    bool slice_prepare_deferred() const { return m_slice_prepare_deferred && m_slice_select == eSliceNonplanar; }
+    // The Print button, for the web-app bridge (slicer.pressPrint): its label now (Print plate,
+    // Print all, Send, Export G-code ... whatever its dropdown is set to), whether pressing it
+    // would do anything, and pressing it exactly as the person does. Every choice opens the
+    // slicer's own window (print / send / save dialog), so nothing leaves until the person
+    // confirms there. `wait` runs that window before returning (it is modal), for a caller that
+    // reports how it was closed; the button itself posts.
+    wxString print_button_label() const;
+    bool     can_press_print();
+    void     press_print_button(bool wait);
     //BBS
     void update_side_button_style();
     void update_slice_print_status(SlicePrintEventType event, bool can_slice = true, bool can_print = true);

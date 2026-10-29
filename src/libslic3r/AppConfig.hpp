@@ -74,20 +74,27 @@ using namespace nlohmann;
 // twice and the user's own choice afterwards sticks. Named for the switch-off it did first.
 #define SETTING_WEB_APP_DISABLE_ONCE "web_app_disable_once"
 
-// Second web-application slot (WebAppSlot::agent(); off in release builds). Same panel, same
-// bridge, its own keys so the two tabs are configured independently; seeded once from its
-// development overlay file. Mirrors the web_app_* family above key for key.
-#define SETTING_AGENT_APP_ENABLED        "agent_app_enabled"
-#define SETTING_AGENT_APP_URL            "agent_app_url"
-#define SETTING_AGENT_APP_TITLE          "agent_app_title"
-#define SETTING_AGENT_APP_ALLOW_LOCAL    "agent_app_allow_local_files"
-#define SETTING_AGENT_APP_PATH_ROOTS     "agent_app_path_roots"
-#define SETTING_AGENT_APP_DOWNLOAD_HOSTS "agent_app_download_hosts"
-#define SETTING_AGENT_APP_EXTRA_ORIGINS  "agent_app_extra_origins"
-#define SETTING_AGENT_APP_SEEDED         "agent_app_seeded"
-#define SETTING_AGENT_APP_ALLOW_SETTINGS "agent_app_allow_settings"
-#define SETTING_AGENT_APP_ALLOW_EXPORT "agent_app_allow_export"
-#define SETTING_AGENT_APP_DISABLE_ONCE "agent_app_disable_once"
+// Second web-application slot, the side panel (WebAppSlot::side_panel()) -- hosted as a sidebar
+// beside the tabs rather than as a tab of its own. Same panel, same bridge, its own keys so the
+// slots are configured independently. Mirrors the web_app_* family above key for key, plus the two
+// sidebar keys at the end. Configurations from before the rename carry agent_app_* keys, which
+// AppConfig::load() copies to side_panel_* once (when the new key is absent) and then erases.
+#define SETTING_SIDE_PANEL_ENABLED        "side_panel_enabled"
+#define SETTING_SIDE_PANEL_URL            "side_panel_url"
+#define SETTING_SIDE_PANEL_TITLE          "side_panel_title"
+#define SETTING_SIDE_PANEL_ALLOW_LOCAL    "side_panel_allow_local_files"
+#define SETTING_SIDE_PANEL_PATH_ROOTS     "side_panel_path_roots"
+#define SETTING_SIDE_PANEL_DOWNLOAD_HOSTS "side_panel_download_hosts"
+#define SETTING_SIDE_PANEL_EXTRA_ORIGINS  "side_panel_extra_origins"
+#define SETTING_SIDE_PANEL_SEEDED         "side_panel_seeded"
+#define SETTING_SIDE_PANEL_ALLOW_SETTINGS "side_panel_allow_settings"
+#define SETTING_SIDE_PANEL_ALLOW_EXPORT   "side_panel_allow_export"
+#define SETTING_SIDE_PANEL_DISABLE_ONCE   "side_panel_disable_once"
+#define SETTING_SIDE_PANEL_RESEED_ONCE    "side_panel_reseed_once"
+// Whether the side panel is open, and how wide it is. The width is stored in DIP (as text --
+// AppConfig has no integer accessor) so it survives a DPI change; 0 or unparsable = the default.
+#define SETTING_SIDE_PANEL_SIDEBAR_OPEN  "side_panel_sidebar_open"
+#define SETTING_SIDE_PANEL_SIDEBAR_WIDTH "side_panel_sidebar_width"
 
 // Unlayered: the third slot, the Unlayered Universe tab -- the model-sharing site embedded so a
 // print can be opened straight onto the plate instead of going through the browser and the
@@ -107,11 +114,19 @@ using namespace nlohmann;
 #define SETTING_UNIVERSE_APP_ALLOW_EXPORT "universe_app_allow_export"
 #define SETTING_UNIVERSE_APP_DISABLE_ONCE "universe_app_disable_once"
 
-// External nonplanar slicing service: the address the plate is handed to when the user picks
-// "Slice nonplanar". Deliberately generic in the same way as the web application above -- any
-// service implementing the protocol in NONPLANAR_SLICE_SERVICE.md may be configured here, this
+// External slicing service: the address the plate is handed to when the user picks one of the
+// service's entries in the Slice dropdown (Preferences > Advanced). Deliberately generic in the same way as the web application above -- any
+// service implementing the protocol in SLICE_SERVICE_PROTOCOL.md may be configured here, this
 // source tree carries no address, and with none set the feature is absent from the UI.
 #define SETTING_NONPLANAR_SLICE_URL    "nonplanar_slice_url"
+// The account provider the application signs in with (auth only: device sign-in, a short-lived
+// token for a slicing service, signed-in web pages). Protocol: the provider section of
+// SLICE_SERVICE_PROTOCOL.md. Preferences > Advanced > "Web apps & services". Blank = no account.
+// Seeded with Unlayered's site only when the key is absent (see AppConfig::set_defaults).
+#define SETTING_ACCOUNT_PROVIDER_URL   "account_provider_url"
+// Comma-separated origins (https://host[:port]) besides the provider's own site that may receive
+// a provider token. A slicing service anywhere else gets no Authorization header from the slicer.
+#define SETTING_SERVICE_TOKEN_ORIGINS  "service_token_origins"
 
 #if defined(_WIN32) || defined(_WIN64)
 #define BAMBU_NETWORK_AGENT_VERSION_LEGACY "01.10.01.09"
@@ -276,6 +291,13 @@ public:
 	}
 	bool				has(const std::string &key) const
 		{ return this->has("app", key); }
+	// True when the key is stored at all, even with an empty value -- unlike has(), which treats
+	// an empty value as absent. For settings where blank is a choice ("off") rather than "unset".
+	bool				contains(const std::string &key) const
+	{
+		auto it = m_storage.find("app");
+		return it != m_storage.end() && it->second.find(key) != it->second.end();
+	}
 
 	void				erase(const std::string &section, const std::string &key)
 	{

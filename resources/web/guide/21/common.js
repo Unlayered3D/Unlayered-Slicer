@@ -43,6 +43,13 @@ function HandleStudio( pVal )
 		let known={'5import':1,'13signin':1};
 		window.open('../'+(known[pVal['page']] ? pVal['page'] : '13')+'/index.html','_self');
 	}
+	else if(strCmd=='page_after_models')
+	{
+		// Unlayered 0.1.8: the answer to GotoFilamentPage() (guide 21 only): guide 21update or
+		// the filament page.
+		if( typeof LeaveModels === 'function' )
+			LeaveModels(pVal['page']);
+	}
 	else if(strCmd=='check_new_printers_result')
 	{
 		let button = document.getElementById("CheckNewPrintersBtn");

@@ -1626,6 +1626,16 @@ PRINT_CONFIG_CLASS_DEFINE(
     ((ConfigOptionBool, zaa_dont_alternate_fill_direction))
     ((ConfigOptionFloat, zaa_min_z))
     ((ConfigOptionFloat, zaa_minimize_perimeter_height))
+
+    // UNLAYERED_MOD: nonplanar layers (curved top shells on a 3-axis printer). See NonplanarTop.hpp.
+    ((ConfigOptionBool,  nonplanar_layers))
+    ((ConfigOptionFloat, nonplanar_max_angle))
+    ((ConfigOptionFloat, nonplanar_max_height))
+    ((ConfigOptionInt,   nonplanar_layer_count))
+    ((ConfigOptionBool,  nonplanar_top_surface_direction_enable))
+    ((ConfigOptionFloat, nonplanar_top_surface_direction))
+    ((ConfigOptionBool,  nonplanar_top_surface_flow_ratio_enable))
+    ((ConfigOptionFloat, nonplanar_top_surface_flow_ratio))
     )
 
 PRINT_CONFIG_CLASS_DEFINE(

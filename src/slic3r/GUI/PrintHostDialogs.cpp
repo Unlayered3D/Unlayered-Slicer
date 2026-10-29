@@ -440,6 +440,16 @@ PrintHostSendDialog::PrintHostSendDialog(const fs::path &path, PrintHostPostUplo
     txt_filename->OSXDisableAllSmartSubstitutions();
 #endif
 }
+void PrintHostSendDialog::set_automation_preset(const std::string& action, const std::string& folder, const std::string& group,
+                                                const std::string& storage)
+{
+    m_automation   = true;
+    m_auto_action  = action;
+    m_auto_folder  = folder;
+    m_auto_group   = group;
+    m_auto_storage = storage;
+}
+
 void PrintHostSendDialog::init()
 {
     const auto& path = m_path;
@@ -464,6 +474,8 @@ void PrintHostSendDialog::init()
         wxString recent_group = from_u8(app_config->get("recent", CONFIG_KEY_GROUP));
         if (! recent_group.empty())
             combo_groups->SetValue(recent_group);
+        if (!m_auto_group.empty() && combo_groups->FindString(from_u8(m_auto_group)) != wxNOT_FOUND)
+            combo_groups->SetValue(from_u8(m_auto_group));
     }
 
     if (combo_storage != nullptr) {
@@ -475,6 +487,8 @@ void PrintHostSendDialog::init()
         wxString recent_storage = from_u8(app_config->get("recent", CONFIG_KEY_STORAGE));
         if (!recent_storage.empty())
             combo_storage->SetValue(recent_storage); 
+        if (!m_auto_storage.empty() && combo_storage->FindString(from_u8(m_auto_storage)) != wxNOT_FOUND)
+            combo_storage->SetValue(from_u8(m_auto_storage));
     } else if (storage_names.GetCount() == 1){
         // PrusaLink specific: Show which storage has been detected.
         auto* label_group = new wxStaticText(this, wxID_ANY, _L("Upload to storage") + ": " + storage_names.front());
@@ -483,7 +497,7 @@ void PrintHostSendDialog::init()
     }
 
 
-    wxString recent_path = from_u8(app_config->get("recent", CONFIG_KEY_PATH));
+    wxString recent_path = from_u8(m_automation && !m_auto_folder.empty() ? m_auto_folder : app_config->get("recent", CONFIG_KEY_PATH));
     if (recent_path.Length() > 0 && recent_path[recent_path.Length() - 1] != '/') {
         recent_path += '/';
     }
@@ -522,13 +536,15 @@ void PrintHostSendDialog::init()
         return true;
     };
 
-    auto* btn_ok = add_button(wxID_OK, true, _L("Upload"));
-    btn_ok->Bind(wxEVT_BUTTON, [this, validate_path](wxCommandEvent&) {
-        if (validate_path(txt_filename->GetValue())) {
-            post_upload_action = PrintHostPostUploadAction::None;
-            EndDialog(wxID_OK);
-        }
-    });
+    if (m_auto_action != "print") {
+        auto* btn_ok = add_button(wxID_OK, true, _L("Upload"));
+        btn_ok->Bind(wxEVT_BUTTON, [this, validate_path](wxCommandEvent&) {
+            if (validate_path(txt_filename->GetValue())) {
+                post_upload_action = PrintHostPostUploadAction::None;
+                EndDialog(wxID_OK);
+            }
+        });
+    }
     txt_filename->SetFocus();
     
     // if (post_actions.has(PrintHostPostUploadAction::QueuePrint)) {
@@ -541,8 +557,8 @@ void PrintHostSendDialog::init()
     //         });
     // }
 
-    if (post_actions.has(PrintHostPostUploadAction::StartPrint)) {
-        auto* btn_print = add_button(wxID_YES, false, _L("Upload and Print"));
+    if (post_actions.has(PrintHostPostUploadAction::StartPrint) && m_auto_action != "upload") {
+        auto* btn_print = add_button(wxID_YES, m_auto_action == "print", _L("Upload and Print"));
         btn_print->Bind(wxEVT_BUTTON, [this, validate_path](wxCommandEvent&) {
             if (validate_path(txt_filename->GetValue())) {
                 post_upload_action = PrintHostPostUploadAction::StartPrint;
@@ -617,7 +633,8 @@ std::string PrintHostSendDialog::storage() const
 
 void PrintHostSendDialog::EndModal(int ret)
 {
-    if (ret == wxID_OK) {
+    // A page's preset folder / group / storage are for this upload, not the person's recent ones.
+    if (ret == wxID_OK && !m_automation) {
         // Persist path and print settings
         wxString path = txt_filename->GetValue();
         int last_slash = path.Find('/', true);
@@ -1474,6 +1491,34 @@ void PrintHostQueueDialog::get_active_jobs(std::vector<std::pair<std::string, st
             ret.emplace_back(upload_names[i]);       
     }
 }
+nlohmann::json PrintHostQueueDialog::jobs_json()
+{
+    static const char* s_states[] = {"queued", "uploading", "error", "cancelling", "cancelled", "completed"};
+    nlohmann::json     jobs       = nlohmann::json::array();
+    for (int i = 0; i < job_list->GetItemCount(); ++i) {
+        const JobState st = get_state(i);
+        wxVariant      progress;
+        job_list->GetValue(progress, unsigned(i), COL_PROGRESS);
+        nlohmann::json job = {{"id", i},
+                              {"state", (st >= ST_NEW && st <= ST_COMPLETED) ? s_states[st] : "unknown"},
+                              {"progress", progress.IsNull() ? 0 : int(progress.GetLong())},
+                              {"file", into_u8(job_list->GetTextValue(unsigned(i), COL_FILENAME))}};
+        const wxString error = job_list->GetTextValue(unsigned(i), COL_ERRORMSG);
+        if (!error.empty())
+            job["error"] = into_u8(error);
+        jobs.push_back(job);
+    }
+    return jobs;
+}
+
+bool PrintHostQueueDialog::cancel_job(int id)
+{
+    if (id < 0 || id >= job_list->GetItemCount() || get_state(id) >= ST_ERROR)
+        return false;
+    GUI::wxGetApp().printhost_job_queue().cancel(size_t(id));
+    return true;
+}
+
 void PrintHostQueueDialog::save_user_data(int udt)
 {
     const auto em = GetTextExtent("m").x;

@@ -511,10 +511,8 @@ void AppConfig::set_defaults()
     // this source tree carries no application-specific address. Every key is user-editable.
     if (get(SETTING_WEB_APP_ENABLED).empty())
         set_bool(SETTING_WEB_APP_ENABLED, false);
-    if (!has(SETTING_WEB_APP_URL))
-        set(SETTING_WEB_APP_URL, "");
-    if (!has(SETTING_WEB_APP_TITLE))
-        set(SETTING_WEB_APP_TITLE, "");
+    // No default for the URL or the title: an absent key is how ensure_seeded (WebAppPanel.cpp)
+    // tells "never set" from a blank the user chose, which means "off".
     if (get(SETTING_WEB_APP_ALLOW_LOCAL).empty())
         set_bool(SETTING_WEB_APP_ALLOW_LOCAL, false);
     if (!has(SETTING_WEB_APP_PATH_ROOTS))
@@ -526,33 +524,31 @@ void AppConfig::set_defaults()
     if (get(SETTING_WEB_APP_ALLOW_SETTINGS).empty())
         set_bool(SETTING_WEB_APP_ALLOW_SETTINGS, false);
 
-    // Unlayered: the second web-application slot (off in release builds), seeded once from its
-    // development overlay file. Same defaults as the generic slot above.
-    if (get(SETTING_AGENT_APP_ENABLED).empty())
-        set_bool(SETTING_AGENT_APP_ENABLED, false);
-    if (!has(SETTING_AGENT_APP_URL))
-        set(SETTING_AGENT_APP_URL, "");
-    if (!has(SETTING_AGENT_APP_TITLE))
-        set(SETTING_AGENT_APP_TITLE, "");
-    if (get(SETTING_AGENT_APP_ALLOW_LOCAL).empty())
-        set_bool(SETTING_AGENT_APP_ALLOW_LOCAL, false);
-    if (!has(SETTING_AGENT_APP_PATH_ROOTS))
-        set(SETTING_AGENT_APP_PATH_ROOTS, "");
-    if (!has(SETTING_AGENT_APP_DOWNLOAD_HOSTS))
-        set(SETTING_AGENT_APP_DOWNLOAD_HOSTS, "");
-    if (!has(SETTING_AGENT_APP_EXTRA_ORIGINS))
-        set(SETTING_AGENT_APP_EXTRA_ORIGINS, "");
-    if (get(SETTING_AGENT_APP_ALLOW_SETTINGS).empty())
-        set_bool(SETTING_AGENT_APP_ALLOW_SETTINGS, false);
+    // Unlayered: the second web-application slot, the side panel. Same defaults as the generic
+    // slot above (no URL or title default, for the same reason).
+    if (get(SETTING_SIDE_PANEL_ENABLED).empty())
+        set_bool(SETTING_SIDE_PANEL_ENABLED, false);
+    if (get(SETTING_SIDE_PANEL_ALLOW_LOCAL).empty())
+        set_bool(SETTING_SIDE_PANEL_ALLOW_LOCAL, false);
+    if (!has(SETTING_SIDE_PANEL_PATH_ROOTS))
+        set(SETTING_SIDE_PANEL_PATH_ROOTS, "");
+    if (!has(SETTING_SIDE_PANEL_DOWNLOAD_HOSTS))
+        set(SETTING_SIDE_PANEL_DOWNLOAD_HOSTS, "");
+    if (!has(SETTING_SIDE_PANEL_EXTRA_ORIGINS))
+        set(SETTING_SIDE_PANEL_EXTRA_ORIGINS, "");
+    if (get(SETTING_SIDE_PANEL_ALLOW_SETTINGS).empty())
+        set_bool(SETTING_SIDE_PANEL_ALLOW_SETTINGS, false);
+    // The side panel starts collapsed: only its toggle shows until the user opens it. The width
+    // default lives in MainFrame (it is a DIP value the frame clamps against its own size).
+    if (get(SETTING_SIDE_PANEL_SIDEBAR_OPEN).empty())
+        set_bool(SETTING_SIDE_PANEL_SIDEBAR_OPEN, false);
+    if (!has(SETTING_SIDE_PANEL_SIDEBAR_WIDTH))
+        set(SETTING_SIDE_PANEL_SIDEBAR_WIDTH, "0");
 
     // Unlayered: the third slot, the Unlayered Universe tab, seeded once from
     // resources/web/webapp/universe.json. Same defaults as the two slots above.
     if (get(SETTING_UNIVERSE_APP_ENABLED).empty())
         set_bool(SETTING_UNIVERSE_APP_ENABLED, false);
-    if (!has(SETTING_UNIVERSE_APP_URL))
-        set(SETTING_UNIVERSE_APP_URL, "");
-    if (!has(SETTING_UNIVERSE_APP_TITLE))
-        set(SETTING_UNIVERSE_APP_TITLE, "");
     if (get(SETTING_UNIVERSE_APP_ALLOW_LOCAL).empty())
         set_bool(SETTING_UNIVERSE_APP_ALLOW_LOCAL, false);
     if (!has(SETTING_UNIVERSE_APP_PATH_ROOTS))
@@ -564,10 +560,21 @@ void AppConfig::set_defaults()
     if (get(SETTING_UNIVERSE_APP_ALLOW_SETTINGS).empty())
         set_bool(SETTING_UNIVERSE_APP_ALLOW_SETTINGS, false);
 
-    // Unlayered: external nonplanar slicing service (NONPLANAR_SLICE_SERVICE.md). No address by
+    // Unlayered: external slicing service (SLICE_SERVICE_PROTOCOL.md). No address by
     // default, which leaves "Slice nonplanar" out of the UI entirely until the user sets one.
     if (!has(SETTING_NONPLANAR_SLICE_URL))
         set(SETTING_NONPLANAR_SLICE_URL, "");
+    // The account provider. Only when the key is absent, so a blank the user chose (no account)
+    // stays blank. An older configuration's undocumented test override (unlayered_site_url) is
+    // carried over once; this runs again after load(), which is when that key can appear.
+    if (has("unlayered_site_url")) {
+        set(SETTING_ACCOUNT_PROVIDER_URL, get("unlayered_site_url"));
+        erase("app", "unlayered_site_url");
+    }
+    if (!contains(SETTING_ACCOUNT_PROVIDER_URL))
+        set(SETTING_ACCOUNT_PROVIDER_URL, "https://unlayered3d.com");
+    if (!contains(SETTING_SERVICE_TOKEN_ORIGINS))
+        set(SETTING_SERVICE_TOKEN_ORIGINS, "");
 
 #ifdef __linux__
     if (get(SETTING_USE_ENCRYPTED_TOKEN_FILE).empty())
@@ -859,6 +866,27 @@ static bool verify_config_file_checksum(boost::nowide::ifstream &ifs)
 
 
 #ifdef USE_JSON_CONFIG
+// The side panel's keys were named agent_app_* before 2026-10-21. Copies each old key whose new
+// spelling the loaded file does not carry (so a value written by a newer build wins), then erases
+// the old one. Runs on the loaded "app" object, not on m_storage alone, because reset() has
+// already filled some side_panel_* keys with defaults that must not count as "present".
+static void migrate_renamed_app_keys(std::map<std::string, std::string> &app, const json &loaded)
+{
+    static const std::string OLD = "agent_app_";
+    static const std::string NEW = "side_panel_";
+    for (auto it = loaded.begin(); it != loaded.end(); ++it) {
+        const std::string &key = it.key();
+        if (key.compare(0, OLD.size(), OLD) != 0)
+            continue;
+        const std::string renamed = NEW + key.substr(OLD.size());
+        if (!loaded.contains(renamed)) {
+            if (auto found = app.find(key); found != app.end())
+                app[renamed] = found->second;
+        }
+        app.erase(key);
+    }
+}
+
 std::string AppConfig::load()
 {
     json j;
@@ -1052,6 +1080,8 @@ std::string AppConfig::load()
                             }
                         }
                     }
+                    if (it.key() == "app")
+                        migrate_renamed_app_keys(m_storage["app"], it.value());
                 }
             }
         }

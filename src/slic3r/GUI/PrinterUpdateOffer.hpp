@@ -3,6 +3,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <functional>
 #include <map>
 #include <memory>
 #include <set>
@@ -66,6 +67,29 @@ public:
 
     static constexpr std::chrono::minutes RETRY_AFTER{10};
 
+    // Unlayered 0.1.8, the setup wizard's "Update your Unlayered printer" step (guide 21update).
+    //
+    // check_now(): the same read and the same feed queries as the offer, for one printer, because
+    // the person pressed "Check for updates". It installs nothing - nothing is flashed or written
+    // from under the modal wizard. `done` runs on the UI thread, unless `alive` is false by then.
+    struct CheckResult
+    {
+        bool                      reachable = false;
+        std::string               error;
+        std::string               machine_name; // M550, empty when the board reports none
+        PrinterUpdateFacts        facts;
+        bool                      config_asked = false;
+        PrinterUpdateCheckOutcome outcome      = PrinterUpdateCheckOutcome::Unreachable;
+    };
+    static void check_now(const std::string &host, const std::string &password, std::shared_ptr<std::atomic<bool>> alive,
+                          std::function<void(const CheckResult &)> done);
+
+    // The app config key ("1") the wizard leaves when its check could not finish the job (an update
+    // is waiting, the printer has no address yet or did not answer). The next check of an Unlayered
+    // printer then runs even if this session checked it already, ignores "Skip this version", says
+    // "up to date" as well, and clears the key once a feed has answered.
+    static constexpr const char *CHECK_AFTER_SETUP_KEY = "printer_update_after_setup";
+
 private:
     struct Request
     {
@@ -73,9 +97,12 @@ private:
         std::string    password;
         std::string    preset_name;
         std::string    api_base;
-        bool           ask_config = false;
+        bool           ask_config  = false;
+        bool           after_setup = false;
         FeedCredential credential;
     };
+    // host, password, api_base, credential and ask_config, read on the UI thread.
+    static Request make_request(const std::string &host, const std::string &password);
     struct Answer;
 
     static Answer check(const Request &request);
@@ -89,6 +116,7 @@ private:
     std::set<std::string>                                           m_hosts;
     std::set<std::string>                                           m_boards;
     std::map<std::string, std::chrono::steady_clock::time_point>    m_retry_at;
+    bool                                                            m_after_setup_busy = false;
 };
 
 } // namespace GUI

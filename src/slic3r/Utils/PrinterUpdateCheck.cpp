@@ -164,4 +164,23 @@ PrinterUpdateDecision decide_printer_update(const PrinterUpdateFacts &facts, con
     return d;
 }
 
+PrinterUpdateSkips no_printer_update_skips()
+{
+    return PrinterUpdateSkips([](const std::string &, const std::string &) { return std::string(); },
+                              [](const std::string &, const std::string &, const std::string &) {});
+}
+
+PrinterUpdateCheckOutcome classify_printer_update_check(bool reachable, const PrinterUpdateFacts &facts)
+{
+    if (!reachable)
+        return PrinterUpdateCheckOutcome::Unreachable;
+    if (decide_printer_update(facts, no_printer_update_skips()).any())
+        return PrinterUpdateCheckOutcome::Available;
+    if (facts.available_firmware.empty() && facts.available_config.empty())
+        return PrinterUpdateCheckOutcome::NoFeed;
+    return PrinterUpdateCheckOutcome::UpToDate;
+}
+
+bool printer_update_check_after_setup(PrinterUpdateCheckOutcome outcome) { return outcome != PrinterUpdateCheckOutcome::UpToDate; }
+
 } // namespace Slic3r

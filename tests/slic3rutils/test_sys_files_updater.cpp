@@ -12,6 +12,7 @@
 #include <boost/property_tree/json_parser.hpp>
 #include <boost/property_tree/ptree.hpp>
 
+#include "libslic3r/miniz_extension.hpp"
 #include "slic3r/Utils/DuetRrfClient.hpp"
 #include "slic3r/Utils/FirmwareBundle.hpp"
 #include "slic3r/Utils/SysFilesBundle.hpp"
@@ -393,6 +394,149 @@ TEST_CASE("Machine-specific files are never part of a package, whatever the mani
     // A manifest that lists only such files does not fall back to installing everything.
     write("manifest.json", "{\"version\":\"1\",\"files\":[{\"path\":\"sys/zstall.g\"}]}");
     CHECK_FALSE(LocalSysFileSource(tmp.path.string()).fetch(pkg, nullptr, err));
+}
+
+namespace {
+
+// Writes a zip to disk, the way From Zip is handed one.
+void write_zip(const fs::path &where, const std::vector<std::pair<std::string, std::string>> &entries)
+{
+    mz_zip_archive arch;
+    mz_zip_zero_struct(&arch);
+    REQUIRE(mz_zip_writer_init_heap(&arch, 0, 64 * 1024));
+    for (const auto &e : entries)
+        REQUIRE(mz_zip_writer_add_mem(&arch, e.first.c_str(), e.second.data(), e.second.size(), MZ_BEST_SPEED));
+    void  *buf  = nullptr;
+    size_t size = 0;
+    REQUIRE(mz_zip_writer_finalize_heap_archive(&arch, &buf, &size));
+    std::ofstream(where.string(), std::ios::binary).write(static_cast<const char *>(buf), std::streamsize(size));
+    mz_free(buf);
+    mz_zip_writer_end(&arch);
+}
+
+// The layout of unlayered-1.9-sd-card-*.zip: the whole card, no manifest, and a print file larger
+// than any configuration file may be.
+std::vector<std::pair<std::string, std::string>> full_sd_card(const std::string &wrapper)
+{
+    return {
+        {wrapper + "README-UNLAYERED-SETUP.md", "# Setup\n"},
+        {wrapper + "START HERE.txt", "Copy everything to the card.\r\n"},
+        {wrapper + "firmware/Duet3Firmware_Mini5plus.uf2", std::string(64 * 1024, 'F')},
+        {wrapper + "gcodes/demo print_PLA_51m23s.gcode", std::string(4789252, 'G')},
+        {wrapper + "www/index.html.gz", std::string(1024, 'W')},
+        {wrapper + "menu/main", "button\n"},
+        {wrapper + "sys/config.g", "; config.g\r\nM550 P\"Unlayered\"\r\n"},
+        {wrapper + "sys/homez.g", "G30\r\n"},
+        {wrapper + "sys/zstall.g", "global zStallTip = 75\r\n"},
+        {wrapper + "macros/Load Filament", "M98 P\"load.g\"\r\n"},
+    };
+}
+
+std::vector<std::string> package_paths(const SysFilePackage &pkg)
+{
+    std::vector<std::string> out;
+    for (const auto &f : pkg.files)
+        out.push_back(f.path);
+    return out;
+}
+
+} // namespace
+
+TEST_CASE("A full SD card is recognised by its card-only folders and notes", "[SysFilesUpdater]")
+{
+    CHECK(sys_looks_like_full_sd_card({"sys/config.g", "gcodes/a.gcode"}));
+    CHECK(sys_looks_like_full_sd_card({"macros/Load", "www/index.html"}));
+    CHECK(sys_looks_like_full_sd_card({"sys/config.g", "firmware/x.uf2"}));
+    CHECK(sys_looks_like_full_sd_card({"sys/config.g", "START HERE.txt"}));
+    CHECK(sys_looks_like_full_sd_card({"SYS/config.g", "README.md"}));
+    // A configuration package, with or without a manifest or loose files, is not one.
+    CHECK_FALSE(sys_looks_like_full_sd_card({"manifest.json", "sys/config.g", "macros/Load"}));
+    CHECK_FALSE(sys_looks_like_full_sd_card({"config.g", "homez.g", "notes.txt"}));
+    CHECK_FALSE(sys_looks_like_full_sd_card({"sys/config.g", "filaments/PLA/load.g"}));
+    // Card folders without any configuration are not one either: nothing would be offered.
+    CHECK_FALSE(sys_looks_like_full_sd_card({"gcodes/a.gcode", "www/index.html"}));
+}
+
+TEST_CASE("From Zip on a full SD card offers sys and macros and skips the rest", "[SysFilesUpdater]")
+{
+    for (const std::string wrapper : {std::string(), std::string("unlayered-1.9-sd-card-2026.10.26/")}) {
+        DYNAMIC_SECTION("wrapper '" << wrapper << "'") {
+            TempDir        tmp;
+            const fs::path zip = tmp.path / "unlayered-1.9-sd-card.zip";
+            write_zip(zip, full_sd_card(wrapper));
+
+            SysFilePackage pkg;
+            std::string    err;
+            REQUIRE(LocalSysFileSource(zip.string()).fetch(pkg, nullptr, err));
+            CHECK(err.empty());
+            CHECK(pkg.from_full_sd_card);
+            // config.g and zstall.g are kept, and nothing outside sys/ and macros/ came along -
+            // not even mapped into sys/, the way a loose file in a configuration package is.
+            CHECK(package_paths(pkg) == std::vector<std::string>{"macros/Load Filament", "sys/homez.g"});
+
+            std::map<std::string, std::string> skipped(pkg.skipped.begin(), pkg.skipped.end());
+            for (const char *s : {"gcodes/", "firmware/", "www/", "menu/", "README-UNLAYERED-SETUP.md", "START HERE.txt"}) {
+                INFO(s);
+                REQUIRE(skipped.count(s) == 1);
+                CHECK(boost::contains(skipped[s], "part of the SD card"));
+            }
+            CHECK(boost::contains(skipped["firmware/"], "Firmware button"));
+            CHECK(boost::contains(skipped["sys/zstall.g"], "belongs to one printer"));
+            // The card's config.g is the generic ship one; the printer's own is kept.
+            REQUIRE(skipped.count("sys/config.g") == 1);
+            CHECK(skipped["sys/config.g"] == "this printer's own setup, kept");
+            CHECK(validate_sys_package(pkg, err));
+        }
+    }
+}
+
+TEST_CASE("A full SD card with an oversized file in sys is still refused", "[SysFilesUpdater]")
+{
+    TempDir tmp;
+    auto    entries = full_sd_card("");
+    entries.emplace_back("sys/heightmap-huge.g", std::string(5 * 1024 * 1024, 'H'));
+    const fs::path zip = tmp.path / "card.zip";
+    write_zip(zip, entries);
+
+    SysFilePackage pkg;
+    std::string    err;
+    CHECK_FALSE(LocalSysFileSource(zip.string()).fetch(pkg, nullptr, err));
+    CHECK(boost::contains(err, "sys/heightmap-huge.g"));
+    CHECK(boost::contains(err, "far too large"));
+}
+
+TEST_CASE("A configuration zip is read as before: loose files go to sys, big files refuse", "[SysFilesUpdater]")
+{
+    TempDir        tmp;
+    const fs::path zip = tmp.path / "config.zip";
+    write_zip(zip, {{"homez.g", "G30\r\n"}, {"config.g", "M550 P\"x\"\r\n"}, {"macros/Load", "M83\r\n"}});
+    SysFilePackage pkg;
+    std::string    err;
+    REQUIRE(LocalSysFileSource(zip.string()).fetch(pkg, nullptr, err));
+    CHECK_FALSE(pkg.from_full_sd_card);
+    // Outside a card image config.g is still offered, as before.
+    CHECK(package_paths(pkg) == std::vector<std::string>{"macros/Load", "sys/config.g", "sys/homez.g"});
+
+    // Not a card (no sys/ or macros/ folder beside the print file), so the print file still refuses.
+    write_zip(zip, {{"homez.g", "G30\r\n"}, {"gcodes/big.gcode", std::string(4789252, 'G')}});
+    CHECK_FALSE(LocalSysFileSource(zip.string()).fetch(pkg, nullptr, err));
+    CHECK(boost::contains(err, "far too large to be a configuration file"));
+}
+
+TEST_CASE("From Folder on a copy of a full SD card reads only its configuration", "[SysFilesUpdater]")
+{
+    TempDir tmp;
+    for (const auto &e : full_sd_card("")) {
+        const fs::path p = tmp.path / e.first;
+        fs::create_directories(p.parent_path());
+        std::ofstream(p.string(), std::ios::binary) << e.second;
+    }
+    SysFilePackage pkg;
+    std::string    err;
+    REQUIRE(LocalSysFileSource(tmp.path.string()).fetch(pkg, nullptr, err));
+    CHECK(pkg.from_full_sd_card);
+    CHECK(package_paths(pkg) == std::vector<std::string>{"macros/Load Filament", "sys/homez.g"});
+    CHECK(pkg.find("sys/config.g") == nullptr);
 }
 
 TEST_CASE("The protected names cover the printer's factory-reset list", "[SysFilesUpdater]")

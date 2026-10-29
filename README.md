@@ -44,11 +44,17 @@ These features are switched on per printer: **Printer settings ▸ Motion abilit
 
   Both work over the network or USB. They target the Duet 3 Mini 5+ in an Unlayered printer. See [USB_UPDATES.md](USB_UPDATES.md).
 
-## Web application tab
+## Web apps and services
 
-One tab, **Unlayered Universe**, embeds a page from unlayered3d.com. It is on by default and fetches nothing until you open it. To remove it, set `universe_app_enabled` to `false` in `Unlayered Slicer.conf` while the app is closed.
+The slicer can show web pages (a web-app tab and a side panel beside the tabs) and send a plate to an external slicing service. You choose the addresses in **Preferences ▸ Advanced ▸ Web apps & services**. A blank address turns that feature off, and none is set by default. The **Universe** tab, Unlayered 3D's model library, is the one page set up by default. It fetches nothing until you open it. To remove it, set `universe_app_enabled` to `false` in `Unlayered Slicer.conf` while the app is closed.
 
-A page talks to the slicer only through a documented bridge with per-tab permissions. The bridge is specified in [WEB_APP_BRIDGE.md](WEB_APP_BRIDGE.md), and there is an example page in [resources/web/webapp-example](resources/web/webapp-example).
+These features talk to other programs only over documented, product-neutral interfaces, and each has an MIT-licensed reference implementation:
+
+- the web-app bridge ([WEB_APP_BRIDGE.md](WEB_APP_BRIDGE.md), example page in [resources/web/webapp-example](resources/web/webapp-example));
+- the slicing service protocol ([SLICE_SERVICE_PROTOCOL.md](SLICE_SERVICE_PROTOCOL.md), reference service in [tools/reference-slice-service](tools/reference-slice-service));
+- the account provider protocol ([ACCOUNT_PROVIDER_PROTOCOL.md](ACCOUNT_PROVIDER_PROTOCOL.md)).
+
+[BOUNDARY.md](BOUNDARY.md) explains how they fit together and what the binary does and does not contain.
 
 ## Removed from OrcaSlicer
 
@@ -63,6 +69,15 @@ A page talks to the slicer only through a documented bridge with per-tab permiss
 ## Stealth mode
 
 **Stealth mode** is off by default and set in **Preferences**. It hides the remaining cloud account settings, and stops the account sign-in check and the printer configuration offer.
+
+## Bambu Lab printers (opt-in)
+
+Printing to Bambu Lab printers needs Bambu's closed-source network plug-in. It is off by default and nothing is downloaded until you turn it on, either in **Preferences ▸ Online ▸ Enable Bambu network plug-in** or by accepting the install prompt on a Bambu printer's Device tab or Print button. Once enabled, the plug-in is downloaded from Bambu Lab's servers (`api.bambulab.com`) into the app's `plugins` folder and loaded at every launch.
+
+- **LAN printing** works in stealth mode.
+- **Bambu Cloud** sign-in requires turning stealth mode off.
+
+Turning the checkbox off stops the plug-in loading at the next launch.
 
 ## Network access
 
@@ -143,7 +158,7 @@ Unlayered Slicer is a fork of [OrcaSlicer](https://github.com/OrcaSlicer/OrcaSli
 
 Unlayered Slicer is licensed under the GNU Affero General Public License, version 3, the same license as OrcaSlicer, Bambu Studio and PrusaSlicer. See [LICENSE.txt](LICENSE.txt).
 
-- The example page in `resources/web/webapp-example/` is MIT licensed, so that web applications can start from it freely.
+- The example page in `resources/web/webapp-example/` and the reference slicing service in `tools/reference-slice-service/` are MIT licensed, so that other programs can start from them freely.
 - Firmware images bundled with an installer are separate programs under their own licenses. RepRapFirmware is GPLv3, and its source is at [Unlayered3D/RepRapFirmware](https://github.com/Unlayered3D/RepRapFirmware).
 
 The Unlayered 3D name and logo are trademarks of Unlayered 3D and are not covered by the AGPL license.

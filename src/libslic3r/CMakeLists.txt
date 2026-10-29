@@ -83,6 +83,8 @@ set(lisbslic3r_sources
     BridgeDetector.cpp
     BridgeDetector.hpp
     Brim.cpp
+    BrimEarsAuto.cpp
+    BrimEarsAuto.hpp
     BrimEarsPoint.hpp
     Brim.hpp
     BuildVolume.cpp
@@ -104,6 +106,8 @@ set(lisbslic3r_sources
     Config.cpp
     Config.hpp
     ContourZ.cpp
+    NonplanarTop.cpp
+    NonplanarTop.hpp
     CustomGCode.cpp
     CustomGCode.hpp
     CutPlaneSegmentation.cpp
@@ -141,6 +145,8 @@ set(lisbslic3r_sources
     ExtrusionSimulator.hpp
     FaceDetector.cpp
     FaceDetector.hpp
+    FacetSelectors.cpp
+    FacetSelectors.hpp
     Feature/FuzzySkin/FuzzySkin.cpp
     Feature/FuzzySkin/FuzzySkin.hpp
     Feature/Interlocking/InterlockingGenerator.cpp
@@ -298,6 +304,8 @@ set(lisbslic3r_sources
     GCode/MachineFrameTransform.hpp
     GCode/MachineKinematics.cpp
     GCode/MachineKinematics.hpp
+    GCode/MultiplanarBaseC.cpp
+    GCode/MultiplanarBaseC.hpp
     GCode/WipeTower2.cpp
     GCode/WipeTower2.hpp
     GCode/WipeTower.cpp
@@ -486,6 +494,8 @@ set(lisbslic3r_sources
     Support/SupportLayer.hpp
     Support/SupportMaterial.cpp
     Support/SupportMaterial.hpp
+    Support/SupportNeighbourClip.cpp
+    Support/SupportNeighbourClip.hpp
     Support/SupportParameters.hpp
     Support/SupportSpotsGenerator.cpp
     Support/SupportSpotsGenerator.hpp

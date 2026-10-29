@@ -53,6 +53,7 @@
 #include "nlohmann/json.hpp"
 
 #include "GCode/ConflictChecker.hpp"
+#include "Support/SupportNeighbourClip.hpp"
 #include "GCode/HotendCollisionCheck.hpp"
 #include "ParameterUtils.hpp"
 
@@ -3311,6 +3312,15 @@ void Print::process(long long *time_cost_with_cache, bool use_cache)
         }
     }
 
+    // UNLAYERED_MOD -- support is generated per object and only avoids its own object; cut it away
+    // from every other object on the plate before the wipe tower, brim and conflict check read it.
+    // Runs on every process(): a move invalidates the brim, not the support (SupportNeighbourClip.hpp).
+    {
+        const size_t clipped = clip_supports_to_neighbours(*this, [this]() { this->throw_if_canceled(); });
+        if (clipped > 0)
+            BOOST_LOG_TRIVIAL(info) << "support clipped against neighbouring objects on " << clipped << " support layers";
+    }
+
 
 
     if (this->set_started(psWipeTower)) {
@@ -5451,11 +5461,22 @@ void Print::export_gcode_from_previous_file(const std::string& file, GCodeProces
         GCodeProcessor::s_IsBBLPrinter = is_BBL_printer();
         const Vec3d origin = this->get_plate_origin();
         processor.set_xy_offset(origin(0), origin(1));
+        // UNLAYERED_MOD: seed the processor with this Print's config (filament count/map, flavor,
+        // densities, machine limits). A G-code without a slicer config block (an external slicer's) otherwise
+        // has filaments_count == 0, every T<n> is rejected and all usage lands on filament 0, so the
+        // sent package lists filament 1 and the AMS mapping misses the real tool (0700-8012 at T2).
+        // A file that carries its own config block still overrides this inside process_file().
+        processor.apply_config(this->config());
         // Reloaded sliced projects re-estimate with the same nozzle-grouping slot context as the
         // original export; process_file re-derives the device-side nozzle grouping onto the result
         // (via ensure_nozzle_group_result), so the multi-nozzle send/monitor mapping survives here.
         if (result != nullptr && result->nozzle_group_result)
             processor.initialize_from_context(result->nozzle_group_result);
+        // UNLAYERED_MOD: a sliced 3MF whose G-code carries no slicer config block (a slicing service
+        // may package its G-code that way for printers that take a sliced 3MF) needs the same defaults the G-code viewer gives an
+        // imported file (Plater::load_gcode), or every T command is "invalid" and the preview gets
+        // no moves. Fills only empty maps: a file with its own config block still overrides them.
+        processor.init_filament_maps_and_nozzle_type_when_import_only_gcode();
         //processor.enable_producers(true);
         processor.process_file(file);
 

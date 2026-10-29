@@ -16,6 +16,11 @@ struct PathVertex;
 class Layers
 {
 public:
+    // UNLAYERED_MOD: a layer whose extrusions span more height than this is not horizontal even
+    // when the tool stays straight up (nonplanar layers' curved shells; ported from feat/layer-map
+    // c5b96b1c74). Z anti-aliasing stays well inside it.
+    static constexpr float NONPLANAR_Z_SPAN = 1.0f;
+
     void update(const PathVertex& vertex, uint32_t vertex_id);
     void reset();
     
@@ -49,7 +54,10 @@ public:
     // True when the layer was printed with the tool straight up, i.e. it really is a horizontal
     // slice and its single Z is meaningful.
     bool is_layer_planar(std::size_t layer_id) const {
-        return (layer_id < m_items.size()) ? m_items[layer_id].tool_axis_id == 0 : true;
+        if (layer_id >= m_items.size())
+            return true;
+        const Item& item = m_items[layer_id];
+        return item.tool_axis_id == 0 && !(item.z_max - item.z_min > NONPLANAR_Z_SPAN);
     }
     uint16_t get_layer_tool_axis_id(std::size_t layer_id) const {
         return (layer_id < m_items.size()) ? m_items[layer_id].tool_axis_id : uint16_t(0);

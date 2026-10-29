@@ -260,3 +260,68 @@ TEST_CASE("An up to date printer gets no offer", "[PrinterUpdateCheck]")
     f.available_config   = "2026.10-1";
     CHECK_FALSE(decide_printer_update(f, store.skips()).any());
 }
+
+// ---- The setup wizard's "Check for updates" (guide 21update) -------------------------------------
+
+namespace {
+PrinterUpdateFacts wizard_facts()
+{
+    PrinterUpdateFacts f;
+    f.board_id           = "board";
+    f.running_firmware   = "3.7.0-beta.1+unlayered.16";
+    f.available_firmware = "3.7.0-beta.1+unlayered.16";
+    f.config_known       = true;
+    f.installed_config   = "2026.10-1";
+    f.available_config   = "2026.10-1";
+    return f;
+}
+} // namespace
+
+TEST_CASE("The wizard reports a printer that did not answer", "[PrinterUpdateCheck]")
+{
+    CHECK(classify_printer_update_check(false, wizard_facts()) == PrinterUpdateCheckOutcome::Unreachable);
+    CHECK(printer_update_check_after_setup(PrinterUpdateCheckOutcome::Unreachable));
+}
+
+TEST_CASE("The wizard reports an up to date printer and leaves nothing pending", "[PrinterUpdateCheck]")
+{
+    CHECK(classify_printer_update_check(true, wizard_facts()) == PrinterUpdateCheckOutcome::UpToDate);
+    CHECK_FALSE(printer_update_check_after_setup(PrinterUpdateCheckOutcome::UpToDate));
+
+    // Signed out: no configuration was asked, the firmware alone decides.
+    PrinterUpdateFacts f = wizard_facts();
+    f.available_config.clear();
+    CHECK(classify_printer_update_check(true, f) == PrinterUpdateCheckOutcome::UpToDate);
+}
+
+TEST_CASE("The wizard reports newer firmware or configuration as available", "[PrinterUpdateCheck]")
+{
+    PrinterUpdateFacts f = wizard_facts();
+    f.available_firmware = "3.7.0-beta.1+unlayered.17";
+    CHECK(classify_printer_update_check(true, f) == PrinterUpdateCheckOutcome::Available);
+    CHECK(printer_update_check_after_setup(PrinterUpdateCheckOutcome::Available));
+
+    f                    = wizard_facts();
+    f.config_known       = false; // a card this slicer never wrote
+    CHECK(classify_printer_update_check(true, f) == PrinterUpdateCheckOutcome::Available);
+}
+
+TEST_CASE("The wizard's check ignores Skip this version", "[PrinterUpdateCheck]")
+{
+    MemoryStore        store;
+    PrinterUpdateFacts f = wizard_facts();
+    f.available_firmware = "3.7.0-beta.1+unlayered.17";
+    store.skips().skip("board", f.available_firmware, "");
+    CHECK_FALSE(decide_printer_update(f, store.skips()).any());
+    CHECK(decide_printer_update(f, no_printer_update_skips()).firmware);
+    CHECK(classify_printer_update_check(true, f) == PrinterUpdateCheckOutcome::Available);
+}
+
+TEST_CASE("The wizard says so when no feed answered", "[PrinterUpdateCheck]")
+{
+    PrinterUpdateFacts f = wizard_facts();
+    f.available_firmware.clear();
+    f.available_config.clear();
+    CHECK(classify_printer_update_check(true, f) == PrinterUpdateCheckOutcome::NoFeed);
+    CHECK(printer_update_check_after_setup(PrinterUpdateCheckOutcome::NoFeed));
+}

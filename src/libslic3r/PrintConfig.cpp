@@ -5352,6 +5352,89 @@ void PrintConfigDef::init_fff_params()
     def->mode     = comExpert;
     def->set_default_value(new ConfigOptionFloat(0.05));
 
+    // UNLAYERED_MOD: nonplanar layers (curved top shells on a 3-axis printer); NonplanarTop.cpp.
+    def = this->add("nonplanar_layers", coBool);
+    def->label    = L("Use nonplanar layers (experimental)");
+    def->category = L("Quality");
+    def->tooltip  = L("Experimental: check the preview before printing, and expect visible seams on some models.\n"
+                      "Print gently sloped top surfaces as curved layers that follow the model, so they have no "
+                      "stair-stepping. The nozzle moves up and down while printing them; works on ordinary 3-axis "
+                      "printers.\n"
+                      "Not the printer setting \"Enable non-planar printing\", which is for cut planes and "
+                      "multi-axis machines.");
+    def->mode     = comSimple;
+    def->set_default_value(new ConfigOptionBool(false));
+
+    def = this->add("nonplanar_max_angle", coFloat);
+    def->label    = L("Maximum nonplanar angle");
+    def->category = L("Quality");
+    def->tooltip  = L("Steepest top surface slope that is printed curved; steeper areas stay planar. Find your "
+                      "printer's value with a test print: the nozzle and its heater block must clear the slope. "
+                      "When the printer's hotend envelope is set (Printer settings, non-planar printing), the "
+                      "smallest envelope side angle also caps this value.");
+    def->sidetext = u8"°";	// degrees, don't need translation
+    def->min      = 0;
+    def->max      = 30;
+    def->mode     = comSimple;
+    def->set_default_value(new ConfigOptionFloat(12));
+
+    def = this->add("nonplanar_max_height", coFloat);
+    def->label    = L("Maximum nonplanar height");
+    def->category = L("Quality");
+    def->tooltip  = L("How far below the current layer the nozzle may reach while printing a curved patch. This is "
+                      "the clearance under the nozzle tip: anything on the toolhead that hangs lower than the "
+                      "nozzle by less than this can hit the print. The low part of a taller patch is left planar.");
+    def->sidetext = L("mm");	// millimeters, CIS languages need translation
+    def->min      = 0;
+    def->max      = 50;
+    def->mode     = comSimple;
+    def->set_default_value(new ConfigOptionFloat(5));
+
+    def = this->add("nonplanar_layer_count", coInt);
+    def->label    = L("Nonplanar layer count");
+    def->category = L("Quality");
+    def->tooltip  = L("How many layers of the top shell follow the curved surface. 0 = automatic: as many as the "
+                      "top shell has (top shell layers, or more if the top shell thickness needs more).");
+    def->sidetext = L("layers");
+    def->min      = 0;
+    def->max      = 20;
+    def->mode     = comSimple;
+    def->set_default_value(new ConfigOptionInt(0));
+
+    def = this->add("nonplanar_top_surface_direction_enable", coBool);
+    def->label    = L("Set nonplanar top surface direction");
+    def->category = L("Quality");
+    def->tooltip  = L("Use a fixed direction for the lines of the curved top surface. When off, they follow the "
+                      "solid infill direction.");
+    def->mode     = comAdvanced;
+    def->set_default_value(new ConfigOptionBool(false));
+
+    def = this->add("nonplanar_top_surface_direction", coFloat);
+    def->label    = L("Nonplanar top surface direction");
+    def->category = L("Quality");
+    def->tooltip  = L("Direction of the curved top surface lines. The curved layers under it alternate by 90 degrees.");
+    def->sidetext = u8"°";	// degrees, don't need translation
+    def->min      = 0;
+    def->max      = 360;
+    def->mode     = comAdvanced;
+    def->set_default_value(new ConfigOptionFloat(0));
+
+    def = this->add("nonplanar_top_surface_flow_ratio_enable", coBool);
+    def->label    = L("Set nonplanar top surface flow ratio");
+    def->category = L("Quality");
+    def->tooltip  = L("Use a separate flow ratio for the curved top surface instead of the top surface flow ratio.");
+    def->mode     = comAdvanced;
+    def->set_default_value(new ConfigOptionBool(false));
+
+    def = this->add("nonplanar_top_surface_flow_ratio", coFloat);
+    def->label    = L("Nonplanar top surface flow ratio");
+    def->category = L("Quality");
+    def->tooltip  = L("Flow ratio of the curved top surface. Replaces the top surface flow ratio there.");
+    def->min      = 0;
+    def->max      = 2;
+    def->mode     = comAdvanced;
+    def->set_default_value(new ConfigOptionFloat(1));
+
     def = this->add("layer_change_gcode", coString);
     def->label = L("Layer change G-code");
     def->tooltip = L("This G-code is inserted at every layer change after the Z lift.");
@@ -5401,7 +5484,9 @@ void PrintConfigDef::init_fff_params()
     def->category = L("Non-planar Printing");
     def->tooltip = L("Master switch for non-planar printing. This is the single source of truth for "
                      "whether non-planar printing is enabled. The other options in this section are "
-                     "hidden unless this is enabled.");
+                     "hidden unless this is enabled.\n"
+                     "For cut planes and multi-axis machines. Curved top surfaces on a 3-axis printer are "
+                     "\"Use nonplanar layers\" in the process Quality settings.");
     // UNLAYERED_MOD -- Simple: fresh installs start in Simple mode, and without this the master
     // switch for the Cut Planes tool was invisible there (the tool just stayed greyed out).
     def->mode = comSimple;
@@ -10583,6 +10668,13 @@ void PrintConfigDef::handle_legacy(t_config_option_key &opt_key, std::string &va
         value = "tree(auto)";
     } else if (opt_key == "support_base_pattern" && value == "none") {
         value = "hollow";
+    } else if (opt_key == "tree_support_wall_count" && value == "-1") {
+        // Unlayered: a BambuStudio project. Its range is [-1,2] with -1 = auto; ours is [0,2] with
+        // 0 = auto, so -1 failed validation ("Invalid values found in the 3MF") on every BS import.
+        value = "0";
+    } else if (opt_key == "raft_first_layer_expansion" && !value.empty() && value.front() == '-') {
+        // Unlayered: BambuStudio's -1 = auto. There is no auto here (min 0); use our default.
+        value = "2";
     } else if (opt_key == "different_settings_to_system") {
         std::string copy_value = value;
         copy_value.erase(std::remove(copy_value.begin(), copy_value.end(), '\"'), copy_value.end()); // remove '"' in string
@@ -10727,6 +10819,8 @@ void PrintConfigDef::handle_legacy(t_config_option_key &opt_key, std::string &va
     // Ignore the following obsolete configuration keys:
     static std::set<std::string> ignore = {
         "acceleration", "scale", "rotate", "duplicate", "duplicate_grid",
+        // UNLAYERED_MOD: dev-only predecessor of nonplanar_layer_count (never in a release).
+        "nonplanar_top_thickness",
         "bed_size",
         "print_center", "g0", "wipe_tower_per_color_wipe", 
         "support_sharp_tails","support_remove_small_overhangs", "support_with_sheath",

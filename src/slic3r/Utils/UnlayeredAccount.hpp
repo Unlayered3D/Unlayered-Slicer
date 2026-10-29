@@ -8,24 +8,31 @@
 
 namespace Slic3r {
 
-// The Unlayered account the application itself is signed in as, for requests made by native code -
-// today the in-app update download, which unlayered3d.com only serves to accounts with software
-// access.
+struct ServiceRefusal;
+
+// The account the application itself is signed in as at its configured account provider
+// (AppConfig account_provider_url; Unlayered's site unless the user changes it), for requests made
+// by native code: the in-app update download, a short-lived token for a slicing service on the
+// provider's site, and signed-in web pages from the provider. Authentication only -- the slicer
+// draws no conclusions about what the account may do; every service decides that itself.
 //
-// This is NOT the Universe tab's sign-in. That one lives in the web view's cookie jar as an httpOnly
+// This is NOT a web tab's sign-in. That one lives in the web view's cookie jar as an httpOnly
 // cookie that neither the page nor this code can read, and native HTTP sends no cookies anyway. So
-// the application signs in a second time through the same browser handoff the tab uses (the person
-// confirms "Sign in the slicer" in their own browser) and collects a device token instead of a
-// cookie:
+// the application signs in a second time through a browser handoff (the person confirms in their
+// own browser) and collects a device token instead of a cookie. The provider protocol
+// (SLICE_SERVICE_PROTOCOL.md, "Account provider"):
 //
 //   1. start_handoff()   POST /api/login/handoff/start            -> {id, secret}
-//   2. the caller opens  <site>/auth/slicer?id=<id>                 in the default browser
+//   2. the caller opens  <provider>/auth/slicer?id=<id>             in the default browser
 //   3. collect()         POST /api/slicer/device/collect (polled)  -> {token, account}
+//      refresh()         GET  /api/slicer/device/me                -> {name, email, edition_label?}
+//      sign_out()        POST /api/slicer/device/signout
+//      fetch_service_token()    POST /api/slicer/slice-token {"audience": origin} -> {token, expiresAt | expires_in}
+//      fetch_web_session_path() POST /api/slicer/web-session {"next": path}       -> {path}
 //
 // The token is kept in the operating system's credential store (Windows Credential Manager, the
-// macOS keychain, libsecret), never in the plain-text config file, and is sent only to the site it
-// came from, as `Authorization: Bearer`. It is revoked by signing out here, by signing out on the
-// website (which ends every session for the account), or after 180 days unused.
+// macOS keychain, libsecret), never in the plain-text config file, keyed by the provider's host,
+// and is sent only to the provider it came from, as `Authorization: Bearer`.
 //
 // All network calls are synchronous; call them from a worker thread. The object is thread safe.
 class UnlayeredAccount
@@ -36,6 +43,11 @@ public:
         std::string name;
         std::string email;
         bool        software_access{false};
+        // A label the provider gives the account's edition (/api/slicer/device/me `edition_label`),
+        // appended to the application's name in the window title and nothing else: the slicer
+        // grants and withholds nothing on it. A provider that still sends only the deprecated
+        // `pro: true` is read as "Pro". Empty until refresh() has asked; never stored.
+        std::string edition_label;
     };
 
     struct Handoff
@@ -58,7 +70,8 @@ public:
         std::string version;
     };
 
-    // site_url: e.g. "https://unlayered3d.com", no trailing slash required.
+    // site_url: the provider, e.g. "https://unlayered3d.com", no trailing slash required; empty for
+    // no provider.
     explicit UnlayeredAccount(std::string site_url);
 
     const std::string &site_url() const { return m_site; }
@@ -93,6 +106,34 @@ public:
     // anywhere else. On a 401 the token is forgotten, as in refresh().
     bool fetch_download_link(const std::string &route_url, DownloadLink &out, unsigned &http_status,
                              std::string &error);
+
+    // A short-lived token for a slicing service at `audience` (its origin), from POST
+    // /api/slicer/slice-token {"audience": ...}. The device token itself never leaves the provider.
+    // `expires_in_s` is the lifetime the provider quoted (`expires_in`, or `expiresAt` in ms since
+    // the epoch), 0 when it quoted none. A provider refusal (401/402/403) fills `refusal` when
+    // given. On a 401 the token is forgotten, as in refresh(). Only call this for a service that
+    // may_receive_token() allows.
+    bool fetch_service_token(const std::string &audience, std::string &token, long &expires_in_s,
+                             unsigned &http_status, std::string &error, ServiceRefusal *refusal = nullptr);
+
+    // Whether a token from this provider may be sent to the service at `service_url`: only when the
+    // service is same-site with the provider (same scheme and registrable domain) or its origin is
+    // listed in `extra_origins` (comma separated, AppConfig service_token_origins). Anywhere else a
+    // request goes without Authorization and the service does its own authentication.
+    bool may_receive_token(const std::string &service_url, const std::string &extra_origins) const;
+
+    // False when no provider is configured: then nobody is ever signed in.
+    bool has_provider() const { return !m_site.empty(); }
+    // The provider's origin ("https://unlayered3d.com"), or empty without one.
+    std::string provider_origin() const;
+
+    // A one-time link that signs the application's web views in to this site as this account, from
+    // POST /api/slicer/web-session, so a web tab hosted on the site never shows a sign-in form of its
+    // own. `next` is the same-site path the web view should end up on. `path` comes back relative to
+    // site_url() and stops working after one use or a minute. On a 401 the token is forgotten, as in
+    // refresh().
+    bool fetch_web_session_path(const std::string &next, std::string &path, unsigned &http_status,
+                                std::string &error);
 
     // "https://unlayered3d.com" -> "unlayered3d.com", "http://localhost:3111" -> "localhost:3111";
     // used to keep the token on its own host and port.

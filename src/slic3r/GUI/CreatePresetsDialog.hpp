@@ -17,6 +17,11 @@
 namespace Slic3r {
 namespace GUI {
 
+// The filament_id the Create Filament / Create Printer dialogs give a new filament named
+// "<vendor> <type> <serial>": an existing filament's id when the name is known, else a new
+// "P" + md5 one. Shared with the automation actions (preset.createFilament, preset.createPrinter).
+std::string create_filament_id(const std::string& vendor_type_serial);
+
 class CreateFilamentPresetDialog : public DPIDialog
 {
 public:

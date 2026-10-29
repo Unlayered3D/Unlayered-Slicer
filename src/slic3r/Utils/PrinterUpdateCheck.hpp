@@ -116,6 +116,31 @@ struct PrinterUpdateDecision
 
 PrinterUpdateDecision decide_printer_update(const PrinterUpdateFacts &facts, const PrinterUpdateSkips &skips);
 
+// ------------------------------------------------------------------------------------------------
+// The setup wizard's "Check for updates" (guide 21update)
+// ------------------------------------------------------------------------------------------------
+
+// What one asked-for check found, for the wizard page to say in words. Skips are not consulted:
+// the person pressed the button, so a version they once skipped is still reported (and, after the
+// wizard, offered once more - see PrinterUpdateOffer's after-setup key).
+enum class PrinterUpdateCheckOutcome
+{
+    Unreachable, // the printer did not answer
+    NoFeed,      // the printer answered, but no feed returned a version (offline, server down)
+    UpToDate,    // nothing newer than what the printer has (of what could be asked)
+    Available,   // newer firmware, newer configuration, or both
+};
+
+PrinterUpdateCheckOutcome classify_printer_update_check(bool reachable, const PrinterUpdateFacts &facts);
+
+// A skip store that remembers nothing: decide_printer_update() with it ignores "Skip this version".
+PrinterUpdateSkips no_printer_update_skips();
+
+// Whether the outcome should leave the after-setup check pending, so the first check of that
+// printer after the wizard runs regardless of skips and says what it found: everything except
+// "up to date", which the page already said.
+bool printer_update_check_after_setup(PrinterUpdateCheckOutcome outcome);
+
 } // namespace Slic3r
 
 #endif // slic3r_PrinterUpdateCheck_hpp_

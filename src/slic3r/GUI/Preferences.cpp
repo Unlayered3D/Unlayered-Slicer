@@ -17,6 +17,7 @@
 #include "I18N.hpp"
 #include "WebAppPanel.hpp"
 #include "WebAppBridge.hpp"
+#include "SliceServiceOptionsDialog.hpp"
 #include "libslic3r/AppConfig.hpp"
 #include "libslic3r/Format/DRC.hpp"
 #include <wx/language.h>
@@ -1318,13 +1319,13 @@ wxBoxSizer *PreferencesDialog::create_item_checkbox(wxString title, wxString too
         // Unlayered: the settings gate is consulted on every bridge call, so nothing needs
         // re-wiring -- the page only has to be told that its capability list changed. Each key
         // belongs to one slot; the other tab is unaffected.
-        if (param == SETTING_WEB_APP_ALLOW_SETTINGS || param == SETTING_AGENT_APP_ALLOW_SETTINGS ||
-            param == SETTING_UNIVERSE_APP_ALLOW_SETTINGS) {
+        if (param == SETTING_WEB_APP_ALLOW_SETTINGS || param == SETTING_SIDE_PANEL_ALLOW_SETTINGS ||
+            param == SETTING_UNIVERSE_APP_ALLOW_SETTINGS || param == "side_panel_allow_printer") {
             MainFrame*   mainframe = wxGetApp().mainframe;
             WebAppPanel* panel     = nullptr;
             if (mainframe != nullptr) {
-                if (param == SETTING_AGENT_APP_ALLOW_SETTINGS)
-                    panel = mainframe->m_agent_view;
+                if (param == SETTING_SIDE_PANEL_ALLOW_SETTINGS || param == "side_panel_allow_printer")
+                    panel = mainframe->m_side_panel_view;
                 else if (param == SETTING_UNIVERSE_APP_ALLOW_SETTINGS)
                     panel = mainframe->m_universe_view;
                 else
@@ -1987,16 +1988,12 @@ void PreferencesDialog::create_items()
     g_sizer->Add(item_multi_machine);
 
     //// GENERAL > Web application
-    // Unlayered: the embedded web-application tabs deliberately have no Preferences UI. The
-    // shipped ones have one sensible address each, so a switch would only offer the user a
-    // way to break them; the generic slot is a developer harness a customer should not find.
-    //
-    // What a tab is, where it points and what it may do through the bridge are fields on its
-    // WebAppSlot (src/slic3r/GUI/WebAppPanel.cpp), applied to the configuration once. On a
-    // development machine the URL overrides ORCA_WEB_APP_URL, ORCA_AGENT_APP_URL and
-    // ORCA_UNIVERSE_APP_URL point a tab elsewhere; each enables its tab whatever the
-    // configuration says (WebAppPanel::is_enabled) and is never written back, so it cannot leak
-    // into a customer profile. The widgets are in git history; WEB_APP_BRIDGE.md section 7 lists
+    // Unlayered: the web-application addresses are under Advanced > "Web apps & services"
+    // (create_item_web_services). What else a slot may do through the bridge are fields on its
+    // WebAppSlot (src/slic3r/GUI/WebAppPanel.cpp), seeded into the configuration only where a key
+    // is absent. On a development machine ORCA_WEB_APP_URL, ORCA_SIDE_PANEL_URL and
+    // ORCA_UNIVERSE_APP_URL point a tab elsewhere; each enables its tab whatever the configuration
+    // says (WebAppPanel::is_enabled) and is never written back. WEB_APP_BRIDGE.md section 7 lists
     // every key.
 
     // Printer updates have no setting here. The configuration feed knows who is asking from the
@@ -2765,6 +2762,74 @@ void PreferencesDialog::create_items()
     sizer_page->Add(g_sizer, 0, wxEXPAND);
     }
 #endif // _WIN32
+
+    //////////////////////////
+    //// ADVANCED TAB
+    /////////////////////////////////////
+    m_pref_tabs->AppendItem(_L("Advanced"));
+    f_sizers.push_back(new wxFlexGridSizer(1, 1, v_gap, 0));
+    g_sizer = f_sizers.back();
+    g_sizer->AddGrowableCol(0, 1);
+
+    //// ADVANCED > Web apps & services
+    // Every external page and service this program talks to, as an address the user can change or
+    // blank (= off). Nothing here is specific to a provider: the side panel and the web-app tab
+    // speak WEB_APP_BRIDGE.md, the slicing service SLICE_SERVICE_PROTOCOL.md, and the account
+    // provider the provider section of the latter. The shipped addresses are seeded only where a
+    // key is absent, so what is typed here always stands.
+    g_sizer->Add(create_item_title(_L("Web apps & services")), 1, wxEXPAND);
+    {
+        auto *warning_sizer = new wxBoxSizer(wxHORIZONTAL);
+        auto *warning       = new wxStaticText(m_parent, wxID_ANY,
+                                               _L("Pages at these addresses can read the plate and, where the slicer allows it, change "
+                                                  "settings. Only enter addresses you trust. Leave a field empty to turn it off."));
+        warning->SetForegroundColour(DESIGN_GRAY900_COLOR);
+        warning->SetFont(::Label::Body_13);
+        warning->Wrap(FromDIP(520));
+        warning_sizer->AddSpacer(FromDIP(DESIGN_LEFT_MARGIN));
+        warning_sizer->Add(warning, 0, wxALIGN_CENTER_VERTICAL);
+        g_sizer->Add(warning_sizer);
+    }
+
+    // A slot's tab or sidebar exists only if it was enabled at start-up (MainFrame creates it
+    // then), so an address set here for a slot that had none takes effect after a restart; one that
+    // had an address reloads at once.
+    auto web_slot_commit = [](const WebAppSlot &slot) {
+        return [&slot]() {
+            AppConfig *cfg = wxGetApp().app_config;
+            if (cfg == nullptr)
+                return;
+            cfg->set_bool(slot.key_enabled, cfg->has(slot.key_url));
+            cfg->save();
+            if (wxGetApp().mainframe != nullptr)
+                wxGetApp().mainframe->refresh_web_app(slot);
+        };
+    };
+    g_sizer->Add(create_item_url_input(_L("Side panel URL"),
+                                       _L("A web page shown as a panel beside the tabs (View > Show Side Panel). "
+                                          "Empty = no side panel. A newly set address appears after a restart."),
+                                       SETTING_SIDE_PANEL_URL, web_slot_commit(WebAppSlot::side_panel())));
+    g_sizer->Add(create_item_url_input(_L("Web-app tab URL"),
+                                       _L("A web page shown as its own tab. Empty = no tab. A newly set address "
+                                          "appears after a restart."),
+                                       SETTING_WEB_APP_URL, web_slot_commit(WebAppSlot::generic())));
+    g_sizer->Add(create_item_url_input(_L("Slicing service URL"),
+                                       _L("A slicing service the Slice button can send the plate to (its modes "
+                                          "appear in the Slice dropdown). Empty = slice on this computer only."),
+                                       SETTING_NONPLANAR_SLICE_URL, []() { SliceService::refresh_schema_async(); }));
+    g_sizer->Add(create_item_url_input(_L("Account provider URL"),
+                                       _L("Where this program signs in (Help > Sign in): the account used for updates and, "
+                                          "where allowed, for the slicing service. Empty = no account. Takes effect "
+                                          "after a restart."),
+                                       SETTING_ACCOUNT_PROVIDER_URL, []() {}));
+    g_sizer->Add(create_item_input(_L("Service token origins"), "",
+                                   _L("Comma-separated origins (https://host) besides the account provider's own site "
+                                      "that may receive a sign-in token for the slicing service. Any other service "
+                                      "gets none and does its own sign-in."),
+                                   SETTING_SERVICE_TOKEN_ORIGINS, {}, wxEmptyString, wxFILTER_NONE));
+
+    g_sizer->AddSpacer(FromDIP(10));
+    sizer_page->Add(g_sizer, 0, wxEXPAND);
 
     //////////////////////////
     //// DEVELOPER TAB

@@ -1,8 +1,13 @@
 #include "MainFrame.hpp"
 
+#include <algorithm>
 #include <climits>
+#include <functional>
 #include <mutex>
+#include <string>
 #include <thread>
+
+#include "libslic3r/AppConfig.hpp" // SETTING_SIDE_PANEL_SIDEBAR_*
 
 #include <wx/panel.h>
 #include <wx/notebook.h>
@@ -43,9 +48,12 @@
 #include "I18N.hpp"
 #include "GLCanvas3D.hpp"
 #include "Plater.hpp"
+#include "ProjectAside.hpp"
 #include "WebViewDialog.hpp"
 #include "WebAppPanel.hpp"
+#include "WebAppBridge.hpp"
 #include "../Utils/NonplanarSliceClient.hpp"
+#include "SliceServiceOptionsDialog.hpp"
 #include "../Utils/Process.hpp"
 #include "../Utils/UsageTelemetry.hpp"
 // BBS
@@ -224,6 +232,65 @@ private:
     const char*   m_last_cursor_name{nullptr};
 };
 #endif // __WXGTK__
+
+// Unlayered: the drag handle between the notebook and the side panel. A thin panel that
+// reports horizontal mouse drags to the frame, which resizes the sidebar; it is a sizer sibling
+// of the web view, never over it, so it needs none of ResizeEdgePanel's GDK gymnastics. The
+// capture-lost handler is not optional: wx asserts on MSW when a captured window loses capture
+// without one (the precedent is TextureImportDialog / BBLTopbar).
+class SidebarSash : public wxPanel
+{
+public:
+    static constexpr int WIDTH_DIP = 5;
+
+    SidebarSash(wxWindow* parent, std::function<void(int)> on_drag, std::function<void()> on_release)
+        : wxPanel(parent, wxID_ANY, wxDefaultPosition, wxDefaultSize, wxBORDER_NONE)
+        , m_on_drag(std::move(on_drag))
+        , m_on_release(std::move(on_release))
+    {
+        SetMinSize(wxSize(FromDIP(WIDTH_DIP), -1));
+        SetCursor(wxCursor(wxCURSOR_SIZEWE));
+        update_colour();
+
+        Bind(wxEVT_LEFT_DOWN, [this](wxMouseEvent& e) {
+            m_last_x   = ClientToScreen(e.GetPosition()).x;
+            m_dragging = true;
+            if (!HasCapture())
+                CaptureMouse();
+        });
+        Bind(wxEVT_MOTION, [this](wxMouseEvent& e) {
+            if (!m_dragging || !e.Dragging())
+                return;
+            const int x = ClientToScreen(e.GetPosition()).x;
+            if (const int dx = x - m_last_x; dx != 0) {
+                m_last_x = x;
+                m_on_drag(dx);
+            }
+        });
+        auto finish = [this](wxEvent&) {
+            if (!m_dragging)
+                return;
+            m_dragging = false;
+            if (HasCapture())
+                ReleaseMouse();
+            m_on_release();
+        };
+        Bind(wxEVT_LEFT_UP, finish);
+        Bind(wxEVT_MOUSE_CAPTURE_LOST, finish);
+    }
+
+    void update_colour()
+    {
+        SetBackgroundColour(StateColor::darkModeColorFor(wxColour("#DADADA")));
+        Refresh();
+    }
+
+private:
+    std::function<void(int)> m_on_drag;
+    std::function<void()>    m_on_release;
+    int                      m_last_x{0};
+    bool                     m_dragging{false};
+};
 
 #ifdef __APPLE__
 class UnlayeredSlicerTaskBarIcon : public wxTaskBarIcon
@@ -494,6 +561,14 @@ DPIFrame(NULL, wxID_ANY, "", wxDefaultPosition, wxDefaultSize, BORDERLESS_FRAME_
                 m_topbar->SetMaximizedSize();
             }
 #endif
+        // Unlayered: a narrower frame may no longer afford the side panel's width.
+        if (m_side_panel_view != nullptr && m_side_panel_view->IsShown()) {
+            const int clamped = clamp_side_panel_width_dip(m_side_panel_width_dip);
+            if (clamped != m_side_panel_width_dip) {
+                m_side_panel_width_dip = clamped;
+                m_side_panel_view->SetMinSize(wxSize(FromDIP(m_side_panel_width_dip), -1));
+            }
+        }
         Refresh();
         Layout();
 #ifdef __WXGTK__
@@ -573,9 +648,9 @@ DPIFrame(NULL, wxID_ANY, "", wxDefaultPosition, wxDefaultSize, BORDERLESS_FRAME_
     // BBS
     Fit();
 
-    const wxSize min_size = wxGetApp().get_min_size(); //wxSize(76*wxGetApp().em_unit(), 49*wxGetApp().em_unit());
-
-    SetMinSize(min_size/*wxSize(760, 490)*/);
+    // Unlayered: frame_min_size() is get_min_size() (76 x 49 em), widened while the side panel
+    // is open; update_layout() above has already applied the persisted sidebar state.
+    SetMinSize(frame_min_size());
     SetSize(wxSize(FromDIP(1200), FromDIP(800)));
 
     Layout();
@@ -733,7 +808,7 @@ DPIFrame(NULL, wxID_ANY, "", wxDefaultPosition, wxDefaultSize, BORDERLESS_FRAME_
             return;
         }
 #endif
-        if (evt.CmdDown() && evt.GetKeyCode() == 'R') { if (m_slice_enable) { wxGetApp().plater()->update(true, true); wxPostEvent(m_plater, SimpleEvent(EVT_GLTOOLBAR_SLICE_PLATE)); this->m_tabpanel->SelectPageByName(TAB_ID_PREVIEW); } return; }
+        if (evt.CmdDown() && evt.GetKeyCode() == 'R') { if (m_slice_enable) { wxGetApp().plater()->update(true, true); m_plater->note_user_slice_request(); wxPostEvent(m_plater, SimpleEvent(EVT_GLTOOLBAR_SLICE_PLATE)); this->m_tabpanel->SelectPageByName(TAB_ID_PREVIEW); } return; }
         if (evt.CmdDown() && evt.ShiftDown() && evt.GetKeyCode() == 'G') {
             m_plater->apply_background_progress();
             m_print_enable = get_enable_print_status();
@@ -1012,12 +1087,23 @@ void MainFrame::update_layout()
         }
 
         clean_sizer(m_main_sizer);
+        // Unlayered: Detach() on a nested sizer detaches without deleting it, so the content
+        // sizer is emptied and freed here; case Old below builds a fresh one.
+        if (m_content_sizer != nullptr) {
+            clean_sizer(m_content_sizer);
+            delete m_content_sizer;
+            m_content_sizer = nullptr;
+        }
         clean_sizer(m_settings_dialog.GetSizer());
 
         if (m_settings_dialog.IsShown())
             m_settings_dialog.Close();
 
         m_tabpanel->Hide();
+        if (m_side_panel_view != nullptr)
+            m_side_panel_view->Hide();
+        if (m_side_panel_sash != nullptr)
+            m_side_panel_sash->Hide();
         m_plater->Hide();
 
         Layout();
@@ -1057,10 +1143,24 @@ void MainFrame::update_layout()
         const size_t prepare_pos = (home_idx == wxNOT_FOUND) ? 0 : static_cast<size_t>(home_idx) + 1;
         m_tabpanel->InsertPage(prepare_pos, TAB_ID_PREPARE, m_plater, _L("Prepare"), "tab_3d_active");
         m_tabpanel->InsertPage(prepare_pos + 1, TAB_ID_PREVIEW, m_plater, _L("Preview"), "tab_preview_active");
-        m_main_sizer->Add(m_tabpanel, 1, wxEXPAND | wxTOP, 0);
+        // Unlayered: the notebook shares the row with the side panel -- [notebook | sash |
+        // side panel] -- so the sidebar stands beside every tab, tab bar included. The sidebar's width
+        // is its min size (proportion 0 + wxEXPAND); the notebook takes the rest.
+        m_content_sizer = new wxBoxSizer(wxHORIZONTAL);
+        m_content_sizer->Add(m_tabpanel, 1, wxEXPAND);
+        if (m_side_panel_view != nullptr && m_side_panel_sash != nullptr) {
+            m_content_sizer->Add(m_side_panel_sash, 0, wxEXPAND);
+            m_content_sizer->Add(m_side_panel_view, 0, wxEXPAND);
+            m_side_panel_view->SetMinSize(wxSize(FromDIP(m_side_panel_width_dip), -1));
+        }
+        m_main_sizer->Add(m_content_sizer, 1, wxEXPAND | wxTOP, 0);
 
         m_tabpanel->Bind(wxCUSTOMEVT_NOTEBOOK_SEL_CHANGED, [this](wxCommandEvent& evt)
         {
+            // Only a click on a tab button posts this event: the person asked for Preview, which
+            // may start a slicing-service run (Plater::note_user_slice_request).
+            if (evt.GetId() >= 0 && evt.GetId() == m_tabpanel->FindPageByName(TAB_ID_PREVIEW))
+                m_plater->note_user_slice_request();
             // jump to 3deditor under preview_only mode
             if (evt.GetId() == m_tabpanel->FindPageByName(TAB_ID_PREPARE)) {
                 Sidebar& sidebar = GUI::wxGetApp().sidebar();
@@ -1079,6 +1179,9 @@ void MainFrame::update_layout()
 
         m_plater->Show();
         m_tabpanel->Show();
+        // Unlayered: the persisted open/closed state of the side panel (collapsed by default).
+        // The Layout() at the end of this function, inside its Freeze/Thaw, applies it.
+        apply_side_panel_state(/*layout=*/false);
 
         break;
     }
@@ -1384,23 +1487,43 @@ void MainFrame::init_tabpanel() {
     // (plugin.<plugin_key>.<name>) so they can't collide with the built-in TAB_ID_* constants.
     m_plugin_pages.initialize(m_tabpanel);
 
-    // Unlayered: optional tabs hosting embedded web applications, one WebAppPanel per WebAppSlot
-    // (its own configuration keys, seed file and environment overrides; see WebAppSlot.hpp).
-    // Nothing here is specific to a particular application -- the URLs are user configurable and
-    // the bridge a page may drive is documented in WEB_APP_BRIDGE.md. Gated on is_editor() so the
-    // G-code viewer is untouched.
+    // Unlayered: embedded web applications, one WebAppPanel per WebAppSlot (its own configuration
+    // keys, seed file and environment overrides; see WebAppSlot.hpp). Nothing here is specific to
+    // a particular application -- the URLs are user configurable and the bridge a page may drive
+    // is documented in WEB_APP_BRIDGE.md. Gated on is_editor() so the G-code viewer is untouched.
     //
-    // These are the TRAILING pages, after Project and Calibration. Order matters twice over:
-    // fit_tab_labels() compacts labels from the right, so the agent tab goes before the generic
-    // one and keeps its label longer; and show_device() re-inserts Calibration on every
+    // The SIDE PANEL is not a page. It is a sidebar beside the notebook -- a child of the frame
+    // that update_layout() puts in the same row as m_tabpanel, so it stands next to every tab and
+    // the page and the plate it works on are on screen together. It starts hidden: a frame child
+    // is IsShown() from birth (AddPage used to hide the page for us), and load_url() only defers
+    // the fetch while the panel is hidden, so without this Hide() a collapsed sidebar would still
+    // load its page at start-up.
+    if (wxGetApp().is_editor() && WebAppPanel::is_enabled(WebAppSlot::side_panel())) {
+        m_side_panel_view = new WebAppPanel(this, WebAppSlot::side_panel());
+        m_side_panel_view->set_hosted_as_sidebar(true);
+        m_side_panel_view->SetBackgroundColour(*wxWHITE);
+        m_side_panel_view->Hide();
+        m_side_panel_view->load_home(); // deferred: nothing is fetched until the sidebar is opened
+        m_side_panel_sash = new SidebarSash(
+            this, [this](int dx) { on_side_panel_sash_drag(dx); }, [this]() { persist_side_panel_width(); });
+        m_side_panel_sash->Hide();
+
+        // The persisted width, in DIP. 0 or garbage means the default.
+        if (AppConfig* cfg = wxGetApp().app_config; cfg != nullptr) {
+            try {
+                if (const int w = std::stoi(cfg->get(SETTING_SIDE_PANEL_SIDEBAR_WIDTH)); w > 0)
+                    m_side_panel_width_dip = w;
+            } catch (const std::exception&) {
+                // keep the default
+            }
+        }
+    }
+
+    // The two TRAILING pages, after Project and Calibration. Order matters twice over:
+    // fit_tab_labels() compacts labels from the right, so Universe goes before the generic slot
+    // and keeps its label longer; and show_device() re-inserts Calibration on every
     // printer-vendor change, which it does positionally (PositionAfter(TAB_ID_PROJECT)) rather
     // than by appending, so Calibration never lands on the wrong side of these tabs.
-    if (wxGetApp().is_editor() && WebAppPanel::is_enabled(WebAppSlot::agent())) {
-        m_agent_view = new WebAppPanel(m_tabpanel, WebAppSlot::agent());
-        m_agent_view->SetBackgroundColour(*wxWHITE);
-        m_tabpanel->AddPage(TAB_ID_AGENT, m_agent_view, WebAppPanel::configured_title(WebAppSlot::agent()), "tab_agent_active");
-        m_agent_view->load_home(); // deferred: nothing is fetched until the tab is shown
-    }
     if (wxGetApp().is_editor() && WebAppPanel::is_enabled(WebAppSlot::universe())) {
         m_universe_view = new WebAppPanel(m_tabpanel, WebAppSlot::universe());
         m_universe_view->SetBackgroundColour(*wxWHITE);
@@ -1429,14 +1552,156 @@ void MainFrame::init_tabpanel() {
     }
 }
 
+// "Slice with <tab>", or the tab's own name when it already says what it does (a tab named
+// "Quick Slice" stays "Quick Slice", not "Slice with Quick Slice").
+static wxString slice_with_title(const wxString& title)
+{
+    return title.Lower().Contains("slice") ? title : wxString::Format(_L("Slice with %s"), title);
+}
+
+wxString MainFrame::slice_with_label() const
+{
+    return m_web_app_view != nullptr ? slice_with_title(WebAppPanel::configured_title())
+                                     : SliceService::display_name();
+}
+
+// Export the plate for the web-app tab's page FIRST -- the export renders the plate thumbnail,
+// which needs the 3D canvas, and that is not drawn once the web tab is in front -- then switch
+// to the tab. The page collects the hand-off (slicer.takeHandoff) when it is ready.
+void MainFrame::hand_off_to_web_app()
+{
+    if (m_web_app_view == nullptr || m_web_app_view->bridge() == nullptr)
+        return;
+    const std::string err = m_web_app_view->bridge()->hand_off_plate(-1, "slice");
+    if (!err.empty()) {
+        show_error(this, from_u8(err));
+        return;
+    }
+    select_tab(wxString(TAB_ID_WEB_APP));
+    m_web_app_view->load_home(); // no-op once loaded; starts a never-shown tab
+}
+
+// The slicing service's options (Slice dropdown). The form is fetched fresh when the service
+// answers, else the cached copy is shown, so it still opens with the service down.
+// True when the dialog was confirmed (OK).
+static bool show_slice_service_options(wxWindow* parent)
+{
+    std::string error;
+    SliceService::refresh_schema_now(error);
+    const nlohmann::json schema = SliceService::cached_schema();
+    if (!schema.is_object()) {
+        show_error(parent, _L("The slicing service's options could not be loaded") +
+                             (error.empty() ? wxString() : ": " + from_u8(error)));
+        return false;
+    }
+    SliceServiceOptionsDialog dlg(parent, schema);
+    return dlg.ShowModal() == wxID_OK;
+}
+
+void MainFrame::apply_slice_mode(int select, const wxString& label, const std::string& mode, bool by_person)
+{
+    if (select == eSliceNonplanar && !mode.empty())
+        SliceService::set_mode(mode);
+    m_slice_btn->SetLabel(label);
+    m_slice_select = select;
+    // The prepare upload is slicing-service work: only the person's own pick starts it (decision D7).
+    m_slice_prepare_deferred = select == eSliceNonplanar && !by_person;
+    set_slice_prepare_active(select == eSliceNonplanar && by_person);
+    m_slice_enable = get_enable_slice_status();
+    m_slice_btn->Enable(m_slice_enable);
+    this->Layout();
+    fit_tab_labels(); // ORCA on label change
+}
+
+std::vector<MainFrame::SliceModeChoice> MainFrame::slice_mode_choices() const
+{
+    std::vector<SliceModeChoice> choices{{"local", _L("Slice plate"), false}, {"local_all", _L("Slice all"), false}};
+    if (!NonplanarSliceClient::is_configured())
+        return choices;
+    std::vector<SliceService::ModeChoice> modes = SliceService::mode_choices();
+    if (modes.empty())
+        modes.push_back({"service", SliceService::display_name()});
+    for (const SliceService::ModeChoice& mode : modes)
+        choices.push_back({mode.id, mode.label, true});
+    return choices;
+}
+
+std::string MainFrame::selected_slice_mode() const
+{
+    if (m_slice_select == eSliceAll)
+        return "local_all";
+    if (m_slice_select != eSliceNonplanar)
+        return "local";
+    if (SliceService::mode_choices().empty())
+        return "service";
+    const std::string mode = SliceService::current_mode();
+    return mode.empty() ? std::string("service") : mode;
+}
+
+std::string MainFrame::select_slice_mode(const std::string& id)
+{
+    for (const SliceModeChoice& choice : slice_mode_choices()) {
+        if (choice.id != id)
+            continue;
+        if (!choice.service) {
+            apply_slice_mode(id == "local_all" ? eSliceAll : eSlicePlate, choice.label, std::string(), /*by_person=*/false);
+            return {};
+        }
+        apply_slice_mode(eSliceNonplanar, choice.label, id == "service" ? std::string() : id, /*by_person=*/false);
+        return {};
+    }
+    return "unknown_mode";
+}
+
+void MainFrame::slice_service_options_changed(bool by_person, bool mode_changed)
+{
+    if (m_slice_select != eSliceNonplanar)
+        return;
+    // New options make the plate's service result out of date: Slice is available again. The
+    // mode's name is re-read in case the service renamed it.
+    const wxString name = SliceService::mode_label(SliceService::current_mode());
+    if (!name.empty()) {
+        m_slice_btn->SetLabel(name);
+        this->Layout();
+        fit_tab_labels();
+    }
+    m_slice_enable = get_enable_slice_status();
+    m_slice_btn->Enable(m_slice_enable);
+    // A new mode is a new prepare upload (SlicePrepare::plate_key): automation never starts one.
+    if (!by_person && mode_changed) {
+        set_slice_prepare_active(false);
+        m_slice_prepare_deferred = true;
+    }
+}
+
+void MainFrame::activate_deferred_slice_prepare()
+{
+    if (!slice_prepare_deferred())
+        return;
+    m_slice_prepare_deferred = false;
+    set_slice_prepare_active(true);
+}
+
 // SoftFever
+void MainFrame::set_slice_prepare_active(bool active)
+{
+    if (m_plater == nullptr)
+        return;
+    if (!m_slice_prepare) {
+        if (!active)
+            return;
+        m_slice_prepare = std::make_unique<SlicePrepare>(m_plater);
+    }
+    m_slice_prepare->set_active(active);
+}
+
 void MainFrame::refresh_web_app() { refresh_web_app(WebAppSlot::generic()); }
 
 bool MainFrame::web_app_slot_view(const WebAppSlot& slot, WebAppPanel*& panel, const char*& tab_id)
 {
     const std::string id = slot.id;
-    if (id == WebAppSlot::agent().id) {
-        panel = m_agent_view;    tab_id = TAB_ID_AGENT;    return true;
+    if (id == WebAppSlot::side_panel().id) {
+        panel = m_side_panel_view;    tab_id = nullptr;         return true; // the sidebar, not a page
     }
     if (id == WebAppSlot::universe().id) {
         panel = m_universe_view; tab_id = TAB_ID_UNIVERSE; return true;
@@ -1457,12 +1722,121 @@ void MainFrame::refresh_web_app(const WebAppSlot& slot)
     if (!web_app_slot_view(slot, panel, tab_id) || panel == nullptr)
         return;
 
-    const int idx = m_tabpanel->FindPageByName(tab_id);
-    if (idx != wxNOT_FOUND) {
+    if (tab_id == nullptr) {
+        // The side panel: no page label to rename, but the toggle's tooltip and the View-menu
+        // item carry the title.
+        apply_side_panel_state(/*layout=*/false);
+    } else if (const int idx = m_tabpanel->FindPageByName(tab_id); idx != wxNOT_FOUND) {
         m_tabpanel->SetPageText(idx, WebAppPanel::configured_title(slot));
         fit_tab_labels();
     }
     panel->load_home();
+}
+
+// --- the side panel -------------------------------------------------------------------------
+
+bool MainFrame::is_side_panel_shown() const
+{
+    return m_side_panel_view != nullptr && m_side_panel_view->IsShown();
+}
+
+void MainFrame::toggle_side_panel() { toggle_side_panel(!is_side_panel_shown()); }
+
+void MainFrame::toggle_side_panel(bool open)
+{
+    if (m_side_panel_view == nullptr || m_content_sizer == nullptr)
+        return;
+    if (AppConfig* cfg = wxGetApp().app_config; cfg != nullptr)
+        cfg->set_bool(SETTING_SIDE_PANEL_SIDEBAR_OPEN, open);
+    apply_side_panel_state(/*layout=*/true);
+}
+
+// Everything that depends on the persisted open flag, in one place: the two sizer items, the
+// frame's minimum size, the toggle's tooltip, the menu check, and the retry of a page whose load
+// failed while the sidebar was closed. With `layout` the frame is re-laid out immediately; the
+// start-up caller leaves that to update_layout()'s own Layout(). No Freeze/Thaw here: Thaw over a
+// WebView2 control paints it black for a frame.
+void MainFrame::apply_side_panel_state(bool layout)
+{
+    if (m_side_panel_view == nullptr || m_side_panel_sash == nullptr || m_content_sizer == nullptr)
+        return;
+    AppConfig* cfg  = wxGetApp().app_config;
+    const bool open = cfg != nullptr && cfg->get_bool(SETTING_SIDE_PANEL_SIDEBAR_OPEN);
+
+    if (open) {
+        m_side_panel_width_dip = clamp_side_panel_width_dip(m_side_panel_width_dip);
+        m_side_panel_view->SetMinSize(wxSize(FromDIP(m_side_panel_width_dip), -1));
+    }
+    // The sizer form reaches the virtual WebAppPanel::Show, which starts a deferred page load the
+    // first time the sidebar opens.
+    m_content_sizer->Show(m_side_panel_sash, open);
+    m_content_sizer->Show(m_side_panel_view, open);
+    if (open && m_side_panel_view->is_showing_fallback())
+        m_side_panel_view->load_home();
+
+    const wxString title = WebAppPanel::configured_title(WebAppSlot::side_panel());
+    if (m_side_panel_toggle_btn != nullptr) {
+        // The pill says what clicking it will do. SetLabel re-measures the button; the tab bar
+        // (ButtonsListCtrl, the button's grandparent) has to lay its sizer out again for the
+        // new width, which the frame-level Layout() below does not reach on its own.
+        const wxString label = open ? wxString::Format(_L("Hide %s"), title) : wxString::Format(_L("Show %s"), title);
+        if (m_side_panel_toggle_btn->GetLabel() != label) {
+            m_side_panel_toggle_btn->SetLabel(label);
+            if (wxWindow* panel = m_side_panel_toggle_btn->GetParent(); panel != nullptr) {
+                panel->Layout();
+                if (wxWindow* bar = panel->GetParent(); bar != nullptr)
+                    bar->Layout();
+            }
+        }
+        m_side_panel_toggle_btn->SetToolTip(label);
+    }
+    if (m_side_panel_menu_item != nullptr)
+        m_side_panel_menu_item->Check(open);
+
+    SetMinSize(frame_min_size());
+    if (layout) {
+        Layout();
+        fit_tab_labels();
+    }
+}
+
+// Dragging the sash left makes the sidebar wider, hence the sign.
+void MainFrame::on_side_panel_sash_drag(int dx)
+{
+    if (m_side_panel_view == nullptr)
+        return;
+    const int w = clamp_side_panel_width_dip(m_side_panel_width_dip - ToDIP(dx));
+    if (w == m_side_panel_width_dip)
+        return;
+    m_side_panel_width_dip = w;
+    m_side_panel_view->SetMinSize(wxSize(FromDIP(m_side_panel_width_dip), -1));
+    Layout();
+}
+
+// Never narrower than a usable page, never more than half the frame.
+int MainFrame::clamp_side_panel_width_dip(int width_dip) const
+{
+    constexpr int min_w = 280;
+    const int     max_w = std::max(min_w, ToDIP(GetClientSize().GetWidth()) / 2);
+    return std::clamp(width_dip, min_w, max_w);
+}
+
+void MainFrame::persist_side_panel_width()
+{
+    if (AppConfig* cfg = wxGetApp().app_config; cfg != nullptr)
+        cfg->set(SETTING_SIDE_PANEL_SIDEBAR_WIDTH, std::to_string(m_side_panel_width_dip));
+    fit_tab_labels();
+}
+
+// get_min_size() is 76 x 49 em; the Prepare tab's own sidebar wants ~39 em of that, so with the
+// side panel open as well the 3D canvas would have no width left at the minimum. Widen the
+// minimum by the sidebar's own minimum while it is open.
+wxSize MainFrame::frame_min_size() const
+{
+    wxSize size = wxGetApp().get_min_size();
+    if (is_side_panel_shown())
+        size.x += FromDIP(280) + FromDIP(SidebarSash::WIDTH_DIP);
+    return size;
 }
 
 void MainFrame::show_device(bool should_use_native) {
@@ -1641,6 +2015,19 @@ bool MainFrame::is_prepare_or_preview_tab() const
 
 void MainFrame::fit_tab_labels()
 {
+    // Unlayered: no Project or Calibration tab, for any printer. They are
+    // created (other code reaches into both panels) and re-inserted on every printer change by
+    // show_device(); this runs after each of those, so it takes them back out.
+    if (m_tabpanel != nullptr) {
+        for (wxWindow* page : {static_cast<wxWindow*>(m_project), static_cast<wxWindow*>(m_calibration)}) {
+            if (page == nullptr)
+                continue;
+            if (const int idx = m_tabpanel->FindPage(page); idx != wxNOT_FOUND) {
+                page->Show(false);
+                m_tabpanel->RemovePage(idx);
+            }
+        }
+    }
     if (!m_tabpanel || !m_slice_option_btn) // ignore layout change while slice/print buttons not visible
         return;
 
@@ -1667,6 +2054,16 @@ void MainFrame::fit_tab_labels()
 
 bool MainFrame::preview_only_hint()
 {
+    // Unlayered: this preview replaced a project that was set aside (ProjectAside.hpp); going back to
+    // Prepare means going back to that project, not to an empty plate after a "will be closed" warning.
+    if (m_plater && has_project_aside(*m_plater)) {
+        wxGetApp().CallAfter([this]() {
+            if (m_plater)
+                restore_project_aside(*m_plater);
+        });
+        return false;
+    }
+
     if (m_plater && (m_plater->only_gcode_mode() || (m_plater->using_exported_file()))) {
         BOOST_LOG_TRIVIAL(info) << boost::format("skipped tab switch from %1% to %2% in preview mode")%m_tabpanel->GetSelectedPageName() %wxString(TAB_ID_PREPARE);
 
@@ -1900,7 +2297,8 @@ bool MainFrame::can_export_gcode() const
         return false;
 
     // Preview-only mode: no model, but there is a G-code file to save (Plater::export_loaded_gcode).
-    if (m_plater->only_gcode_mode())
+    // So is a loaded sliced .gcode.3mf with no objects (a sliced project handed back without its model).
+    if (m_plater->only_gcode_mode() || (m_plater->using_exported_file() && m_plater->model().objects.empty()))
         return m_plater->can_export_loaded_gcode();
 
     if (m_plater->model().objects.empty())
@@ -2058,6 +2456,26 @@ wxBoxSizer* MainFrame::create_side_tools()
     print_sizer->Add(m_print_btn, 0, wxLEFT | wxALIGN_CENTER_VERTICAL, FromDIP(1));
     print_panel->SetSizer(print_sizer);
 
+    // Unlayered: the side panel's toggle, at the far right of the tab bar so it is reachable
+    // from every tab. Its own panel item in the sizer (ButtonsListCtrl reparents each top-level
+    // sizer window into itself, so a bare button would not survive), to the RIGHT of the print
+    // button because fit_tab_labels() measures the free space up to m_slice_option_btn, and kept
+    // OUT of show_option(), which hides the slice/print buttons on the non-Plater tabs. Gated on
+    // the slot being enabled rather than on m_side_panel_view, which init_tabpanel creates later.
+    // Created BEFORE update_side_button_style() below, which is what gives it the same compact
+    // round shape as the two dropdown buttons -- a SideButton left unstyled is a wide text pill.
+    wxPanel* side_panel_host = nullptr;
+    if (wxGetApp().is_editor() && WebAppPanel::is_enabled(WebAppSlot::side_panel())) {
+        side_panel_host = new wxPanel(this, wxID_ANY, wxDefaultPosition, wxDefaultSize);
+        side_panel_host->SetBackgroundColour(StateColor::darkModeColorFor(wxColour("#3B4446")));
+        // A full labelled pill exactly like Print rather than a small round icon: easier to hit.
+        m_side_panel_toggle_btn = new SideButton(side_panel_host, WebAppPanel::configured_title(WebAppSlot::side_panel()), "");
+        auto side_panel_sizer   = new wxBoxSizer(wxHORIZONTAL);
+        side_panel_sizer->Add(m_side_panel_toggle_btn, 0, wxALIGN_CENTER_VERTICAL);
+        side_panel_host->SetSizer(side_panel_sizer);
+        m_side_panel_toggle_btn->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) { toggle_side_panel(); });
+    }
+
     update_side_button_style();
     m_slice_option_btn->Enable();
     m_print_option_btn->Enable();
@@ -2065,6 +2483,10 @@ wxBoxSizer* MainFrame::create_side_tools()
     sizer->Add(slice_panel);
     sizer->Add(FromDIP(15), 0, 0, 0, 0);
     sizer->Add(print_panel);
+    if (side_panel_host != nullptr) {
+        sizer->Add(FromDIP(15), 0, 0, 0, 0);
+        sizer->Add(side_panel_host);
+    }
     sizer->Add(FromDIP(19), 0, 0, 0, 0);
 
     sizer->Layout();
@@ -2114,11 +2536,17 @@ wxBoxSizer* MainFrame::create_side_tools()
             m_plater->exit_gizmo();
             m_plater->update(true, true);
 
-            // Nonplanar goes to an external service: no local slicing, so none of the checks
-            // below (which are about this program's own slice) apply. It switches to the Preview
-            // tab itself once the G-code comes back, rather than ahead of time on an empty one.
+            // The slicing service (the dropdown's service entries) slices the plate instead of this
+            // program, so the checks below (about this program's own slice) do not apply. It goes
+            // the way "Slice plate" goes: Plater::reslice() sends the plate while a service mode is
+            // selected, and Preview shows the plate's result once it is back.
             if (m_slice_select == eSliceNonplanar) {
-                m_plater->slice_nonplanar();
+                // The person's own click: the one kind of request a service run may start from
+                // (Plater::note_user_slice_request). Whether the service accepts the job is the
+                // service's decision; a refusal comes back as its own message (NonplanarSliceJob).
+                m_plater->note_user_slice_request();
+                wxPostEvent(m_plater, SimpleEvent(EVT_GLTOOLBAR_SLICE_PLATE));
+                this->m_tabpanel->SelectPageByName(TAB_ID_PREVIEW);
                 return;
             }
 
@@ -2142,41 +2570,7 @@ wxBoxSizer* MainFrame::create_side_tools()
             }
         });
 
-    m_print_btn->Bind(wxEVT_BUTTON, [this](wxCommandEvent& event)
-        {
-            //this->m_plater->select_view_3D("Preview");
-            if (m_print_select == ePrintAll || m_print_select == ePrintPlate || m_print_select == ePrintMultiMachine)
-            {
-                m_plater->apply_background_progress();
-                // check valid of print
-                m_print_enable = get_enable_print_status();
-                m_print_btn->Enable(m_print_enable);
-                if (m_print_enable) {
-                    if (m_print_select == ePrintAll)
-                        wxPostEvent(m_plater, SimpleEvent(EVT_GLTOOLBAR_PRINT_ALL));
-                    if (m_print_select == ePrintPlate)
-                        wxPostEvent(m_plater, SimpleEvent(EVT_GLTOOLBAR_PRINT_PLATE));
-                    if(m_print_select == ePrintMultiMachine)
-                         wxPostEvent(m_plater, SimpleEvent(EVT_GLTOOLBAR_PRINT_MULTI_MACHINE));
-                }
-            }
-            else if (m_print_select == eExportGcode)
-                wxPostEvent(m_plater, SimpleEvent(EVT_GLTOOLBAR_EXPORT_GCODE));
-            else if (m_print_select == eSendGcode)
-                wxPostEvent(m_plater, SimpleEvent(EVT_GLTOOLBAR_SEND_GCODE));
-            else if (m_print_select == eUploadGcode)
-                wxPostEvent(m_plater, SimpleEvent(EVT_GLTOOLBAR_UPLOAD_GCODE));
-            else if (m_print_select == eExportSlicedFile)
-                wxPostEvent(m_plater, SimpleEvent(EVT_GLTOOLBAR_EXPORT_SLICED_FILE));
-            else if (m_print_select == eExportAllSlicedFile)
-                wxPostEvent(m_plater, SimpleEvent(EVT_GLTOOLBAR_EXPORT_ALL_SLICED_FILE));
-            else if (m_print_select == eSendToPrinter)
-                wxPostEvent(m_plater, SimpleEvent(EVT_GLTOOLBAR_SEND_TO_PRINTER));
-            else if (m_print_select == eSendToPrinterAll)
-                wxPostEvent(m_plater, SimpleEvent(EVT_GLTOOLBAR_SEND_TO_PRINTER_ALL));
-            /* else if (m_print_select == ePrintMultiMachine)
-                 wxPostEvent(m_plater, SimpleEvent(EVT_GLTOOLBAR_PRINT_MULTI_MACHINE));*/
-        });
+    m_print_btn->Bind(wxEVT_BUTTON, [this](wxCommandEvent& event) { press_print_button(false); });
 
     m_slice_option_btn->Bind(wxEVT_BUTTON, [this](wxCommandEvent& event)
         {
@@ -2189,32 +2583,57 @@ wxBoxSizer* MainFrame::create_side_tools()
             slice_plate_btn->SetCornerRadius(0);
 
             slice_all_btn->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) {
-                m_slice_btn->SetLabel(_L("Slice all"));
-                m_slice_select = eSliceAll;
-                m_slice_enable = get_enable_slice_status();
-                m_slice_btn->Enable(m_slice_enable);
-                this->Layout();
-                fit_tab_labels(); // ORCA on label change
+                apply_slice_mode(eSliceAll, _L("Slice all"));
                 if(m_slice_option_pop_up)
                     m_slice_option_pop_up->Dismiss();
                 });
 
             slice_plate_btn->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) {
-                m_slice_btn->SetLabel(_L("Slice plate"));
-                m_slice_select = eSlicePlate;
-                m_slice_enable = get_enable_slice_status();
-                m_slice_btn->Enable(m_slice_enable);
-                this->Layout();
-                fit_tab_labels(); // ORCA on label change
+                apply_slice_mode(eSlicePlate, _L("Slice plate"));
                 if(m_slice_option_pop_up)
                     m_slice_option_pop_up->Dismiss();
                 });
             m_slice_option_pop_up->append_button(slice_all_btn);
             m_slice_option_pop_up->append_button(slice_plate_btn);
 
-            // Unlayered: the "Slice nonplanar" dropdown entry (external slice service) was removed
-            // from the UI at the user's request. The eSliceNonplanar handling elsewhere is left
-            // dormant -- nothing can select it now that the button is gone.
+            // An external slicing service (SLICE_SERVICE_PROTOCOL.md) is a third way to slice,
+            // chosen here like the other two -- the plate goes out as a 3MF and the G-code comes
+            // back into Preview. One entry per mode the service offers on this printer; without
+            // one, a single entry named after the service. Picking one selects it like "Slice
+            // plate", with no check of its own: the service decides whether it takes a job. Names
+            // and the options form come from the service itself (SliceServiceOptionsDialog.hpp);
+            // with no service configured there are no entries.
+            if (NonplanarSliceClient::is_configured()) {
+                SliceService::refresh_schema_async(); // for next time: the modes, the options form
+                std::vector<SliceService::ModeChoice> modes = SliceService::mode_choices();
+                if (modes.empty())
+                    modes.push_back({std::string(), SliceService::display_name()});
+                for (const SliceService::ModeChoice& mode : modes) {
+                    const wxString label = mode.label;
+                    SideButton* mode_btn = new SideButton(m_slice_option_pop_up, label, "");
+                    mode_btn->SetCornerRadius(0);
+                    mode_btn->Bind(wxEVT_BUTTON, [this, mode, label](wxCommandEvent&) {
+                        if (m_slice_option_pop_up)
+                            m_slice_option_pop_up->Dismiss();
+                        // CallAfter: the popup is still tearing down.
+                        CallAfter([this, mode, label]() { apply_slice_mode(eSliceNonplanar, label, mode.id); });
+                    });
+                    m_slice_option_pop_up->append_button(mode_btn);
+                }
+                SideButton* options_btn = new SideButton(m_slice_option_pop_up,
+                                                         _L("Slicing service options..."), "");
+                options_btn->SetCornerRadius(0);
+                options_btn->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) {
+                    if (m_slice_option_pop_up)
+                        m_slice_option_pop_up->Dismiss();
+                    CallAfter([this]() {
+                        if (!show_slice_service_options(this))
+                            return;
+                        slice_service_options_changed(/*by_person=*/true);
+                    });
+                });
+                m_slice_option_pop_up->append_button(options_btn);
+            }
             m_slice_option_pop_up->Popup(m_slice_btn);
         }
     );
@@ -2440,10 +2859,11 @@ bool MainFrame::get_enable_slice_status()
         return false;
     }
 
-    // Nonplanar is an external service, so the plate's own slice state says nothing about
-    // whether it can run: it needs geometry, a configured address and a free job worker.
+    // The slicing service needs geometry and a configured address; a plate already holding the
+    // service's result has nothing to slice (a different mode or options of the service is a new
+    // slice, which reslice() starts from the Preview tab as well).
     if (m_slice_select == eSliceNonplanar)
-        return m_plater->can_slice_nonplanar();
+        return m_plater->can_slice_nonplanar() && !m_plater->current_plate_has_service_result(true);
 
     PartPlateList &part_plate_list = m_plater->get_partplate_list();
     PartPlate *current_plate = part_plate_list.get_curr_plate();
@@ -2463,7 +2883,8 @@ bool MainFrame::get_enable_slice_status()
     }
     else if (m_slice_select == eSlicePlate)
     {
-        if (current_plate->is_slice_result_valid())
+        // A result from the slicing service is not this mode's: slicing replaces it.
+        if (current_plate->is_slice_result_valid() && !m_plater->current_plate_has_service_result())
         {
             enable = false;
         }
@@ -2480,6 +2901,59 @@ bool MainFrame::get_enable_slice_status()
 
     BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(": m_slice_select %1%, enable= %2% ")%m_slice_select %enable;
     return enable;
+}
+
+wxString MainFrame::print_button_label() const { return m_print_btn != nullptr ? m_print_btn->GetLabel() : wxString(); }
+
+bool MainFrame::can_press_print()
+{
+    if (m_print_btn == nullptr || m_plater == nullptr)
+        return false;
+    m_plater->apply_background_progress();
+    return get_enable_print_status();
+}
+
+void MainFrame::press_print_button(bool wait)
+{
+    auto fire = [this, wait](wxEventType type) {
+        SimpleEvent evt(type);
+        if (wait)
+            m_plater->GetEventHandler()->ProcessEvent(evt);
+        else
+            wxPostEvent(m_plater, evt);
+    };
+    //this->m_plater->select_view_3D("Preview");
+    if (m_print_select == ePrintAll || m_print_select == ePrintPlate || m_print_select == ePrintMultiMachine)
+    {
+        m_plater->apply_background_progress();
+        // check valid of print
+        m_print_enable = get_enable_print_status();
+        m_print_btn->Enable(m_print_enable);
+        if (m_print_enable) {
+            if (m_print_select == ePrintAll)
+                fire(EVT_GLTOOLBAR_PRINT_ALL);
+            if (m_print_select == ePrintPlate)
+                fire(EVT_GLTOOLBAR_PRINT_PLATE);
+            if(m_print_select == ePrintMultiMachine)
+                fire(EVT_GLTOOLBAR_PRINT_MULTI_MACHINE);
+        }
+    }
+    else if (m_print_select == eExportGcode)
+        fire(EVT_GLTOOLBAR_EXPORT_GCODE);
+    else if (m_print_select == eSendGcode)
+        fire(EVT_GLTOOLBAR_SEND_GCODE);
+    else if (m_print_select == eUploadGcode)
+        fire(EVT_GLTOOLBAR_UPLOAD_GCODE);
+    else if (m_print_select == eExportSlicedFile)
+        fire(EVT_GLTOOLBAR_EXPORT_SLICED_FILE);
+    else if (m_print_select == eExportAllSlicedFile)
+        fire(EVT_GLTOOLBAR_EXPORT_ALL_SLICED_FILE);
+    else if (m_print_select == eSendToPrinter)
+        fire(EVT_GLTOOLBAR_SEND_TO_PRINTER);
+    else if (m_print_select == eSendToPrinterAll)
+        fire(EVT_GLTOOLBAR_SEND_TO_PRINTER_ALL);
+    /* else if (m_print_select == ePrintMultiMachine)
+         fire(EVT_GLTOOLBAR_PRINT_MULTI_MACHINE);*/
 }
 
 bool MainFrame::get_enable_print_status()
@@ -2636,10 +3110,22 @@ void MainFrame::update_side_button_style()
     m_print_option_btn->SetIconOffset(FromDIP(2));
     m_print_option_btn->SetMinSize(wxSize(FromDIP(24), FromDIP(24)));
 
+    // Unlayered: the side panel toggle. Print's pill is two SideButtons (dropdown + label) and
+    // its label half is rounded on one side only; layout style 1 is the whole pill in one button.
+    if (m_side_panel_toggle_btn != nullptr) {
+        m_side_panel_toggle_btn->SetLayoutStyle(1);
+        m_side_panel_toggle_btn->SetTextLayout(SideButton::EHorizontalOrientation::HO_Center, FromDIP(15));
+        m_side_panel_toggle_btn->SetCornerRadius(FromDIP(12));
+        m_side_panel_toggle_btn->SetExtraSize(wxSize(FromDIP(38), FromDIP(10)));
+        m_side_panel_toggle_btn->SetMinSize(wxSize(-1, FromDIP(24)));
+    }
+
     // Keep panel backgrounds in sync with SideButton's darkModeColorFor(#3B4446) bottom strip
     auto bg = StateColor::darkModeColorFor(wxColour("#3B4446"));
     m_slice_btn->GetParent()->SetBackgroundColour(bg);
     m_print_btn->GetParent()->SetBackgroundColour(bg);
+    if (m_side_panel_toggle_btn != nullptr)
+        m_side_panel_toggle_btn->GetParent()->SetBackgroundColour(bg);
 }
 
 void MainFrame::update_slice_print_status(SlicePrintEventType event, bool can_slice, bool can_print)
@@ -2707,6 +3193,12 @@ void MainFrame::on_dpi_changed(const wxRect& suggested_rect)
     m_print_btn->Rescale();
     m_slice_option_btn->Rescale();
     m_print_option_btn->Rescale();
+    if (m_side_panel_toggle_btn != nullptr)
+        m_side_panel_toggle_btn->Rescale();
+    if (m_side_panel_sash != nullptr)
+        m_side_panel_sash->SetMinSize(wxSize(FromDIP(SidebarSash::WIDTH_DIP), -1));
+    if (m_side_panel_view != nullptr)
+        m_side_panel_view->SetMinSize(wxSize(FromDIP(m_side_panel_width_dip), -1));
 
     // update Plater
     wxGetApp().plater()->msw_rescale();
@@ -2795,6 +3287,12 @@ void MainFrame::on_sys_color_changed()
     wxGetApp().plate_tab->sys_color_changed();
 
     MenuFactory::sys_color_changed(m_menubar);
+
+    // Unlayered: the side panel's sash and the tab-bar panels re-read darkModeColorFor().
+    // The web view itself is re-themed below (RecreateAll; the side panel slot does it in place).
+    if (m_side_panel_sash != nullptr)
+        m_side_panel_sash->update_colour();
+    update_side_button_style();
 
     WebView::RecreateAll();
 
@@ -3470,6 +3968,18 @@ void MainFrame::init_menubar_as_editor()
             },
             this, [this]() { return m_tabpanel->GetSelectedPageName() == TAB_ID_PREPARE; },
             []() { return wxGetApp().show_outline(); }, this);
+
+        // Unlayered: the side panel. Ctrl+Shift+B -- not A, which GLCanvas3D::on_char already
+        // takes for "select all objects on all plates" without listing it anywhere.
+        if (m_side_panel_view != nullptr) {
+            viewMenu->AppendSeparator();
+            m_side_panel_menu_item = append_menu_check_item(
+                viewMenu, wxID_ANY,
+                _L("Show Side Panel") + "\t" + ctrl + shift + "B",
+                _L("Show the side panel beside the current tab."),
+                [this](wxCommandEvent&) { toggle_side_panel(); }, this, [this]() { return m_side_panel_view != nullptr; },
+                [this]() { return is_side_panel_shown(); }, this);
+        }
 
         /*viewMenu->AppendSeparator();
         append_menu_check_item(viewMenu, wxID_ANY, _L("Show &Wireframe") + "\t" + ctrl + shift + _L("Enter"), _L("Show wireframes in 3D scene."),

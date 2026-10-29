@@ -106,6 +106,8 @@ void SupportLayer::translate(const Point &shift)
     Slic3r::translate(this->floor_areas, shift);
     Slic3r::translate(this->roof_gap_areas, shift);
     translate_extrusions(this->support_fills, shift);
+    Slic3r::translate(this->unclipped_support_islands, shift);
+    translate_extrusions(this->unclipped_support_fills, shift);
 }
 
 // merge all regions' slices to get islands

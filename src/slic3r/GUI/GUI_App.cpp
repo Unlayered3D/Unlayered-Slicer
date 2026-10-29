@@ -845,6 +845,7 @@ static bool take_installer_network_plugin_request(AppConfig* app_config)
     }
     return false;
 }
+
 #endif // _WIN32
 
 // Unlayered: anonymous usage diagnostics (slic3r/Utils/UsageTelemetry.hpp). The app's own part is
@@ -1505,6 +1506,9 @@ void GUI_App::shutdown()
     set_closing(true);
     Slic3r::PluginManager::instance().set_shutting_down();
 
+    // First quiet the Bambu plug-in's own threads (discovery, the printer connection): replacing
+    // its callbacks below, and destroying its agent, while they still run is how it crashed at quit.
+    BBLNetworkPlugin::stop_for_exit();
     if (m_agent)
         m_agent->set_printer_agent(nullptr);
     NetworkAgentFactory::clear_printer_agent_cache();
@@ -3301,9 +3305,162 @@ void GUI_App::init_plugin_gui_wiring()
         });
 }
 
+// Unlayered: several slicer windows at once. Each window is its own process ("single_instance" is
+// off by default, and File > New Window starts another one), and they share the user's data
+// folder and the WebView2 user-data folder.
+namespace {
+#ifdef _WIN32
+// WebView2 keeps its browser state in a user-data folder; wxWidgets gives every process the same
+// one (wxStandardPaths::GetUserLocalDataDir(), i.e. %LOCALAPPDATA%\Unlayered Slicer, with WebView2's
+// own EBWebView inside it). A second window sharing that folder with the first came up with dead
+// web panels. The first window keeps the default folder, so its sign-ins and storage stay where
+// they always were. Every later window takes the first free slot k and points WebView2 at
+// %LOCALAPPDATA%\Unlayered Slicer\EBWebView-instances\<k> through WEBVIEW2_USER_DATA_FOLDER, which
+// CreateCoreWebView2EnvironmentWithOptions reads in place of the folder wxWidgets passes. A slot
+// keeps its folder (and its sign-ins) for the next window that gets the same slot.
+//
+// "Who is first" and "which slot is free" are named mutexes: an object exists while a process holds
+// a handle to it, and Windows closes the handles of a process that exits or crashes, so a slot frees
+// itself. The handle a window keeps is deliberately never closed. Must run before the first WebView
+// is created: MainFrame creates several, so this is at the top of on_init_inner (post_init, where
+// init_webview_runtime() runs, comes after MainFrame).
+void choose_webview2_user_data_folder()
+{
+    static const wchar_t* PRIMARY = L"Local\\UnlayeredSlicer.WebView2.Primary";
+    constexpr int         MAX_SLOTS = 32;
+    const wxString        instances = wxStandardPaths::Get().GetUserLocalDataDir() + wxS("\\EBWebView-instances\\");
+
+    // A window started from another one (File > New Window) inherits its environment, slot folder
+    // included; it must choose its own, or it would share that window's folder again.
+    if (wxString inherited; wxGetEnv(wxS("WEBVIEW2_USER_DATA_FOLDER"), &inherited) && inherited.StartsWith(instances))
+        wxUnsetEnv(wxS("WEBVIEW2_USER_DATA_FOLDER"));
+    // A folder chosen from outside (the environment, or the dev edition's E2E override in
+    // WebView.cpp) wins; a slot folder would otherwise override that choice.
+    if (wxString external; wxGetEnv(wxS("WEBVIEW2_USER_DATA_FOLDER"), &external) && !external.empty()) {
+        BOOST_LOG_TRIVIAL(info) << "WebView2 folder: WEBVIEW2_USER_DATA_FOLDER already set, keeping it";
+        return;
+    }
+
+    if (HANDLE primary = ::CreateMutexW(nullptr, FALSE, PRIMARY); primary == nullptr) {
+        // ACCESS_DENIED: it exists but was made by a window with other rights (run as administrator).
+        if (const DWORD error = ::GetLastError(); error != ERROR_ACCESS_DENIED) {
+            BOOST_LOG_TRIVIAL(warning) << "WebView2 folder: CreateMutex failed (" << error << "); keeping the default folder";
+            return;
+        }
+    } else if (::GetLastError() != ERROR_ALREADY_EXISTS) {
+        BOOST_LOG_TRIVIAL(info) << "WebView2 folder: first window, default user-data folder";
+        return; // the first window: keep the handle (and the default folder) for the process lifetime
+    } else {
+        // Another window is the first. Do not keep its object alive: once it exits, the next
+        // window to start should become the first again and get the default folder back.
+        ::CloseHandle(primary);
+    }
+
+    for (int slot = 1; slot <= MAX_SLOTS; ++slot) {
+        const std::wstring name   = L"Local\\UnlayeredSlicer.WebView2.Slot." + std::to_wstring(slot);
+        HANDLE             handle = ::CreateMutexW(nullptr, FALSE, name.c_str());
+        if (handle == nullptr)
+            continue; // ACCESS_DENIED: held by a window with other rights
+        if (::GetLastError() == ERROR_ALREADY_EXISTS) {
+            ::CloseHandle(handle); // another window has this slot
+            continue;
+        }
+        // This slot is ours for the process lifetime: the handle is never closed.
+        const wxString folder = instances + wxString::Format(wxS("%d"), slot);
+        boost::system::error_code ec;
+        boost::filesystem::create_directories(boost::filesystem::path(folder.ToStdWstring()), ec);
+        if (!wxSetEnv(wxS("WEBVIEW2_USER_DATA_FOLDER"), folder)) {
+            BOOST_LOG_TRIVIAL(warning) << "WebView2 folder: could not set WEBVIEW2_USER_DATA_FOLDER; keeping the default folder";
+            return;
+        }
+        BOOST_LOG_TRIVIAL(info) << "WebView2 folder: another window is running, this one uses slot " << slot << ": "
+                                << folder.ToUTF8().data();
+        return;
+    }
+    BOOST_LOG_TRIVIAL(warning) << "WebView2 folder: all " << MAX_SLOTS << " slots are in use; keeping the default folder";
+}
+#endif // _WIN32
+
+// Two windows starting together used to install the system profiles over each other
+// (install_vendor_bundles_from_resources removes a vendor's folder and copies it again) and to read
+// them while the other was still copying. A window holds this lock while it installs the system
+// profiles (PresetUpdater's constructor: check_installed_vendor_profiles -> install_bundles_rsrc ->
+// copy_directory_recursively, and the printers folder) and while it first loads the presets, so
+// starting windows take turns. The lock is a named mutex per data folder; Windows releases it if
+// its holder dies (WAIT_ABANDONED). A window never waits more than two minutes: after that it logs
+// and goes on without the lock, as every window did before. Windows only; on other platforms
+// (where several windows on one data folder are rare) it does nothing.
+class ProfileSyncLock
+{
+public:
+    explicit ProfileSyncLock(const char* what)
+    {
+#ifdef _WIN32
+        // One lock per data folder: FNV-1a of the path, so two builds name it the same way.
+        unsigned long long hash = 14695981039346656037ull;
+        for (unsigned char c : data_dir()) {
+            hash ^= c;
+            hash *= 1099511628211ull;
+        }
+        const std::wstring name = L"Local\\UnlayeredSlicer.ProfileSync." + std::to_wstring(hash);
+        m_handle                = ::CreateMutexW(nullptr, FALSE, name.c_str());
+        if (m_handle == nullptr) {
+            BOOST_LOG_TRIVIAL(warning) << "profile lock: CreateMutex failed (" << ::GetLastError() << "); " << what << " without it";
+            return;
+        }
+        DWORD result = ::WaitForSingleObject(m_handle, 0);
+        if (result == WAIT_TIMEOUT) {
+            BOOST_LOG_TRIVIAL(info) << "profile lock: another window is installing or loading the profiles; waiting before " << what;
+            result = ::WaitForSingleObject(m_handle, kWaitMs);
+        }
+        switch (result) {
+        case WAIT_OBJECT_0:
+            m_owned = true;
+            break;
+        case WAIT_ABANDONED: // the holder exited without releasing it: ours now
+            m_owned = true;
+            BOOST_LOG_TRIVIAL(warning) << "profile lock: the window holding it exited while " << what << "; continuing";
+            break;
+        case WAIT_TIMEOUT:
+            BOOST_LOG_TRIVIAL(warning) << "profile lock: still held after " << kWaitMs / 1000 << " s; " << what << " without it";
+            break;
+        default:
+            BOOST_LOG_TRIVIAL(warning) << "profile lock: wait failed (" << ::GetLastError() << "); " << what << " without it";
+            break;
+        }
+#else
+        (void) what;
+#endif
+    }
+    ~ProfileSyncLock()
+    {
+#ifdef _WIN32
+        if (m_owned)
+            ::ReleaseMutex(m_handle);
+        if (m_handle != nullptr)
+            ::CloseHandle(m_handle);
+#endif
+    }
+    ProfileSyncLock(const ProfileSyncLock&)            = delete;
+    ProfileSyncLock& operator=(const ProfileSyncLock&) = delete;
+
+private:
+#ifdef _WIN32
+    static constexpr DWORD kWaitMs  = 120000;
+    HANDLE                 m_handle = nullptr;
+    bool                   m_owned  = false;
+#endif
+};
+} // namespace
+
 bool GUI_App::on_init_inner()
 {
     wxLog::SetActiveTarget(new wxBoostLog());
+
+#ifdef _WIN32
+    // Before any WebView exists (see choose_webview2_user_data_folder).
+    choose_webview2_user_data_folder();
+#endif
 
 #ifdef __APPLE__
     // Override wxWidgets' kAEGetURL handler so unlayeredslicer:// deep links keep
@@ -3571,6 +3728,11 @@ bool GUI_App::on_init_inner()
     BOOST_LOG_TRIVIAL(info) << "loading systen presets...";
     preset_bundle = new PresetBundle();
 
+    // Unlayered: held from here until the system profiles are installed (the PresetUpdater
+    // constructor below) and the user folder is backed up, so a second window starting at the
+    // same time waits instead of copying over this one (see ProfileSyncLock).
+    auto profile_sync_lock = std::make_unique<ProfileSyncLock>("installing the system profiles");
+
     // just checking for existence of Slic3r::data_dir is not enough : it may be an empty directory
     // supplied as argument to --datadir; in that case we should still run the wizard
     preset_bundle->setup_directories();
@@ -3721,6 +3883,7 @@ bool GUI_App::on_init_inner()
     preset_bundle->set_default_suppressed(true);
 
     preset_bundle->backup_user_folder();
+    profile_sync_lock.reset();
 
     Bind(EVT_UPDATE_MACHINE_LIST, &GUI_App::on_update_machine_list, this);
     Bind(EVT_USER_LOGIN, &GUI_App::on_user_login, this);
@@ -3822,6 +3985,9 @@ bool GUI_App::on_init_inner()
             // If there are substitutions in system profiles, then a "reconfigure" event shall be triggered, which will force
             // installation of a compatible system preset, thus nullifying the system preset substitutions.
             if (scrn) { scrn->SetText(_L("Loading printer & filament profiles") + dots, 30); wxYield(); }
+            // Unlayered: not while another starting window installs the system profiles (released
+            // at the end of this block, before any error dialog).
+            ProfileSyncLock profile_load_lock("loading the presets");
             init_params->preset_substitutions = preset_bundle->load_presets(*app_config, ForwardCompatibilitySubstitutionRule::EnableSystemSilent);
         }
         catch (const std::exception& ex) {
@@ -8794,8 +8960,8 @@ void GUI_App::update_mode()
         mainframe->m_printer_view->update_mode();
     if (mainframe->m_web_app_view)
         mainframe->m_web_app_view->update_mode();
-    if (mainframe->m_agent_view)
-        mainframe->m_agent_view->update_mode();
+    if (mainframe->m_side_panel_view)
+        mainframe->m_side_panel_view->update_mode();
     mainframe->m_webview->update_mode();
 
 #ifdef _MSW_DARK_MODE
@@ -8819,8 +8985,8 @@ void GUI_App::update_internal_development() {
         mainframe->m_printer_view->update_mode();
     if (mainframe->m_web_app_view)
         mainframe->m_web_app_view->update_mode();
-    if (mainframe->m_agent_view)
-        mainframe->m_agent_view->update_mode();
+    if (mainframe->m_side_panel_view)
+        mainframe->m_side_panel_view->update_mode();
 }
 
 void GUI_App::show_ip_address_enter_dialog(wxString title)
@@ -10278,6 +10444,16 @@ bool GUI_App::run_wizard(ConfigWizard::RunReason reason, ConfigWizard::StartPage
 
     // Unlayered 0.1.7: settings from other slicers are imported by the wizard itself, on its own
     // step before the printer picker (guide 5import), so there is nothing left to do here.
+
+    // Unlayered 0.1.8: the printer update step (guide 21update) leaves a check for after the wizard
+    // when an update is waiting or the printer could not be checked yet. Help > Setup Wizard runs
+    // after start-up, when the offer exists and has already checked this session, so ask it now;
+    // the first-run wizard runs before the offer exists, and post_init hands it the printer.
+    if (m_printer_update_offer && preset_bundle && app_config->get(PrinterUpdateOffer::CHECK_AFTER_SETUP_KEY) == "1")
+        CallAfter([this] {
+            if (m_printer_update_offer && preset_bundle)
+                m_printer_update_offer->on_printer_selected(preset_bundle->printers.get_edited_preset().config);
+        });
 
     return res;
 }

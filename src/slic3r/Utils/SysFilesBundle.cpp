@@ -184,6 +184,51 @@ bool sys_is_machine_specific(const std::string &card_path)
     return false;
 }
 
+// Top-level folders of an Unlayered SD card image that are not printer configuration: the
+// firmware updater's images, print files, the web interface and the 12864 display's menus.
+static const char *const SD_CARD_ONLY_DIRS[] = {"firmware", "gcodes", "www", "menu"};
+
+// The README / START HERE notes a card image carries at its root.
+static bool is_sd_card_note(const std::string &root_file_name)
+{
+    const std::string lower = boost::algorithm::to_lower_copy(root_file_name);
+    return boost::starts_with(lower, "readme") || boost::starts_with(lower, "start here") ||
+           boost::starts_with(lower, "start_here") || boost::starts_with(lower, "start-here");
+}
+
+bool sys_looks_like_full_sd_card(const std::vector<std::string> &paths)
+{
+    bool has_config = false, has_card_only = false;
+    for (const auto &path : paths) {
+        const std::vector<std::string> parts = split_path(normalize_separators(path));
+        if (parts.empty())
+            continue;
+        if (parts.size() == 1) {
+            has_card_only = has_card_only || is_sd_card_note(parts.front());
+            continue;
+        }
+        if (boost::iequals(parts.front(), "sys") || boost::iequals(parts.front(), "macros"))
+            has_config = true;
+        for (const char *dir : SD_CARD_ONLY_DIRS)
+            if (boost::iequals(parts.front(), dir))
+                has_card_only = true;
+    }
+    return has_config && has_card_only;
+}
+
+bool sys_is_card_kept_config(const std::string &card_path)
+{
+    // Keep in step with what the configuration release stage leaves out beyond
+    // sys_machine_specific_names() (see the release notes: "never touches config.g").
+    return boost::iequals(normalize_separators(card_path), "sys/config.g");
+}
+
+bool sys_is_config_folder_path(const std::string &relative_path)
+{
+    const std::vector<std::string> parts = split_path(normalize_separators(relative_path));
+    return parts.size() >= 2 && is_allowed_root(parts.front());
+}
+
 // -----------------------------------------------------------------------------------------------
 // Package
 // -----------------------------------------------------------------------------------------------
@@ -458,34 +503,100 @@ struct RawEntry
     std::vector<uint8_t> data;
 };
 
-// Removes a directory that wraps the whole package - the "repo-1.2/" a GitHub archive adds, or the
-// folder somebody zipped by right-clicking it. A wrapper that is itself a destination (sys/) is
-// left alone, because that one carries meaning.
-void strip_wrapper_dirs(std::vector<RawEntry> &entries)
+// The directory, if any, that wraps the whole package - the "repo-1.2/" a GitHub archive adds, or
+// the folder somebody zipped by right-clicking it - as a prefix ending in '/'. A wrapper that is
+// itself a destination (sys/) is not one, because that one carries meaning. Paths are normalised.
+std::string wrapper_prefix(const std::vector<std::string> &paths)
 {
-    for (int pass = 0; pass < 3; ++pass) {
+    std::string prefix;
+    for (int pass = 0; pass < 3 && !paths.empty(); ++pass) {
         std::string common;
-        for (const auto &e : entries) {
-            const auto slash = e.path.find('/');
+        for (const auto &full : paths) {
+            const std::string p     = full.substr(prefix.size());
+            const auto        slash = p.find('/');
             if (slash == std::string::npos)
-                return; // something sits at the root, so there is no wrapper
-            const std::string first = e.path.substr(0, slash);
+                return prefix; // something sits at this level, so there is no wrapper
+            const std::string first = p.substr(0, slash);
             if (common.empty())
                 common = first;
             else if (!boost::iequals(common, first))
-                return;
+                return prefix;
         }
         if (common.empty() || is_allowed_root(common))
-            return;
-
-        BOOST_LOG_TRIVIAL(info) << "SysFiles: stripping wrapper directory " << common << "/";
-        for (auto &e : entries)
-            e.path = e.path.substr(common.size() + 1);
+            return prefix;
+        prefix += paths.front().substr(prefix.size(), common.size() + 1);
     }
+    return prefix;
+}
+
+// Removes the wrapper directory (see wrapper_prefix) from every entry.
+void strip_wrapper_dirs(std::vector<RawEntry> &entries)
+{
+    std::vector<std::string> paths;
+    paths.reserve(entries.size());
+    for (const auto &e : entries)
+        paths.push_back(e.path);
+    const std::string prefix = wrapper_prefix(paths);
+    if (prefix.empty())
+        return;
+    BOOST_LOG_TRIVIAL(info) << "SysFiles: stripping wrapper directory " << prefix;
+    for (auto &e : entries)
+        e.path = e.path.substr(prefix.size());
+}
+
+// What was decided about a whole SD card image before any payload was read: that it is one, and
+// what was left on the card because of it.
+struct CardFilter
+{
+    bool                                             full_sd_card = false;
+    std::vector<std::pair<std::string, std::string>> skipped;
+};
+
+// For a package that is a whole SD card image (sys_looks_like_full_sd_card), marks every path
+// outside the configuration folders as not to be read, and reports them one line per top-level
+// folder rather than one per print file and web page. Any other package is left exactly as it
+// was; in particular a loose file in an ordinary package still lands in sys/. `paths` are
+// normalised and wrapper-free. Returns one flag per path: true = read it.
+std::vector<bool> filter_full_sd_card(const std::vector<std::string> &paths, CardFilter &filter)
+{
+    std::vector<bool> keep(paths.size(), true);
+    filter.full_sd_card = sys_looks_like_full_sd_card(paths);
+    if (!filter.full_sd_card)
+        return keep;
+
+    std::vector<std::pair<std::string, int>> folders; // top-level folder -> files left out
+    for (size_t i = 0; i < paths.size(); ++i) {
+        if (sys_is_config_folder_path(paths[i]))
+            continue;
+        keep[i] = false;
+        if (sys_is_ignored_file(paths[i]))
+            continue; // __MACOSX, .DS_Store and the like: not worth a line
+        const std::vector<std::string> parts = split_path(paths[i]);
+        if (parts.size() < 2) {
+            filter.skipped.emplace_back(paths[i], "part of the SD card, not printer configuration");
+            continue;
+        }
+        auto it = std::find_if(folders.begin(), folders.end(),
+                               [&parts](const std::pair<std::string, int> &f) { return boost::iequals(f.first, parts.front()); });
+        if (it == folders.end())
+            folders.emplace_back(parts.front(), 1);
+        else
+            ++it->second;
+    }
+    for (const auto &f : folders) {
+        const bool firmware = boost::iequals(f.first, "firmware");
+        filter.skipped.emplace_back(
+            f.first + "/",
+            (boost::format("part of the SD card, not printer configuration (%1% file%2%)%3%") % f.second
+             % (f.second == 1 ? "" : "s") % (firmware ? "; update firmware with the Firmware button" : "")).str());
+    }
+    BOOST_LOG_TRIVIAL(info) << "SysFiles: a whole SD card image; only its configuration folders are read";
+    return keep;
 }
 
 bool build_package(std::vector<RawEntry> entries,
                    const std::string    &origin,
+                   const CardFilter     &filter,
                    SysFilePackage       &pkg_out,
                    std::string          &error_out)
 {
@@ -494,7 +605,9 @@ bool build_package(std::vector<RawEntry> entries,
     strip_wrapper_dirs(entries);
 
     SysFilePackage pkg;
-    pkg.origin = origin;
+    pkg.origin            = origin;
+    pkg.from_full_sd_card = filter.full_sd_card;
+    pkg.skipped           = filter.skipped;
 
     // A manifest at the package root, if there is one, is authoritative about what gets installed.
     bool have_manifest = false;
@@ -505,6 +618,9 @@ bool build_package(std::vector<RawEntry> entries,
         if (!parse_sys_manifest(json, pkg, error_out))
             return false;
         pkg.origin   = origin;
+        // parse_sys_manifest() does not touch these today; set again so that never matters.
+        pkg.from_full_sd_card = filter.full_sd_card;
+        pkg.skipped           = filter.skipped;
         have_manifest = true;
         entries.erase(it);
         break;
@@ -516,12 +632,24 @@ bool build_package(std::vector<RawEntry> entries,
     // left empty by it can never fall through to "install everything that was found".
     static const char *MACHINE_SPECIFIC_REASON =
         "belongs to one printer (its calibration, name, network, setup or logs) and is never replaced";
+    // A whole SD card always carries the ship image's sys/config.g (ship header, DHCP, factory
+    // geometry). Installing it would replace this printer's tuned one with the generic one, so from
+    // a card it is kept - as the configuration releases do, whose stage leaves config.g out.
+    static const char *CARD_CONFIG_REASON = "this printer's own setup, kept";
+    const bool         full_card          = filter.full_sd_card;
+    auto protected_reason = [full_card](const std::string &card_path) -> const char * {
+        if (sys_is_machine_specific(card_path))
+            return MACHINE_SPECIFIC_REASON;
+        if (full_card && sys_is_card_kept_config(card_path))
+            return CARD_CONFIG_REASON;
+        return nullptr;
+    };
     const bool manifest_lists_files = have_manifest && !pkg.files.empty();
     if (manifest_lists_files) {
         auto keep = std::stable_partition(pkg.files.begin(), pkg.files.end(),
-                                          [](const SysFile &f) { return !sys_is_machine_specific(f.path); });
+                                          [&](const SysFile &f) { return protected_reason(f.path) == nullptr; });
         for (auto it = keep; it != pkg.files.end(); ++it)
-            pkg.skipped.emplace_back(it->path, MACHINE_SPECIFIC_REASON);
+            pkg.skipped.emplace_back(it->path, protected_reason(it->path));
         pkg.files.erase(keep, pkg.files.end());
     }
 
@@ -537,12 +665,12 @@ bool build_package(std::vector<RawEntry> entries,
             pkg.skipped.emplace_back(e.path, reason);
             continue;
         }
-        if (sys_is_machine_specific(card_path)) {
+        if (const char *why = protected_reason(card_path)) {
             // Reported once: a manifest that declared it has already been answered above.
             const bool reported = std::any_of(pkg.skipped.begin(), pkg.skipped.end(),
                                               [&card_path](const auto &s) { return boost::iequals(s.first, card_path); });
             if (!reported)
-                pkg.skipped.emplace_back(e.path, MACHINE_SPECIFIC_REASON);
+                pkg.skipped.emplace_back(e.path, why);
             continue;
         }
         if (e.data.empty()) {
@@ -594,15 +722,39 @@ bool build_package(std::vector<RawEntry> entries,
 
 bool read_zip_entries(mz_zip_archive       &arch,
                       std::vector<RawEntry> &out,
+                      CardFilter            &filter,
                       SysProgressFn          progress,
                       std::string           &error_out)
 {
     const mz_uint count = mz_zip_reader_get_num_files(&arch);
     uint64_t      total = 0;
 
+    // Names first: whether this is a whole SD card image decides which entries are read at all, so
+    // its print files and firmware stay in the archive instead of tripping the size limits below.
+    std::vector<mz_uint>     indices;
+    std::vector<std::string> names;
     for (mz_uint i = 0; i < count; ++i) {
         if (mz_zip_reader_is_file_a_directory(&arch, i))
             continue;
+        mz_zip_archive_file_stat stat;
+        if (!mz_zip_reader_file_stat(&arch, i, &stat)) {
+            error_out = "The archive could not be read";
+            return false;
+        }
+        indices.push_back(i);
+        names.push_back(normalize_separators(stat.m_filename));
+    }
+    const std::string        prefix = wrapper_prefix(names);
+    std::vector<std::string> unwrapped;
+    unwrapped.reserve(names.size());
+    for (const auto &n : names)
+        unwrapped.push_back(n.substr(prefix.size()));
+    const std::vector<bool> keep = filter_full_sd_card(unwrapped, filter);
+
+    for (size_t k = 0; k < indices.size(); ++k) {
+        if (!keep[k])
+            continue;
+        const mz_uint i = indices[k];
 
         mz_zip_archive_file_stat stat;
         if (!mz_zip_reader_file_stat(&arch, i, &stat)) {
@@ -637,7 +789,7 @@ bool read_zip_entries(mz_zip_archive       &arch,
     }
 
     if (out.empty()) {
-        error_out = "The archive is empty";
+        error_out = filter.full_sd_card ? "The SD card image has no files in sys or macros" : "The archive is empty";
         return false;
     }
     return true;
@@ -686,12 +838,13 @@ bool LocalSysFileSource::fetch_from_zip(SysFilePackage &pkg_out, SysProgressFn p
     }
 
     std::vector<RawEntry> entries;
-    const bool            read_ok = read_zip_entries(zip.arch, entries, progress, error_out);
+    CardFilter            filter;
+    const bool            read_ok = read_zip_entries(zip.arch, entries, filter, progress, error_out);
     close_zip_reader(&zip.arch);
     if (!read_ok)
         return false;
 
-    return build_package(std::move(entries), description(), pkg_out, error_out);
+    return build_package(std::move(entries), description(), filter, pkg_out, error_out);
 }
 
 bool LocalSysFileSource::fetch_from_directory(SysFilePackage &pkg_out, SysProgressFn progress, std::string &error_out)
@@ -702,9 +855,10 @@ bool LocalSysFileSource::fetch_from_directory(SysFilePackage &pkg_out, SysProgre
     const std::string root_name   = root.filename().string();
     const std::string path_prefix = is_allowed_root(root_name) ? canonical_root(root_name) + "/" : std::string();
 
-    std::vector<RawEntry> entries;
-    uint64_t              total = 0;
-
+    // Names first, as for a zip: the root of a whole SD card (or a copy of one) is read for its
+    // configuration folders only, so its print files never count against the size limits.
+    std::vector<fs::path>    found_paths;
+    std::vector<std::string> found_rel;
     boost::system::error_code ec;
     for (fs::recursive_directory_iterator it(root, ec), end; it != end; it.increment(ec)) {
         if (ec) {
@@ -718,18 +872,33 @@ bool LocalSysFileSource::fetch_from_directory(SysFilePackage &pkg_out, SysProgre
         std::string rel = it->path().string().substr(root.string().size());
         while (!rel.empty() && (rel.front() == '/' || rel.front() == '\\'))
             rel = rel.substr(1);
+        found_paths.push_back(it->path());
+        found_rel.push_back(path_prefix + normalize_separators(rel));
+    }
+    const std::string        prefix = wrapper_prefix(found_rel);
+    std::vector<std::string> unwrapped;
+    unwrapped.reserve(found_rel.size());
+    for (const auto &r : found_rel)
+        unwrapped.push_back(r.substr(prefix.size()));
+    CardFilter              filter;
+    const std::vector<bool> keep = filter_full_sd_card(unwrapped, filter);
 
+    std::vector<RawEntry> entries;
+    uint64_t              total = 0;
+    for (size_t k = 0; k < found_paths.size(); ++k) {
+        if (!keep[k])
+            continue;
         RawEntry entry;
-        entry.path = path_prefix + normalize_separators(rel);
+        entry.path = found_rel[k];
 
-        const uint64_t size = uint64_t(fs::file_size(it->path(), ec));
+        const uint64_t size = uint64_t(fs::file_size(found_paths[k], ec));
         if (ec) {
-            error_out = (boost::format("Could not read %1%: %2%") % it->path().string() % ec.message()).str();
+            error_out = (boost::format("Could not read %1%: %2%") % found_paths[k].string() % ec.message()).str();
             return false;
         }
         if (size > MAX_FILE_BYTES) {
             // Not fatal for a folder: the user may simply have a stray archive sitting in it.
-            BOOST_LOG_TRIVIAL(info) << "SysFiles: ignoring oversized file " << it->path().string();
+            BOOST_LOG_TRIVIAL(info) << "SysFiles: ignoring oversized file " << found_paths[k].string();
             continue;
         }
         total += size;
@@ -740,7 +909,7 @@ bool LocalSysFileSource::fetch_from_directory(SysFilePackage &pkg_out, SysProgre
         }
 
         std::string read_err;
-        if (!DuetRrfClient::read_file_binary(it->path().string(), entry.data, read_err)) {
+        if (!DuetRrfClient::read_file_binary(found_paths[k].string(), entry.data, read_err)) {
             error_out = read_err;
             return false;
         }
@@ -753,10 +922,11 @@ bool LocalSysFileSource::fetch_from_directory(SysFilePackage &pkg_out, SysProgre
     }
 
     if (entries.empty()) {
-        error_out = (boost::format("%1% is empty") % m_path).str();
+        error_out = filter.full_sd_card ? (boost::format("%1% has no files in sys or macros") % m_path).str()
+                                        : (boost::format("%1% is empty") % m_path).str();
         return false;
     }
-    return build_package(std::move(entries), description(), pkg_out, error_out);
+    return build_package(std::move(entries), description(), filter, pkg_out, error_out);
 }
 
 // -----------------------------------------------------------------------------------------------
@@ -963,13 +1133,14 @@ bool GitHubSysFileSource::fetch(SysFilePackage &pkg_out, SysProgressFn progress,
         return false;
     }
     std::vector<RawEntry> entries;
-    const bool            read_ok = read_zip_entries(zip.arch, entries, progress, error_out);
+    CardFilter            filter;
+    const bool            read_ok = read_zip_entries(zip.arch, entries, filter, progress, error_out);
     mz_zip_reader_end(&zip.arch);
     if (!read_ok)
         return false;
 
     const std::string origin = (boost::format("GitHub release %1% (%2%/%3%)") % tag % m_opts.owner % m_opts.repo).str();
-    if (!build_package(std::move(entries), origin, pkg_out, error_out))
+    if (!build_package(std::move(entries), origin, filter, pkg_out, error_out))
         return false;
 
     // A manifest inside the archive is authoritative; without one the tag stands in, exactly as it

@@ -32,6 +32,7 @@
 
 #include <memory>
 #include <map>
+#include <unordered_map>
 #include <set>
 #include <string>
 #include <cfloat>
@@ -869,6 +870,18 @@ private:
     double   m_sub_layer_flow_ratio = 0.0;
     double   m_sub_layer_height     = 0.0;
     bool m_need_change_layer_lift_z = false;
+    // UNLAYERED_MOD: nonplanar layers travel guard. Set once a curved-shell path
+    // (ExtrusionPath::nonplanar_shell) has been extruded: every travel then rises vertically to
+    // m_np_safe_z (slice frame, like m_nominal_z) before moving in XY and descends vertically onto
+    // its target, and wiping is suppressed, so the nozzle never drags through printed curved
+    // material. Cleared by the first travel made once the layer's nominal Z is above it.
+    bool   m_np_guard  = false;
+    double m_np_safe_z = 0.;
+    // Set for the whole export when any object prints nonplanar layers: then every extrusion is
+    // recorded into a coarse height map (0.5 mm cells, G-code XY, slice-frame Z) and a guarded
+    // travel rises only as high as the material under its own XY path, not to the patch top.
+    bool m_np_enabled = false;
+    std::unordered_map<uint64_t, float> m_np_hmap;
     // UNLAYERED_MOD — ByGroup: set when a cross-orientation hop to the next group member is
     // pending. The next travel_to must traverse at machine-vertical height and descend straight
     // down onto the destination (tool-axis lifts tilt/dive through the bed). One-shot.
@@ -881,6 +894,11 @@ private:
     double m_bygroup_hop_b_deg = 0.;
     double m_bygroup_hop_c_deg = 0.;
     double m_bygroup_hop_bc_dist_deg = 0.;
+    // UNLAYERED_MOD -- multiplanar base C (GCode/MultiplanarBaseC.hpp): while a By-group group prints
+    // its planar base, the C the table is held at (radians, the first angled chunk's), standing in for
+    // the C = 0 that trafo_to_bc() reports for a vertical tool axis. Empty outside a base; cleared by
+    // the first transition onto an angled chunk and at the end of the group.
+    std::optional<double> m_multiplanar_base_c;
     int m_start_gcode_filament = -1;
     std::string m_filament_instances_code;
 

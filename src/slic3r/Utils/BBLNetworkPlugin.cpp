@@ -62,13 +62,36 @@ BBLNetworkPlugin& BBLNetworkPlugin::instance()
     return *s_instance;
 }
 
+void BBLNetworkPlugin::stop_for_exit()
+{
+    BBLNetworkPlugin *p = s_instance;
+    if (!p || !p->m_agent)
+        return;
+    if (p->m_start_discovery)
+        p->m_start_discovery(p->m_agent, false, false);
+    if (p->m_disconnect_printer)
+        p->m_disconnect_printer(p->m_agent);
+}
+
+// Unlayered 0.1.8: the singleton used to be deleted here, and every later instance() -- the
+// NetworkAgent statics, StaticBambuLib::release() in ~GUI_App -- then dereferenced null. And on
+// Windows the agent was destroyed and both DLLs freed while the plug-in's own threads (SSDP, MQTT)
+// still ran: crash signatures "bambu_networking_02.08.01.dll+0xffb90>+0xff89e>+0x57db6a>ucrtbase"
+// (a plug-in thread procedure) in the 0.1.3-0.1.5 diagnostics, phase "closing". Bambu Studio
+// itself stops discovery, destroys the agent and never frees the library at exit.
 void BBLNetworkPlugin::shutdown()
 {
-    // Note: Do not call instance() after shutdown() - the singleton is destroyed.
-    if (s_instance) {
-        delete s_instance;
-        s_instance = nullptr;
-    }
+    BBLNetworkPlugin *p = s_instance;
+    if (!p)
+        return;
+    stop_for_exit();
+#ifdef _WIN32
+    p->destroy_agent();
+#else
+    // macOS: the dylib must be unloaded here, before AppKit's exit() runs its static destructors
+    // (one of them throws; see GUI_App::shutdown).
+    p->unload();
+#endif
 }
 
 BBLNetworkPlugin::BBLNetworkPlugin() = default;

@@ -20,13 +20,24 @@ add_executable(${_TEST_NAME}_tests
     test_plugin_cloud_metadata.cpp
     test_plugin_audit.cpp
     test_sys_files_bundle.cpp
-    test_webapp_preset_share.cpp
     test_sys_files_updater.cpp
     test_usage_telemetry.cpp
+    test_webapp_preset_share.cpp
     test_privacy_consent.cpp
     test_app_updater_macos.cpp
     test_app_updater_platform.cpp
     test_app_updater_reuse.cpp
+    test_action_catalog.cpp
+    test_action_schema.cpp
+    test_actions_objects.cpp
+    test_actions_parts.cpp
+    test_actions_objectsettings.cpp
+    test_actions_plates.cpp
+    test_actions_paint.cpp
+    test_actions_presets.cpp
+    test_actions_filament.cpp
+    test_actions_slice_project.cpp
+    test_actions_printers.cpp
     test_printer_update_check.cpp
     test_firmware_bundle.cpp
     ../fff_print/test_helpers.cpp

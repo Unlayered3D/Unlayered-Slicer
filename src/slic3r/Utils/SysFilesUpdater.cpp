@@ -340,6 +340,7 @@ void Run::execute(const SysFileSourceFactory &source_factory)
     m_r.available_notes   = pkg.notes;
     m_r.available_origin  = pkg.origin.empty() ? source->description() : pkg.origin;
     m_r.skipped           = pkg.skipped;
+    m_r.from_full_sd_card = pkg.from_full_sd_card;
     for (const auto &f : pkg.files)
         m_r.available_files.push_back({f.path, uint64_t(f.data.size())});
 

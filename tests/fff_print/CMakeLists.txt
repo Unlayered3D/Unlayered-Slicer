@@ -10,6 +10,7 @@ add_executable(${_TEST_NAME}_tests
 	test_hotend_collision.cpp
 	test_virtual_tilt_limit.cpp
 	test_max_layer_z_multiplanar.cpp
+	test_multiplanar_base_c.cpp
 	test_segment_support_cascade.cpp
 	test_skeleton_containment.cpp
 	test_extrusion_entity.cpp
@@ -29,9 +30,11 @@ add_executable(${_TEST_NAME}_tests
 	test_slicing_pipeline_hook.cpp
 	test_support_material.cpp
 	test_support_direction.cpp
+	test_support_neighbour_clip.cpp
 	test_tree_support.cpp
 	test_trianglemesh.cpp
 	test_wave_overhangs.cpp
+	test_nonplanar_top.cpp
 	test_wipe_tower.cpp
 	)
 target_link_libraries(${_TEST_NAME}_tests test_common libslic3r Catch2::Catch2WithMain)

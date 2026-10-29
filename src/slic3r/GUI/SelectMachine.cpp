@@ -944,6 +944,7 @@ void SelectMachineDialog::update_select_layout(MachineObject *obj)
 
     load_option_vals(obj);
     if (obj && obj->get_printer_arch() == PrinterArch::ARCH_I3) { m_checkbox_list["timelapse"]->setValue("off"); } /*off timelapse on selected for n series by zhimin.zeng*/
+    apply_automation_options(obj); // after the saved choices, so the page's win; save_option_vals skips them
     save_option_vals(obj);
 
     // Orca: pa_value visibility depends on the freshly-loaded flow_cali value, so recompute it
@@ -1875,6 +1876,55 @@ bool SelectMachineDialog::is_selected_ams_drying(MachineObject* obj)
 void SelectMachineDialog::prepare(int print_plate_idx)
 {
     m_print_plate_idx = print_plate_idx;
+}
+
+void SelectMachineDialog::set_automation_options(const nlohmann::json& options)
+{
+    m_automation_options            = options.is_object() ? options : nlohmann::json::object();
+    m_automation_ext_assist_applied = false;
+}
+
+// The page's print options, on top of the printer's saved ones (load_option_vals): each only when
+// the dialog shows that option and offers that value, the same states the person could pick.
+void SelectMachineDialog::apply_automation_options(MachineObject *obj)
+{
+    if (obj == nullptr || m_automation_options.empty())
+        return;
+    static const std::pair<const char*, const char*> s_keys[] = {{"timelapse", "timelapse"},
+                                                                 {"bedLeveling", "bed_leveling"},
+                                                                 {"flowCalibration", "flow_cali"},
+                                                                 {"nozzleOffsetCalibration", "nozzle_offset_cali"},
+                                                                 {"sharedPaProfile", "pa_value"}};
+    for (const auto& [key, opt_name] : s_keys) {
+        auto it = m_automation_options.find(key);
+        if (it == m_automation_options.end() || !it->is_string() || m_checkbox_list.count(opt_name) == 0)
+            continue;
+        PrintOption*      opt = m_checkbox_list[opt_name];
+        const std::string val = it->get<std::string>();
+        if (!opt->IsShown() || !opt->contain_opt(val))
+            continue;
+        if (std::string(key) == "timelapse" && val == "on") {
+            // load_option_vals turns timelapse off where it cannot run; so does the N series.
+            wxString why;
+            if (!obj->canEnableTimelapse(why) || has_timelapse_warning(why) || obj->get_printer_arch() == PrinterArch::ARCH_I3)
+                continue;
+        }
+        opt->setValue(val);
+    }
+    if (auto it = m_automation_options.find("timelapseStorage"); it != m_automation_options.end() && it->is_string() &&
+                                                                 obj->is_support_internal_timelapse) {
+        const std::string val = it->get<std::string>();
+        const bool has_sdcard = obj->GetStorage()->get_sdcard_state() == DevStorage::SdcardState::HAS_SDCARD_NORMAL;
+        if (val == "internal" || (val == "external" && has_sdcard)) {
+            m_timelapse_storage = val;
+            update_timelapse_folder_btn_icon();
+        }
+    }
+    if (auto it = m_automation_options.find("jobName"); it != m_automation_options.end() && it->is_string() && !it->get<std::string>().empty()) {
+        m_current_project_name = wxString::FromUTF8(it->get<std::string>());
+        m_rename_text->SetLabelText(m_current_project_name);
+        m_rename_normal_panel->Layout();
+    }
 }
 
 void SelectMachineDialog::update_print_status_msg()
@@ -3152,6 +3202,8 @@ void SelectMachineDialog::save_option_vals(MachineObject *obj) {
     AppConfig *config = wxGetApp().app_config;
     if (!config) return;
     if (!obj) return;
+    // A page's choices (set_automation_options) are for this print only, not the person's defaults.
+    if (!m_automation_options.empty()) return;
     for (auto item : m_checkbox_list) {
         config->set(obj->printer_type, item.first, item.second->getValue());
     }
@@ -4727,6 +4779,13 @@ void SelectMachineDialog::update_show_status(MachineObject* obj_)
     /*check external change assist*/
     if(!m_ams_mapping_result.empty() && is_enable_external_change_assist(m_ams_mapping_result)){
         m_check_ext_change_assist->Enable(true);
+        // Automation: the page's extChangeAssist, once, as soon as the option is offered.
+        if (!m_automation_ext_assist_applied && m_check_ext_change_assist->IsShown() && m_automation_options.contains("extChangeAssist") &&
+            m_automation_options["extChangeAssist"].is_boolean()) {
+            m_ext_change_assist = m_automation_options["extChangeAssist"].get<bool>();
+            m_check_ext_change_assist->SetValue(m_ext_change_assist);
+            m_automation_ext_assist_applied = true;
+        }
     }else{
         m_check_ext_change_assist->SetValue(false);
         m_check_ext_change_assist->Enable(false);

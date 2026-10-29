@@ -2043,7 +2043,7 @@ void GCodeViewer::enable_moves_slider(bool enable) const
 
 void GCodeViewer::update_moves_slider(bool set_to_max)
 {
-    if (m_gcode_result->moves.empty())
+    if (m_gcode_result == nullptr || m_gcode_result->moves.empty() || m_viewer.get_vertices_count() == 0)
         return;
 
     const libvgcode::Interval& range = m_viewer.get_view_enabled_range();
@@ -2097,6 +2097,57 @@ void GCodeViewer::update_moves_slider(bool set_to_max)
     m_moves_slider->SetSelectionSpan(span_min_id, span_max_id);
     if (set_to_max)
         m_moves_slider->SetHigherValue(keep_min ? m_moves_slider->GetMinValue() : m_moves_slider->GetMaxValue());
+}
+
+std::vector<libvgcode::EViewType> GCodeViewer::get_offered_view_types() const
+{
+    // view_type_items carries a trailing Tool entry the combo does not list (update_by_mode).
+    const size_t n = std::min(view_type_items.size(), view_type_items_str.size());
+    return std::vector<libvgcode::EViewType>(view_type_items.begin(), view_type_items.begin() + n);
+}
+
+bool GCodeViewer::select_view_type(libvgcode::EViewType type)
+{
+    const std::vector<libvgcode::EViewType> offered = get_offered_view_types();
+    const auto it = std::find(offered.begin(), offered.end(), type);
+    if (it == offered.end())
+        return false;
+    // As a pick in the legend's colouring combo (render_legend).
+    m_view_type_sel = int(std::distance(offered.begin(), it));
+    set_view_type(type);
+    reset_visible(type);
+    update_moves_slider();
+    return true;
+}
+
+void GCodeViewer::set_option_visible(libvgcode::EOptionType type, bool visible)
+{
+    if (m_viewer.is_option_visible(type) == visible)
+        return;
+    m_viewer.toggle_option_visibility(type);
+    update_moves_slider();
+}
+
+void GCodeViewer::set_extrusion_role_visible(libvgcode::EGCodeExtrusionRole role, bool visible)
+{
+    if (m_viewer.is_extrusion_role_visible(role) == visible)
+        return;
+    m_viewer.toggle_extrusion_role_visibility(role);
+    update_moves_slider();
+}
+
+void GCodeViewer::set_cut_segment_visible(int16_t segment_id, bool visible)
+{
+    if (m_viewer.is_cut_segment_visible(segment_id) == visible)
+        return;
+    m_viewer.toggle_cut_segment_visibility(segment_id);
+    update_moves_slider();
+}
+
+void GCodeViewer::set_time_mode(libvgcode::ETimeMode mode)
+{
+    if (m_viewer.get_time_mode() != mode)
+        m_viewer.set_time_mode(mode);
 }
 
 void GCodeViewer::update_layers_slider_mode()

@@ -51,7 +51,10 @@ size_t max_len_for(const std::string &event, const std::string &key)
 {
     if (event == "slice" && (key == "settings" || key == "parts"))
         return 100;
-    if (key == "error" || key == "why")
+    // A crash's "at" is the faulting frame plus up to five callers ("UnlayeredSlicer.dll+0x4862937>..."),
+    // about 30 characters a frame; at 120 the whole value was dropped and no 0.1.6/0.1.7 crash inside our
+    // own code reported where it happened. UsageTelemetry cuts it to 190 at a frame boundary.
+    if (key == "error" || key == "why" || (event == "crash" && key == "at"))
         return 190;
     return 120;
 }

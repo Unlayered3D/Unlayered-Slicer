@@ -51,6 +51,8 @@ struct SysFilesUpdateResult
     std::vector<FileInfo> available_files;
     // path -> why it was left out of the package.
     std::vector<std::pair<std::string, std::string>> skipped;
+    // The source was a whole SD card image; only its configuration folders were offered.
+    bool from_full_sd_card = false;
     // The firmware the whole package needs (sys_required_firmware), where that came from, and
     // whether the board is known to be older. An install checks again on the ticked files.
     std::string required_firmware;

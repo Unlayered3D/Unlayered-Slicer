@@ -12,6 +12,13 @@
 
 #include "libslic3r_version.h"
 #include "slic3r/Utils/Http.hpp"
+#include "slic3r/Utils/ServiceRefusal.hpp"
+
+#include <boost/algorithm/string/split.hpp>
+#include <boost/algorithm/string/trim.hpp>
+#include <algorithm>
+#include <chrono>
+#include <vector>
 
 namespace Slic3r {
 
@@ -78,6 +85,8 @@ std::string UnlayeredAccount::secret_service() const
 
 void UnlayeredAccount::load()
 {
+    if (m_site.empty())
+        return; // no provider: nobody to be signed in to
     wxSecretStore store = wxSecretStore::GetDefault();
     if (!store.IsOk())
         return;
@@ -146,6 +155,10 @@ void UnlayeredAccount::forget_token()
 
 bool UnlayeredAccount::start_handoff(Handoff &out, std::string &error) const
 {
+    if (m_site.empty()) {
+        error = "No account provider is configured (Preferences > Advanced > Web apps & services).";
+        return false;
+    }
     bool ok = false;
     prepared(Http::post(m_site + "/api/login/handoff/start"))
         .header("Content-Type", "application/json")
@@ -219,6 +232,121 @@ UnlayeredAccount::CollectResult UnlayeredAccount::collect(const Handoff &handoff
     return result;
 }
 
+std::string UnlayeredAccount::provider_origin() const { return url_origin(m_site); }
+
+bool UnlayeredAccount::may_receive_token(const std::string &service_url, const std::string &extra_origins) const
+{
+    if (m_site.empty() || !is_http_url(service_url))
+        return false;
+    if (same_site(service_url, m_site))
+        return true;
+    const std::string origin = url_origin(service_url);
+    std::vector<std::string> listed;
+    boost::algorithm::split(listed, extra_origins, [](char c) { return c == ',' || c == ';'; });
+    for (std::string o : listed) {
+        boost::algorithm::trim(o);
+        while (!o.empty() && o.back() == '/')
+            o.pop_back();
+        if (!o.empty() && url_origin(o) == origin)
+            return true;
+    }
+    return false;
+}
+
+bool UnlayeredAccount::fetch_service_token(const std::string &audience, std::string &token, long &expires_in_s,
+                                           unsigned &http_status, std::string &error, ServiceRefusal *refusal)
+{
+    http_status            = 0;
+    expires_in_s           = 0;
+    const std::string auth = bearer();
+    if (auth.empty()) {
+        error = "not signed in";
+        return false;
+    }
+    const std::string url = m_site + "/api/slicer/slice-token";
+    bool              ok  = false;
+    prepared(Http::post(url))
+        .header("Authorization", "Bearer " + auth)
+        .header("Content-Type", "application/json")
+        .set_post_body(nlohmann::json{{"audience", audience}}.dump()) // never body-less (see NonplanarSliceClient.cpp)
+        .on_complete([&](std::string body, unsigned status) {
+            http_status = status;
+            try {
+                auto j = nlohmann::json::parse(body);
+                token  = j.value("token", "");
+                ok     = !token.empty();
+                if (j.contains("expires_in") && j["expires_in"].is_number())
+                    expires_in_s = static_cast<long>(j["expires_in"].get<double>());
+                else if (j.contains("expiresAt") && j["expiresAt"].is_number()) {
+                    const double now_ms = double(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                                     std::chrono::system_clock::now().time_since_epoch())
+                                                     .count());
+                    expires_in_s        = std::max(0L, static_cast<long>((j["expiresAt"].get<double>() - now_ms) / 1000.));
+                }
+                if (!ok)
+                    error = "the account provider returned no token";
+            } catch (...) {
+                error = "the account provider's answer could not be read";
+            }
+        })
+        .on_error([&](std::string body, std::string err, unsigned status) {
+            http_status = status;
+            if (auto r = parse_service_refusal(status, body, url)) {
+                error = r->message;
+                if (refusal != nullptr)
+                    *refusal = *r;
+            } else
+                error = status ? error_from_body(body, "HTTP " + std::to_string(status)) : err;
+        })
+        .perform_sync();
+    if (http_status == 401) {
+        BOOST_LOG_TRIVIAL(info) << "account: the provider no longer accepts the stored sign-in; forgetting it";
+        forget_token();
+    }
+    return ok;
+}
+
+bool UnlayeredAccount::fetch_web_session_path(const std::string &next, std::string &path, unsigned &http_status,
+                                              std::string &error)
+{
+    http_status            = 0;
+    const std::string auth = bearer();
+    if (auth.empty()) {
+        error = "not signed in";
+        return false;
+    }
+    static const std::string expected = "/api/slicer/web-session?code=";
+    bool ok = false;
+    prepared(Http::post(m_site + "/api/slicer/web-session"))
+        .header("Authorization", "Bearer " + auth)
+        .header("Content-Type", "application/json")
+        .set_post_body(nlohmann::json{{"next", next}}.dump())
+        .on_complete([&](std::string body, unsigned status) {
+            http_status = status;
+            try {
+                auto j = nlohmann::json::parse(body);
+                path   = j.value("path", "");
+                // The link is joined to m_site, never followed as given: anything but the route's own
+                // shape would be a page this code did not ask for.
+                ok = boost::algorithm::starts_with(path, expected) && path.find_first_of(" \r\n") == std::string::npos;
+                if (!ok)
+                    error = "the site returned no sign-in link";
+            } catch (...) {
+                error = "the site's answer could not be read";
+            }
+        })
+        .on_error([&](std::string body, std::string err, unsigned status) {
+            http_status = status;
+            error       = status ? error_from_body(body, "HTTP " + std::to_string(status)) : err;
+        })
+        .perform_sync();
+    if (http_status == 401) {
+        BOOST_LOG_TRIVIAL(info) << "account: the site no longer accepts the stored sign-in; forgetting it";
+        forget_token();
+    }
+    return ok;
+}
+
 UnlayeredAccount::RefreshResult UnlayeredAccount::refresh()
 {
     const std::string token = bearer();
@@ -235,6 +363,10 @@ UnlayeredAccount::RefreshResult UnlayeredAccount::refresh()
                 p.name            = j.value("name", "");
                 p.email           = j.value("email", "");
                 p.software_access = j.value("softwareAccess", false);
+                p.edition_label   = j.contains("edition_label") && j["edition_label"].is_string()
+                                        ? j["edition_label"].get<std::string>()
+                                        // Deprecated spelling: a bare `pro: true` from an older provider.
+                                        : (j.value("pro", false) ? std::string("Pro") : std::string());
                 result            = RefreshResult::SignedIn;
             } catch (...) {
                 // A login page or proxy error with a 200: say nothing about the token.

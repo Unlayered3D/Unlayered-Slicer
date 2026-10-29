@@ -1,3 +1,5 @@
+#include "NonplanarTop.hpp"
+#include "NonplanarTopSlice.hpp"
 #include <limits>
 #include <boost/log/trivial.hpp>
 #include <Eigen/Dense>
@@ -1063,7 +1065,15 @@ void PrintObject::update_slice_frame()
         // the material under the plate (walls printed to Z -8.3 on a sunk 45 degree benchy, the kind of
         // print that scraped a customer's A1 bed) and dropped material above it. Rebase onto the
         // object's own minimum; slice_volumes() clips what is under the plate.
-        const double sink = m_print->config().belt_printer.value || tilted_and_sunk(*this) ? 0. : std::min(box_min.z(), 0.0);
+        // UNLAYERED_MOD -- a plain object (no layer rotation, not on a belt) lifted off the bed with
+        // Auto Drop off keeps its lift, as stock does: it is sliced where it floats, the layers below
+        // it are empty and support grows up into them from the plate. Clamping that at 0 dropped it
+        // onto the bed in the slice frame, so supports had nothing to fill. A
+        // rotated object keeps the rebase onto its own minimum: its floor is measured along the
+        // tilted axis.
+        const bool   plain = ! m_print->config().belt_printer.value && tempTrafo.linear().isIdentity(1e-12);
+        const double sink  = m_print->config().belt_printer.value || tilted_and_sunk(*this) ? 0. :
+                             plain && box_min.z() > EPSILON ? box_min.z() : std::min(box_min.z(), 0.0);
         tempTrafo.translation() = Eigen::Vector3d(0, 0, sink - new_box_min.z());
         // BELT_MOD -- belt schedule: raise this object's frame so print_z is comparable across the
         // objects on the belt (Print::update_belt_schedule()). Undone exactly by post_trafo_inverse.
@@ -1198,6 +1208,15 @@ void PrintObject::slice()
     //m_slicing_params.object_print_z_max = old_max;
     this->slice_volumes(); 
     m_print->throw_if_canceled();
+    // UNLAYERED_MOD: nonplanar layers -- the planar part under a curved top is the model with its top T lower,
+    // clipped here, before perimeters and infill, so it gets normal walls and its own top layers.
+    if (nonplanar_top_requested(*this)) {
+        const std::string skip = nonplanar_top_clip_slices(*this);
+        if (! skip.empty())
+            this->active_step_add_warning(PrintStateBase::WarningLevel::NON_CRITICAL,
+                Slic3r::format(_u8L("Nonplanar layers skipped for %1%: %2%. It prints with normal planar layers."), this->model_object()->name, skip));
+        m_print->throw_if_canceled();
+    }
     int firstLayerReplacedBy = 0;
 
 #if 0

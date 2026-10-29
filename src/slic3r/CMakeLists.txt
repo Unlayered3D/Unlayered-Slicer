@@ -134,6 +134,47 @@ set(SLIC3R_GUI_SOURCES
     GUI/SpeedDialDialog.hpp
     GUI/ActionRegistry.cpp
     GUI/ActionRegistry.hpp
+    GUI/Actions/ActionCatalog.cpp
+    GUI/Actions/ActionCatalog.hpp
+    GUI/Actions/ActionRuntime.cpp
+    GUI/Actions/ActionRuntime.hpp
+    GUI/Actions/ActionSchema.cpp
+    GUI/Actions/ActionSchema.hpp
+    GUI/Actions/ActionTargets.cpp
+    GUI/Actions/ActionTargets.hpp
+    GUI/Actions/CalibrationActions.cpp
+    GUI/Actions/CutPlaneRules.hpp
+    GUI/Actions/EditActions.cpp
+    GUI/Actions/ExistingMethods.cpp
+    GUI/Actions/FilamentActions.cpp
+    GUI/Actions/FileActions.cpp
+    GUI/Actions/GeometryActions.cpp
+    GUI/Actions/LayerEventActions.cpp
+    GUI/Actions/LayerHeightActions.cpp
+    GUI/Actions/MeshActions.cpp
+    GUI/Actions/ModelTree.cpp
+    GUI/Actions/ModelTree.hpp
+    GUI/Actions/NativeConfirm.cpp
+    GUI/Actions/NativeConfirm.hpp
+    GUI/Actions/ObjectActions.cpp
+    GUI/Actions/ObjectListLogic.hpp
+    GUI/Actions/ObjectSettingsActions.cpp
+    GUI/Actions/PaintActions.cpp
+    GUI/Actions/PartActions.cpp
+    GUI/Actions/PlateActions.cpp
+    GUI/Actions/PreferenceActions.cpp
+    GUI/Actions/PresetActions.cpp
+    GUI/Actions/PreviewActions.cpp
+    GUI/Actions/ProjectActions.cpp
+    GUI/Actions/Register.cpp
+    GUI/Actions/Register.hpp
+    GUI/Actions/SelectionActions.cpp
+    GUI/Actions/SliceActions.cpp
+    GUI/Actions/TextActions.cpp
+    GUI/Actions/TurnLog.cpp
+    GUI/Actions/TurnLog.hpp
+    GUI/Actions/ViewActions.cpp
+    GUI/Actions/PrinterRules.hpp
     GUI/PluginsConfigDialog.cpp
     GUI/PluginsConfigDialog.hpp
     GUI/ProcessRunner.cpp
@@ -521,6 +562,10 @@ set(SLIC3R_GUI_SOURCES
     GUI/SingleChoiceDialog.hpp
     GUI/SliceInfoPanel.cpp
     GUI/SliceInfoPanel.hpp
+    GUI/SliceServiceOptionsDialog.cpp
+    GUI/SliceServiceOptionsDialog.hpp
+    GUI/SlicePrepare.cpp
+    GUI/SlicePrepare.hpp
     GUI/SlicingProgressNotification.cpp
     GUI/SlicingProgressNotification.hpp
     GUI/StatusPanel.cpp
@@ -563,10 +608,16 @@ set(SLIC3R_GUI_SOURCES
     GUI/UserNotification.hpp
     GUI/WebAppBridge.cpp
     GUI/WebAppBridge.hpp
+    GUI/WebAppBridgeActions.cpp
+    GUI/WebAppBridgeActions.hpp
+    GUI/WebAppDialogs.cpp
+    GUI/WebAppDialogs.hpp
     GUI/WebAppPanel.cpp
     GUI/WebAppPanel.hpp
     GUI/WebAppPresetShare.cpp
     GUI/WebAppPresetShare.hpp
+    GUI/WebAppPrinters.cpp
+    GUI/WebAppPrinters.hpp
     GUI/WebAppSettings.cpp
     GUI/WebAppSettings.hpp
     GUI/WebAppSlot.hpp
@@ -762,6 +813,8 @@ set(SLIC3R_GUI_SOURCES
     Utils/DuetSerialClient.hpp
     Utils/NonplanarSliceClient.cpp
     Utils/NonplanarSliceClient.hpp
+    Utils/ServiceRefusal.cpp
+    Utils/ServiceRefusal.hpp
     Utils/FirmwareBundle.cpp
     Utils/FirmwareBundle.hpp
     Utils/SysFilesBundle.cpp

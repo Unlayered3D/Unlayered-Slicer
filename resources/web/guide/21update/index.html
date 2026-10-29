@@ -1,0 +1,50 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Cache-Control" content="max-age=7200" />
+<title>Update your Unlayered printer</title>
+<link rel="stylesheet" type="text/css" href="../../include/global.css" />
+<link rel="stylesheet" type="text/css" href="../css/common.css" />
+<link rel="stylesheet" type="text/css" href="../css/dark.css" />
+<link rel="stylesheet" type="text/css" href="21update.css" />
+<script type="text/javascript" src="../js/jquery-2.1.1.min.js"></script>
+<script type="text/javascript" src="../js/json2.js"></script>
+<script type="text/javascript" src="../../data/text.js"></script>
+<script type="text/javascript" src="../js/globalapi.js"></script>
+<script type="text/javascript" src="../js/common.js"></script>
+<script type="text/javascript" src="21update.js"></script>
+</head>
+<!-- Unlayered 0.1.8: "Update your Unlayered printer", between the printer picker (21) and the
+     filament page (22), shown only when an Unlayered printer is ticked in the picker or already set
+     up (WebGuideDialog "request_page_after_models" / "request_page_before_filaments").
+     Check for updates = PrinterUpdateOffer::check_now() on the Unlayered printer that has an
+     address: one short read of the board and the feeds, nothing installed from the wizard. When an
+     update is waiting (or the printer cannot be checked yet) the slicer keeps a flag, and the first
+     check after the wizard offers it with the usual "Printer update available" notification,
+     "Skip this version" or not. Nothing here blocks: Do it later / Next always go on.
+     Static texts: text.js unlupd1..unlupd7. Results come from the slicer, translated there. -->
+<body onLoad="OnInit()">
+<div id="Title">
+	<div class="trans" tid="unlupd1">Update your Unlayered printer</div>
+</div>
+<div id="Content">
+	<div class="FeatureText"><a class="trans TextS1" tid="unlupd2">Get the latest firmware and printer settings for your Unlayered printer. Connect it to your network, then press Check for updates. We install the firmware first, then the settings; you confirm each one. Your calibration, name and network settings are never replaced.</a></div>
+	<div class="FeatureText" id="SignInNote" hidden>
+		<a class="trans TextS2" tid="unlupd6">Downloading the printer settings needs your free Unlayered account.</a>
+		<a class="trans" tid="unlupd7" id="SignInLink" onclick="GoSignIn()">Sign in</a>
+	</div>
+	<div id="CheckArea">
+		<div class="ButtonStyleConfirm trans" tid="unlupd3" id="CheckBtn" onclick="DoCheck()">Check for updates</div>
+		<div class="FeatureText" id="PrinterText" hidden></div>
+		<div class="FeatureText" id="ResultText" hidden></div>
+	</div>
+	<div class="FeatureText"><a class="trans TextS2" tid="unlupd5">Later, you find this in the Prepare tab: press Connection (the signal icon next to Printer), then Firmware or Config. When an update is published, Unlayered Slicer also shows a "Printer update available" notification.</a></div>
+</div>
+<div id="AcceptArea">
+	<div class="ButtonStyleRegular ButtonTypeChoice trans" tid="t8" id="PreBtn" onclick="GoBack()">Back</div>
+	<div class="ButtonStyleRegular ButtonTypeChoice trans" tid="unlupd4" id="LaterBtn" onclick="GoNext()">Do it later</div>
+	<div class="ButtonStyleConfirm ButtonTypeChoice trans" tid="t9" id="NextBtn" onclick="GoNext()" hidden>Next</div>
+</div>
+</body>
+</html>

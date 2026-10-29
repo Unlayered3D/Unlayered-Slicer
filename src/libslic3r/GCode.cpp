@@ -6,6 +6,7 @@
 #include "libslic3r.h"
 #include "I18N.hpp"
 #include "GCode.hpp"
+#include "NonplanarTop.hpp"
 #include "Exception.hpp"
 #include "ExtrusionEntity.hpp"
 #include "EdgeGrid.hpp"
@@ -15,6 +16,7 @@
 #include "GCode/WipeTower.hpp"
 #include "GCode/WipeTower2.hpp"
 #include "GCode/BeltKinematics.hpp"
+#include "GCode/MultiplanarBaseC.hpp"
 #include "BeltTransform.hpp"
 #include "ShortestPath.hpp"
 #include "GCode/OrderingStrategies.hpp"
@@ -33,6 +35,7 @@
 #include <chrono>
 #include <iostream>
 #include <iterator>
+#include <mutex>
 #include <math.h>
 #include <stdlib.h>
 #include <string>
@@ -88,6 +91,72 @@ using namespace std::literals::string_view_literals;
 
 namespace Slic3r {
 
+// UNLAYERED_MOD: nonplanar layers travel guard height map, defined next to GCode::travel_to.
+void   np_hmap_record(std::unordered_map<uint64_t, float> &map, const Vec2d &a, const Vec2d &b, double za, double zb);
+double np_hmap_query(const std::unordered_map<uint64_t, float> &map, const Vec2d &a, const Vec2d &b);
+
+// UNLAYERED_MOD: nonplanar layers -- each curved layer is its own layer in the G-code. A shell (a collection
+// of nonplanar_shell paths, one child collection per curved layer) is not printed where the island order puts
+// it: it is deferred to the end of its layer, after all planar material, and each child gets a layer change.
+// State is per GCode object, kept here to leave GCode.hpp (widely included) alone.
+namespace {
+struct NpDeferredShell
+{
+    const ExtrusionEntityCollection *shell;
+    Vec2d                            origin;
+    Transform3d                      trafo;
+    const PrintRegionConfig         *region;
+    unsigned int                     extruder;
+};
+std::mutex                                                     g_np_mutex;
+std::unordered_map<const void *, std::vector<NpDeferredShell>> g_np_deferred;
+const char                                                    *kNpCoolingSplit = ";_NP_LAYER_SPLIT\n";
+
+bool np_is_shell(const ExtrusionEntity *e)
+{
+    if (const auto *c = dynamic_cast<const ExtrusionEntityCollection *>(e)) {
+        if (c->entities.empty())
+            return false;
+        for (const ExtrusionEntity *x : c->entities)
+            if (! np_is_shell(x)) return false;
+        return true;
+    }
+    if (const auto *p = dynamic_cast<const ExtrusionPath *>(e))
+        return p->nonplanar_shell;
+    return false;
+}
+
+// Curved layers in a layer's fills (the most children of any shell), for the layer count.
+size_t np_curved_layers(const Layer &layer)
+{
+    size_t n = 0;
+    for (const LayerRegion *lr : layer.regions())
+        for (const ExtrusionEntity *e : lr->fills.entities)
+            if (np_is_shell(e))
+                n = std::max(n, static_cast<const ExtrusionEntityCollection *>(e)->entities.size());
+    return n;
+}
+
+// The cooling buffer slows a layer down by its own time: a curved layer is cooled as its own layer.
+std::string np_cooling_process(CoolingBuffer &cb, std::string &&gcode, size_t layer_id, bool flush)
+{
+    if (gcode.find(kNpCoolingSplit) == std::string::npos)
+        return cb.process_layer(std::move(gcode), layer_id, flush);
+    std::string  out;
+    size_t       pos = 0;
+    const size_t len = strlen(kNpCoolingSplit);
+    while (true) {
+        const size_t next  = gcode.find(kNpCoolingSplit, pos);
+        std::string  piece = gcode.substr(pos, next == std::string::npos ? std::string::npos : next - pos);
+        out += cb.process_layer(std::move(piece), layer_id, flush);
+        if (next == std::string::npos)
+            break;
+        pos = next + len;
+    }
+    return out;
+}
+} // namespace
+
 // UNLAYERED_MOD — the tool axis a chunk prints along, in the bed frame the G-code lives in.
 static inline Vec3d trafo_to_tool_axis(const Transform3d& trafo)
 {
@@ -97,9 +166,17 @@ static inline Vec3d trafo_to_tool_axis(const Transform3d& trafo)
 // The machine's B/C for a chunk trafo. tool_axis_to_bc() in PrintConfig.cpp owns the convention.
 // BELT_MOD: the axis is expressed in the gantry frame first (identity on a flat bed), so on a belt
 // the root, which builds along the gantry normal, sits at the rotary home.
-static inline void trafo_to_bc(const Transform3d& trafo, const Matrix3d &world_to_gantry, double& angle_b, double& angle_c)
+// UNLAYERED_MOD -- `vertical_c`: the C the table is held at while a vertical tool axis prints, where
+// tool_axis_to_bc() can only report 0 because the azimuth of a vertical axis is free. Set while a
+// multiplanar base prints at its first angled chunk's C (GCode/MultiplanarBaseC.hpp); a tilted axis
+// always takes its own C.
+static inline void trafo_to_bc(const Transform3d& trafo, const Matrix3d &world_to_gantry, double& angle_b, double& angle_c,
+                               const std::optional<double> &vertical_c = std::nullopt)
 {
-    tool_axis_to_bc((world_to_gantry * trafo_to_tool_axis(trafo)).normalized(), angle_b, angle_c);
+    const Vec3d axis = (world_to_gantry * trafo_to_tool_axis(trafo)).normalized();
+    tool_axis_to_bc(axis, angle_b, angle_c);
+    if (vertical_c && MultiplanarBaseC::is_vertical(axis))
+        angle_c = *vertical_c;
 }
 
 // Convert transformation to G-code translation + rotation command
@@ -2329,6 +2406,11 @@ std::vector<GCode::LayerToPrint> GCode::collect_layers_to_print(const PrintObjec
             double maximal_print_z = (last_extrusion_layer ? last_extrusion_layer->print_z() : 0.)
                 + layer_to_print.layer()->height
                 + std::max(0., extra_gap);
+            // UNLAYERED_MOD: nonplanar layers -- a layer that carries curved shells prints material down to
+            // (curved layers) x height below its print_z: the planar layers in between were replaced by the shell,
+            // not left empty (b 10/28: every nonplanar coaster reported "empty layers between 2.8 and 3.8").
+            if (layer_to_print.object_layer)
+                maximal_print_z += double(np_curved_layers(*layer_to_print.object_layer)) * layer_to_print.object_layer->height;
             // Negative support_contact_z is not taken into account, it can result in false positives in cases
 
             // BELT_MOD -- an object further along the belt starts its raised frame with empty layers
@@ -2506,6 +2588,126 @@ collect_layers_to_print_for_group(const Print& print, const std::vector<const Pr
     }
 
     return layers_to_print;
+}
+
+// UNLAYERED_MOD -- multiplanar base C (GCode/MultiplanarBaseC.hpp). For one By-group group: the C its
+// planar base is printed at -- the C of the first angled chunk printed after the base -- or empty to
+// keep today's C = 0. Only for the slicer's own B/C output and only for a group that carries cut-plane
+// segments; every other print gets an empty result and no note, so its G-code does not change.
+//
+// "First angled chunk" is decided in actual print order: the group's layers in the order
+// collect_layers_to_print_for_group() returns them (segment rank first, so the root and anything else
+// built straight up come before every angled segment), and within a layer the order the group lists
+// its instances. With several first-level segments that is the one with the lowest segment index,
+// i.e. the one printed first after the base.
+//
+// The base must still fit the machine with the table turned: the firmware puts a bed point p under
+// machine X/Y = pivot + Rz(-C) * (p - pivot), and every such point of the base (its slices, support,
+// skirt and brim) has to stay inside the printable area. If one would not, the group falls back to
+// C = 0; `note` then says why (written to the G-code as a comment) and the reason is logged.
+static std::optional<double> plan_multiplanar_base_c(const Print &print,
+                                                     const std::vector<const PrintInstance*> &group_ordering,
+                                                     const std::vector<std::pair<coordf_t, std::vector<GCode::LayerToPrint>>> &group_layers,
+                                                     const Vec2f &plate_offset,
+                                                     std::string &note)
+{
+    note.clear();
+    const PrintConfig &config = print.config();
+    if (! config.enable_nonplanar.value || config.virtual_5axis.value || config.belt_printer.value ||
+        config.axis_selection.value != AxisSelection::BC)
+        return std::nullopt;
+    if (std::none_of(group_ordering.begin(), group_ordering.end(),
+                     [](const PrintInstance *inst) { return inst->print_object->is_segment(); }))
+        return std::nullopt;   // no cut planes in this group: not a multiplanar base
+
+    std::map<const PrintObject*, size_t> object_index;
+    for (size_t idx = 0; idx < print.objects().size(); ++ idx)
+        object_index.emplace(print.objects()[idx], idx);
+
+    // Who prints in each layer, in group order, and the layers they print.
+    struct Visit { const PrintInstance *instance; const GCode::LayerToPrint *layer; };
+    std::vector<std::vector<MultiplanarBaseC::Member>> members(group_layers.size());
+    std::vector<std::vector<Visit>>                    visits(group_layers.size());
+    for (size_t l = 0; l < group_layers.size(); ++ l)
+        for (const PrintInstance *inst : group_ordering) {
+            const auto it = object_index.find(inst->print_object);
+            if (it == object_index.end() || it->second >= group_layers[l].second.size())
+                continue;
+            const GCode::LayerToPrint &ltp = group_layers[l].second[it->second];
+            if (ltp.layer() == nullptr)
+                continue;
+            // The same axis trafo_to_bc() turns into B/C when the member prints (flat bed: the
+            // gantry frame is the bed frame; belt printers never get here).
+            members[l].push_back({ trafo_to_tool_axis(inst->print_object->post_trafo_inverse()), inst->print_object->is_segment() });
+            visits[l].push_back({ inst, &ltp });
+        }
+
+    const MultiplanarBaseC::Choice choice = MultiplanarBaseC::choose(members);
+    if (! choice.c_rad) {
+        BOOST_LOG_TRIVIAL(info) << "Multiplanar base C: the base stays at C0, " << choice.reason;
+        return std::nullopt;
+    }
+    const PrintObject &first_angled = *visits[size_t(choice.layer)][size_t(choice.member)].instance->print_object;
+    const double       c_deg        = *choice.c_rad * 180. / M_PI;
+    if (std::abs(c_deg) < 0.0005)
+        return std::nullopt;   // the first angled chunk is at C0 already: the file stays exactly as it was
+    if (choice.ambiguous)
+        BOOST_LOG_TRIVIAL(info) << "Multiplanar base C: several angled chunks start in the same layer; the base takes the C of "
+                                << "the first in group order (segment " << first_angled.segment_index() << ")";
+
+    // Everything the base lays down, as bed-frame points: the slices and support islands of every
+    // upright member up to the first angled chunk's layer, and the skirt and brim around them.
+    Points                     points;
+    std::set<ObjectInstanceID> base_instances;
+    auto add_expolygons = [&points](const ExPolygons &expolygons, const Point &shift) {
+        for (const ExPolygon &expoly : expolygons)
+            for (const Point &pt : expoly.contour.points)
+                points.emplace_back(pt + shift);
+    };
+    for (size_t l = 0; l <= size_t(choice.layer); ++ l)
+        for (size_t m = 0; m < visits[l].size(); ++ m) {
+            if (! MultiplanarBaseC::is_vertical(members[l][m].tool_axis))
+                continue;
+            const Visit &visit = visits[l][m];
+            if (visit.layer->object_layer != nullptr)
+                add_expolygons(visit.layer->object_layer->lslices, visit.instance->shift);
+            if (visit.layer->support_layer != nullptr)
+                add_expolygons(visit.layer->support_layer->support_islands, visit.instance->shift);
+            const PrintObject &object = *visit.instance->print_object;
+            base_instances.insert(ObjectInstanceID{ object.id(), size_t(visit.instance - object.instances().data()) });
+        }
+    // Skirt and brim paths are already in plate coordinates (no instance shift). A combined skirt goes
+    // down with the first layer whoever it surrounds.
+    for (const Print::SkirtBrimGroup &sb : print.skirt_brim_groups()) {
+        const bool ours = std::any_of(sb.instances.begin(), sb.instances.end(),
+                                      [&base_instances](const ObjectInstanceID &id) { return base_instances.count(id) > 0; });
+        if (ours || config.skirt_type.value == stCombined)
+            sb.skirt.collect_points(points);
+        if (ours)
+            for (const Print::SkirtBrimGroup::Brim &brim : sb.brims)
+                brim.brim.collect_points(points);
+    }
+    // Printer coordinates, the frame printable_area is given in: the writer frame minus the plate offset.
+    std::vector<Vec2d> footprint;
+    if (! points.empty())
+        for (const Point &pt : Geometry::convex_hull(std::move(points)).points)
+            footprint.emplace_back(unscale(pt) - plate_offset.cast<double>());
+
+    const std::vector<Vec2d> &area  = config.printable_area.values;
+    const Vec2d               pivot = BoundingBoxf(area).center();   // the C axis, as chunk_transition_gcode() has it
+    Vec2d                     worst = Vec2d::Zero();
+    if (! MultiplanarBaseC::fits_at_c(footprint, area, pivot, *choice.c_rad, 0.1, &worst)) {
+        std::ostringstream msg;
+        msg << std::fixed << std::setprecision(3) << "multiplanar base: C kept at 0 -- turned to C" << c_deg
+            << " (segment " << first_angled.segment_index() << ", the first angled chunk) the base would reach X"
+            << worst.x() << " Y" << worst.y() << ", outside the printable area";
+        note = msg.str();
+        BOOST_LOG_TRIVIAL(warning) << "Multiplanar base C: " << note;
+        return std::nullopt;
+    }
+    BOOST_LOG_TRIVIAL(info) << "Multiplanar base C: the base prints at C" << c_deg << ", the C of segment "
+                            << first_angled.segment_index() << ", the first angled chunk";
+    return choice.c_rad;
 }
 
 // free functions called by GCode::do_export()
@@ -3190,6 +3392,11 @@ void GCode::_do_export(Print& print, GCodeOutputStream &file, ThumbnailsGenerato
 {
     PROFILE_FUNC();
 
+    // UNLAYERED_MOD -- the export below reads print.objects().front() and friends; an empty print
+    // (a plate that only holds a sliced file) crashed here with an access violation.
+    if (print.objects().empty())
+        throw Slic3r::SlicingError(_(L("Nothing to slice: the plate has no objects.")));
+
     m_print = &print;
     m_timelapse_pos_picker.init(&print,m_writer.get_xy_offset().cast<coord_t>());
     // init as filament map
@@ -3206,6 +3413,12 @@ void GCode::_do_export(Print& print, GCodeOutputStream &file, ThumbnailsGenerato
     m_last_height  = 0.f;
     m_last_layer_z = 0.f;
     m_max_layer_z  = 0.f;
+    // UNLAYERED_MOD: nonplanar layers travel guard (see GCode.hpp).
+    m_np_guard   = false;
+    m_np_safe_z  = 0.;
+    m_np_hmap.clear();
+    m_np_enabled = std::any_of(print.objects().begin(), print.objects().end(),
+                               [](const PrintObject *o) { return nonplanar_top_requested(*o); });
     m_last_width = 0.f;
     m_last_layer_accumulated_mass = 0.0;
     m_is_role_based_fan_on.fill(false);
@@ -3306,6 +3519,61 @@ void GCode::_do_export(Print& print, GCodeOutputStream &file, ThumbnailsGenerato
                     m_layer_count--;
             }
         }
+    }
+    // UNLAYERED_MOD: nonplanar layers -- every curved layer is a layer of its own (see np_is_shell).
+    bool np_any_shell = false;
+    if (m_np_enabled)
+        for (const PrintObject *object : print.objects())
+            for (const Layer *layer : object->layers())
+                np_any_shell |= np_curved_layers(*layer) > 0;
+    if (np_any_shell && print.config().print_sequence != PrintSequence::ByGroup) {
+        // The planar layers a shell replaced completely print nothing and are skipped: count only layers with
+        // extrusions (audit: header 23 vs 20 layer tags).
+        auto has_ext = [](const Layer *l) {
+            for (const LayerRegion *lr : l->regions())
+                if (! lr->perimeters.entities.empty() || ! lr->fills.entities.empty()) return true;
+            return false;
+        };
+        auto count = [](std::vector<coordf_t> &zs) {
+            std::sort(zs.begin(), zs.end());
+            unsigned int n = 0;
+            for (size_t i = 0; i < zs.size(); ++ i)
+                if (i == 0 || std::abs(zs[i] - zs[i - 1]) >= EPSILON) ++ n;
+            return n;
+        };
+        if (print.config().print_sequence == PrintSequence::ByObject) {
+            m_layer_count = 0;
+            for (const PrintObject *object : print.objects()) {
+                std::vector<coordf_t> zs;
+                for (const Layer *l : object->layers()) if (has_ext(l)) zs.push_back(l->print_z);
+                for (const SupportLayer *l : object->support_layers()) zs.push_back(l->print_z);
+                for (const BeltBrimBand &band : object->belt_brim_prologue()) zs.push_back(band.print_z);
+                m_layer_count += (unsigned int)(object->instances().size() * count(zs));
+            }
+        } else {
+            std::vector<coordf_t> zs;
+            for (const PrintObject *object : print.objects()) {
+                for (const Layer *l : object->layers()) if (has_ext(l)) zs.push_back(l->print_z);
+                for (const SupportLayer *l : object->support_layers()) zs.push_back(l->print_z);
+            }
+            m_layer_count = count(zs);
+        }
+    }
+    if (m_np_enabled) {
+        std::map<long long, size_t> extra; // print_z -> curved layers printed with it
+        size_t extra_by_object = 0;
+        for (const PrintObject *object : print.objects())
+            for (const Layer *layer : object->layers()) {
+                const size_t n = np_curved_layers(*layer);
+                if (n == 0) continue;
+                size_t &e = extra[std::llround(layer->print_z * 1e5)];
+                e = std::max(e, n);
+                extra_by_object += n * object->instances().size();
+            }
+        if (print.config().print_sequence == PrintSequence::ByObject)
+            m_layer_count += (unsigned int) extra_by_object;
+        else
+            for (const auto &zn : extra) m_layer_count += (unsigned int) zn.second;
     }
     print.throw_if_canceled();
 
@@ -4522,7 +4790,36 @@ void GCode::_do_export(Print& print, GCodeOutputStream &file, ThumbnailsGenerato
 
                 // Collect layers scoped to this group's objects and run the ByLayer pipeline.
                 auto group_layers = collect_layers_to_print_for_group(print, group);
+
+                // UNLAYERED_MOD -- multiplanar base C (GCode/MultiplanarBaseC.hpp): hold the table at the first
+                // angled chunk's C for the whole planar base. The machine is at home here (from the start
+                // G-code for the first group, from the reset above for the others), and the custom G-code that
+                // ran there -- start G-code with a printer-fixed purge line, between-object G-code -- ran at
+                // the C its author wrote it for. Turn the table in place now, before the first layer. The
+                // base's X/Y words do not change: they are bed-frame coordinates, which the firmware's 5-axis
+                // compensation maps through the new C exactly as it does for every angled chunk.
+                {
+                    std::string                 base_c_note;
+                    const std::optional<double> base_c = plan_multiplanar_base_c(print, group_ordering, group_layers,
+                                                                                 m_writer.get_xy_offset(), base_c_note);
+                    if (! base_c_note.empty() && GCodeWriter::full_gcode_comment)
+                        file.write("; " + base_c_note + "\n");
+                    if (base_c) {
+                        double angle_b = 0., angle_c = 0.;
+                        trafo_to_bc(this->home_trafo(), m_world_to_gantry, angle_b, angle_c, base_c);
+                        GCodeG1Formatter w;
+                        w.emit_axis('B', angle_b * 180. / M_PI, GCodeFormatter::XYZF_EXPORT_DIGITS);
+                        w.emit_axis('C', angle_c * 180. / M_PI, GCodeFormatter::XYZF_EXPORT_DIGITS);
+                        w.emit_f(5000.);   // the rotary feed of trafo_to_rotation_gcode()
+                        w.emit_comment(GCodeWriter::full_gcode_comment, "turn C to the first angled chunk's C for the base");
+                        file.write(w.string());
+                    }
+                    m_multiplanar_base_c = base_c;
+                }
+
                 this->process_layers(print, tool_ordering, group_ordering, group_layers, file);
+                // UNLAYERED_MOD -- the base C belongs to this group only.
+                m_multiplanar_base_c.reset();
 
                 {
                     print.m_statistics_by_extruder_count.stats_by_single_extruder += tool_ordering.get_filament_change_stats(ToolOrdering::FilamentChangeMode::SingleExt);
@@ -4955,7 +5252,7 @@ void GCode::process_layers(
         [&cooling_buffer = *this->m_cooling_buffer.get()](LayerResult in) -> std::string {
         	if (in.nop_layer_result)
                 return in.gcode;
-            return cooling_buffer.process_layer(std::move(in.gcode), in.layer_id, in.cooling_buffer_flush);
+            return np_cooling_process(cooling_buffer, std::move(in.gcode), in.layer_id, in.cooling_buffer_flush);
         });
     const auto pa_processor_filter = tbb::make_filter<std::string, std::string>(slic3r_tbb_filtermode::serial_in_order,
             [&pa_processor = *this->m_pa_processor](std::string in) -> std::string {
@@ -5055,7 +5352,7 @@ void GCode::process_layers(
         [&cooling_buffer = *this->m_cooling_buffer.get()](LayerResult in)->std::string {
             if (in.nop_layer_result)
                 return in.gcode;
-            return cooling_buffer.process_layer(std::move(in.gcode), in.layer_id, in.cooling_buffer_flush);
+            return np_cooling_process(cooling_buffer, std::move(in.gcode), in.layer_id, in.cooling_buffer_flush);
         });
     const auto pa_processor_filter = tbb::make_filter<std::string, std::string>(slic3r_tbb_filtermode::serial_in_order,
         [&pa_processor = *this->m_pa_processor](std::string in) -> std::string {
@@ -7813,6 +8110,112 @@ LayerResult GCode::process_layer(
         }
 
     }
+    // UNLAYERED_MOD: nonplanar layers -- the curved shells deferred from extrude_infill, each curved layer as
+    // its own layer: layer tags, the layer change G-code, progress and fan as for a planar layer change. The
+    // head first rises above everything printed (the custom G-code may move it), then the travel guard brings
+    // it down onto the next path.
+    if (m_np_enabled) {
+        std::vector<NpDeferredShell> deferred;
+        {
+            std::lock_guard<std::mutex> lock(g_np_mutex);
+            auto it = g_np_deferred.find(this);
+            if (it != g_np_deferred.end()) { deferred.swap(it->second); g_np_deferred.erase(it); }
+        }
+        size_t n_curved = 0;
+        for (const NpDeferredShell &d : deferred)
+            n_curved = std::max(n_curved, d.shell->entities.size());
+        const Vec2d saved_origin = m_origin;
+        double      tag_z        = print_z;
+        for (size_t k = 0; k < n_curved; ++ k) {
+            double zmax = -DBL_MAX;
+            for (const NpDeferredShell &d : deferred)
+                if (k < d.shell->entities.size()) {
+                    std::vector<const ExtrusionEntity *> stack{ d.shell->entities[k] };
+                    while (! stack.empty()) {
+                        const ExtrusionEntity *e = stack.back();
+                        stack.pop_back();
+                        if (const auto *c = dynamic_cast<const ExtrusionEntityCollection *>(e))
+                            for (const ExtrusionEntity *x : c->entities) stack.push_back(x);
+                        else if (const auto *pth = dynamic_cast<const ExtrusionPath *>(e))
+                            for (const Point3 &pt : pth->polyline.points) zmax = std::max(zmax, print_z + unscale_(pt.z()));
+                    }
+                }
+            // Layers stay monotonic and distinct: each curved layer is tagged at its own highest point, or just above
+            // the layer before it (a few um per curved layer, well under the next planar layer).
+            tag_z = std::max(tag_z + std::min(0.01, 0.5 * height / double(std::max<size_t>(1, n_curved))), zmax);
+            gcode += kNpCoolingSplit;
+            gcode += ";" + GCodeProcessor::reserved_tag(GCodeProcessor::ETags::Layer_Change) + "\n";
+            char nbuf[80];
+            sprintf(nbuf, print.is_BBL_printer() ? "; Z_HEIGHT: %g\n" : ";Z:%g\n", tag_z);
+            gcode += nbuf;
+            sprintf(nbuf, ";%s%g\n", GCodeProcessor::reserved_tag(GCodeProcessor::ETags::Height).c_str(), float(height));
+            gcode += nbuf;
+            if (! m_config.before_layer_change_gcode.value.empty()) {
+                DynamicConfig config;
+                config.set_key_value("layer_num",   new ConfigOptionInt(m_layer_index + 1));
+                config.set_key_value("layer_z",     new ConfigOptionFloat(tag_z));
+                config.set_key_value("max_layer_z", new ConfigOptionFloat(max_layer_z_for_templates()));
+                gcode += this->placeholder_parser_process("before_layer_change_gcode",
+                    print.config().before_layer_change_gcode.value, m_writer.filament()->id(), &config) + "\n";
+            }
+            // No wipe along the curved bead, and straight to the guard height (audit: the wipe climbed to the tag Z).
+            m_wipe.reset_path();
+            gcode += this->retract(false, false, LiftType::NormalLift);
+            {
+                const double safe = std::max(m_writer.get_position().z(), m_np_guard ? m_np_safe_z : print_z);
+                gcode += m_writer.travel_to_z(safe, "nonplanar layer change");
+            }
+            if (m_layer_count > 0)
+                gcode += m_writer.update_progress(++ m_layer_index, m_layer_count);
+            if (! m_config.time_lapse_gcode.value.empty() && ! is_BBL_Printer()) {
+                DynamicConfig config;
+                config.set_key_value("layer_num",   new ConfigOptionInt(m_layer_index));
+                config.set_key_value("layer_z",     new ConfigOptionFloat(tag_z));
+                config.set_key_value("max_layer_z", new ConfigOptionFloat(max_layer_z_for_templates()));
+                gcode += this->placeholder_parser_process("timelapse_gcode",
+                    print.config().time_lapse_gcode.value, m_writer.filament()->id(), &config) + "\n";
+            }
+            if (! m_config.layer_change_gcode.value.empty()) {
+                DynamicConfig config;
+                config.set_key_value("most_used_physical_extruder_id", new ConfigOptionInt(m_config.physical_extruder_map.get_at(most_used_extruder)));
+                config.set_key_value("layer_num", new ConfigOptionInt(m_layer_index));
+                config.set_key_value("layer_z",   new ConfigOptionFloat(tag_z));
+                const int  cur_filament_id = (int) m_writer.filament()->id();
+                const auto group_result    = m_print->get_layered_nozzle_group_result();
+                config.set_key_value("current_filament_id", new ConfigOptionInt(cur_filament_id));
+                config.set_key_value("current_nozzle_id", new ConfigOptionInt(
+                    nozzle_id_for_gcode_placeholder(group_result, cur_filament_id, (int) m_writer.filament()->extruder_id(), m_layer_index)));
+                double          y_acc = -1, acc_mass = -1;
+                PrintStatistics np_stats;
+                for (const Extruder &extruder : m_writer.extruders()) {
+                    const double w = extruder.extruded_volume() * extruder.filament_density() * 0.001;
+                    if (w > 0.) np_stats.total_weight += w;
+                }
+                mass_load_limited_machine_acceleration(np_stats, print, y_acc, acc_mass);
+                config.set_key_value("curr_y_acceleration_limit", new ConfigOptionFloat(y_acc));
+                config.set_key_value("curr_accumulated_mass", new ConfigOptionFloat(acc_mass));
+                config.set_key_value("curr_layer_mass", new ConfigOptionFloat(0.));
+                config.set_key_value("max_layer_z", new ConfigOptionFloat(max_layer_z_for_templates()));
+                gcode += this->placeholder_parser_process("layer_change_gcode",
+                    print.config().layer_change_gcode.value, m_writer.filament()->id(), &config) + "\n";
+            }
+            gcode += ";_SET_FAN_SPEED_CHANGING_LAYER\n";
+            for (const NpDeferredShell &d : deferred) {
+                if (k >= d.shell->entities.size())
+                    continue;
+                this->set_origin(d.origin);
+                m_config.apply(*d.region);
+                if (m_writer.filament() == nullptr || m_writer.filament()->id() != d.extruder)
+                    gcode += this->set_extruder(d.extruder, print_z);
+                const auto *layer_k = static_cast<const ExtrusionEntityCollection *>(d.shell->entities[k]);
+                for (const ExtrusionEntity *ee : layer_k->entities)
+                    gcode += this->extrude_entity(*ee, "infill", -1., ExtrusionEntitiesPtr(), d.trafo);
+            }
+        }
+        if (! deferred.empty())
+            this->set_origin(saved_origin);
+    }
+
     // BELT_MOD -- belt brim orphan sweep: a coincident band lives on an object layer that can
     // yield no instance visit (a zero-extrusion lead-in slice), so the in-visit emission never
     // fired. Emit any such band exactly once here, keyed like the in-visit emission.
@@ -7929,8 +8332,10 @@ void GCode::apply_print_config(const PrintConfig &print_config)
     m_writer.apply_print_config(print_config);
     // UNLAYERED_MOD -- see GCodeWriter::set_min_extrusion_z(): 0.1 mm for the usual first layers,
     // 40 % of the first layer height when that is thinner (a 0.1 mm belt brim band is laid at
-    // ~0.055 mm above the belt).
-    m_writer.set_min_extrusion_z(print_config.initial_layer_print_height.value < 0.25 ? 0.4 * print_config.initial_layer_print_height.value : 0.1);
+    // ~0.055 mm above the belt). Measured from the bed: the writer's z already holds z_offset, the
+    // printer's own calibration, so a -0.63 offset made every tilted first layer "very low z".
+    m_writer.set_min_extrusion_z((print_config.initial_layer_print_height.value < 0.25 ? 0.4 * print_config.initial_layer_print_height.value : 0.1) +
+                                 print_config.z_offset.value);
     m_config.apply(print_config);
     m_scaled_resolution = scaled<double>(print_config.resolution.value);
     m_enable_exclude_object = m_config.exclude_object;
@@ -8570,6 +8975,14 @@ std::string GCode::extrude_infill(const Print &print, const std::vector<ObjectBy
                 m_config.apply(print.get_print_region(&region - &by_region.front()).config());
                 chain_and_reorder_extrusion_entities(extrusions, m_last_pos.to_point());
                 for (const ExtrusionEntity *fill : extrusions) {
+                    // UNLAYERED_MOD: nonplanar layers, a curved shell prints at the end of the layer (see np_is_shell).
+                    if (m_np_enabled && ! ironing && np_is_shell(fill)) {
+                        std::lock_guard<std::mutex> lock(g_np_mutex);
+                        g_np_deferred[this].push_back({ static_cast<const ExtrusionEntityCollection *>(fill), m_origin, trafo,
+                                                        &print.get_print_region(&region - &by_region.front()).config(),
+                                                        m_writer.filament() ? m_writer.filament()->id() : 0u });
+                        continue;
+                    }
                     auto *eec = dynamic_cast<const ExtrusionEntityCollection*>(fill);
                     if (eec) {
 
@@ -9136,6 +9549,17 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
 
     const ExtrusionPathSloped* sloped = dynamic_cast<const ExtrusionPathSloped*>(&path);
 
+    // UNLAYERED_MOD: nonplanar layers. From the first curved-shell path on, travels rise above all
+    // printed curved material (see travel_to). The clearance is one layer plus 0.2 mm.
+    if (path.nonplanar_shell && ! path.polyline.points.empty()) {
+        coord_t top = path.polyline.points.front().z();
+        for (const Point3 &pt : path.polyline.points)
+            top = std::max(top, pt.z());
+        const double safe = m_nominal_z + unscale_(top) + std::max(0.2, double(path.height)) + 0.2;
+        m_np_safe_z = m_np_guard ? std::max(m_np_safe_z, safe) : safe;
+        m_np_guard  = true;
+    }
+
     const auto get_sloped_z = [&sloped, this](double z_ratio) {
         const auto height = sloped->height;
         return lerp(m_nominal_z - height, m_nominal_z, z_ratio);
@@ -9150,7 +9574,12 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
     // path is 2D. But in slope lift case, lift z is done in travel_to function.
     // Add m_need_change_layer_lift_z when change_layer in case of no lift if m_last_pos is equal to path.first_point() by chance
     Point first_point = path.first_point();
-    if (!m_last_pos_defined || m_last_pos.to_point() != first_point || m_need_change_layer_lift_z || slope_need_z_travel) {
+    // UNLAYERED_MOD: nonplanar layers -- after custom G-code that moves the head (Bambu timelapse parks
+    // it at X0), the writer's position is unknown; a path starting exactly where the last one ended
+    // would otherwise extrude a streak from the park position. Only when nonplanar layers are in use,
+    // so planar output stays byte-identical.
+    const bool np_unknown_pos = m_np_enabled && ! m_writer.is_current_position_clear();
+    if (!m_last_pos_defined || m_last_pos.to_point() != first_point || m_need_change_layer_lift_z || slope_need_z_travel || np_unknown_pos) {
         const bool _last_pos_undefined = !m_last_pos_defined;
 
         double z = DBL_MAX;
@@ -9169,6 +9598,17 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
         //    gcode += this->writer().travel_to_z(m_nominal_z, z_sync_comment, true);
         //}
         m_need_change_layer_lift_z = false;
+    }
+
+    // UNLAYERED_MOD: nonplanar layers -- this path goes into the travel height map once the approach
+    // travel is done (it is not in the way of its own approach).
+    if (m_np_enabled && trafo.linear().isApprox(Matrix3d::Identity()) && path.polyline.points.size() >= 2) {
+        const bool has_z = path.z_contoured;
+        for (size_t i = 0; i + 1 < path.polyline.points.size(); ++ i) {
+            const Point3 &a = path.polyline.points[i], &b = path.polyline.points[i + 1];
+            np_hmap_record(m_np_hmap, this->point_to_gcode(Point(a.x(), a.y())), this->point_to_gcode(Point(b.x(), b.y())),
+                           m_nominal_z + (has_z ? unscale_(a.z()) : 0.), m_nominal_z + (has_z ? unscale_(b.z()) : 0.));
+        }
     }
 
     /*if (path.z_contoured && !path.polyline.lines().empty()) {
@@ -9457,7 +9897,9 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
     const bool need_overhang_detection = NOZZLE_CONFIG(enable_overhang_speed) ||
         (FILAMENT_CONFIG(enable_overhang_bridge_fan) && m_enable_cooling_markers);
 
-    if (need_overhang_detection && !this->path_on_first_layer() && !object_layer_over_raft() &&
+    // UNLAYERED_MOD: nonplanar layers -- a curved shell path is not an overhang (it lies on the layer under it, which
+    // the planar overlap estimate cannot see): no overhang slowdown and no overhang fan on it (audit P1).
+    if (need_overhang_detection && !this->path_on_first_layer() && !object_layer_over_raft() && ! path.nonplanar_shell &&
         (is_bridge(path.role()) || is_perimeter(path.role()))) {
             bool is_external = is_external_perimeter(path.role());
             double ref_speed   = is_external ? NOZZLE_CONFIG(outer_wall_speed) : NOZZLE_CONFIG(inner_wall_speed);
@@ -9703,7 +10145,8 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
 
 
     auto overhang_fan_threshold = FILAMENT_CONFIG(overhang_fan_threshold);
-    auto enable_overhang_bridge_fan = FILAMENT_CONFIG(enable_overhang_bridge_fan);
+    // UNLAYERED_MOD: no overhang fan on curved shell paths (see the overhang detection above).
+    const bool enable_overhang_bridge_fan = FILAMENT_CONFIG(enable_overhang_bridge_fan) && ! path.nonplanar_shell;
 
     //    { "0%", Overhang_threshold_none },
     //    { "10%", Overhang_threshold_1_4 },
@@ -9812,6 +10255,9 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
         }
     };
 
+    // UNLAYERED_MOD: nonplanar layers -- a curved shell path is always emitted by the linear branch below (XY-length E).
+    if (path.nonplanar_shell)
+        variable_speed = false;
     if (!variable_speed) {
         // F is mm per minute.
         if( (std::abs(writer().get_current_speed() - F) > EPSILON) || (std::abs(_mm3_per_mm - m_last_mm3_mm) > EPSILON) ){
@@ -9895,13 +10341,18 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
                 double total_length = sloped == nullptr ? 0. : path.polyline.length() * SCALING_FACTOR;
                 double saved_z      = m_writer.get_position().z();
 
+                size_t np_seg = size_t(-1);
                 for (const Line3& line : path.polyline.lines()) {
+                    ++ np_seg;
                     std::string tempDescription = description;
                     const double line_length = line.length() * SCALING_FACTOR;
                     if (line_length < EPSILON)
                         continue;
                     path_length += line_length;
-                    auto dE = e_per_mm * line_length;
+                    // UNLAYERED_MOD: a curved shell layer is h thick vertically over the area it covers, so its
+                    // material goes by the XY length of a move; the 3D length over-extrudes by 1/cos(slope).
+                    const double e_length = path.nonplanar_shell ? (line.b.head<2>() - line.a.head<2>()).cast<double>().norm() * SCALING_FACTOR : line_length;
+                    auto dE = e_per_mm * e_length;
                     if (_needSAFC(path)) {
                         auto oldE = dE;
                         dE = m_small_area_infill_flow_compensator->modify_flow(line_length, dE, path.role());
@@ -9919,8 +10370,10 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
                         coordf_t z_diff = unscale_(line.b.z());
 
                         double extrusion_ratio = 1;
-                        if (path.role() != erIroning) {
+                        if (path.role() != erIroning && ! path.nonplanar_shell) {
                             extrusion_ratio = (path.height + z_diff) / path.height;
+                        } else if (path.nonplanar_shell && np_seg < path.np_flow.size()) {
+                            extrusion_ratio = path.np_flow[np_seg];
                         }
 
                         double e = dE * extrusion_ratio;
@@ -10136,7 +10589,7 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
                 coordf_t z_diff = unscale_(processed_point.p.z());
 
                 double extrusion_ratio = 1;
-                if (path.role() != erIroning) {
+                if (path.role() != erIroning && ! path.nonplanar_shell) {
                     extrusion_ratio = (path.height + z_diff) / path.height;
                 }
 
@@ -10336,9 +10789,16 @@ std::string GCode::chunk_transition_gcode(const Print &print, const PrintObject 
     m_wipe.reset_path();
     gcode += this->retract();
 
+    // UNLAYERED_MOD -- multiplanar base C: while the base prints, the table is held at the first angled
+    // chunk's C (m_multiplanar_base_c), so a vertical chunk -- the one being left, or another upright
+    // one being entered -- is at that C rather than at 0. Entering the first angled chunk then makes
+    // dc = 0 below: no C swing, only the B tilt. From there on the machine is wherever the angled chunks
+    // put it, and a vertical chunk goes back to C = 0 as before.
     double b_old, c_old, b_new, c_new;
-    trafo_to_bc(m_last_trafo, m_world_to_gantry, b_old, c_old);
-    trafo_to_bc(trafo, m_world_to_gantry, b_new, c_new);
+    trafo_to_bc(m_last_trafo, m_world_to_gantry, b_old, c_old, m_multiplanar_base_c);
+    trafo_to_bc(trafo, m_world_to_gantry, b_new, c_new, m_multiplanar_base_c);
+    if (! MultiplanarBaseC::is_vertical((m_world_to_gantry * trafo_to_tool_axis(trafo)).normalized()))
+        m_multiplanar_base_c.reset();
     const bool suppress_rotary = ! this->emit_rotary_axes();
 
     // Lifted staging position of the next chunk, in the bed frame. Same math as
@@ -10509,6 +10969,46 @@ std::string GCode::chunk_transition_gcode(const Print &print, const PrintObject 
     return gcode;
 }
 
+// UNLAYERED_MOD: nonplanar layers travel guard height map (see GCode.hpp).
+static constexpr double kNpCell = 0.5;
+static inline uint64_t np_hmap_key(int ix, int iy) { return (uint64_t(uint32_t(ix)) << 32) | uint64_t(uint32_t(iy)); }
+
+void np_hmap_record(std::unordered_map<uint64_t, float> &map, const Vec2d &a, const Vec2d &b, double za, double zb)
+{
+    const double len = (b - a).norm();
+    const int    n   = std::max(1, int(std::ceil(len / (0.5 * kNpCell))));
+    for (int i = 0; i <= n; ++ i) {
+        const double t = double(i) / n;
+        const Vec2d  p = a + (b - a) * t;
+        const float  z = float(za + (zb - za) * t);
+        const uint64_t key = np_hmap_key(int(std::floor(p.x() / kNpCell)), int(std::floor(p.y() / kNpCell)));
+        auto it = map.find(key);
+        if (it == map.end())
+            map.emplace(key, z);
+        else if (it->second < z)
+            it->second = z;
+    }
+}
+
+double np_hmap_query(const std::unordered_map<uint64_t, float> &map, const Vec2d &a, const Vec2d &b)
+{
+    double     top = -DBL_MAX;
+    const int  r   = 2; // cells around the path: 1 mm
+    const double len = (b - a).norm();
+    const int  n   = std::max(1, int(std::ceil(len / (0.5 * kNpCell))));
+    for (int i = 0; i <= n; ++ i) {
+        const Vec2d p  = a + (b - a) * (double(i) / n);
+        const int   cx = int(std::floor(p.x() / kNpCell)), cy = int(std::floor(p.y() / kNpCell));
+        for (int dy = -r; dy <= r; ++ dy)
+            for (int dx = -r; dx <= r; ++ dx) {
+                auto it = map.find(np_hmap_key(cx + dx, cy + dy));
+                if (it != map.end())
+                    top = std::max(top, double(it->second));
+            }
+    }
+    return top;
+}
+
 std::string GCode::travel_to(const Point& point, ExtrusionRole role, std::string comment, double z/* = DBL_MAX*/, const Transform3d &trafo)
 {
     /*  Define the travel move as a line between current position and the taget point.
@@ -10516,9 +11016,20 @@ std::string GCode::travel_to(const Point& point, ExtrusionRole role, std::string
         this->origin in order to get G-code coordinates.  */
     Polyline travel { this->last_pos(), point };
 
+    // UNLAYERED_MOD: nonplanar layers -- a wipe would drag the nozzle back along a curved path at
+    // the end point's Z, and a sloped or spiral lift moves sideways while still low.
+    if (m_np_guard)
+        m_wipe.reset_path();
+
     // check whether a straight travel move would need retraction
     LiftType lift_type = LiftType::SpiralLift;
     bool needs_retraction = this->needs_retraction(travel, role, lift_type);
+    if (m_np_guard) {
+        lift_type = LiftType::NormalLift;
+        // Over curved material every travel past the minimum retracts (audit: 4-42 % did, oozing over the top).
+        if (travel.length() > scale_(EXTRUDER_CONFIG(retraction_minimum_travel)))
+            needs_retraction = true;
+    }
     // check whether wipe could be disabled without causing visible stringing
     bool could_be_wipe_disabled       = false;
     // Save state of use_external_mp_once for the case that will be needed to call twice m_avoid_crossing_perimeters.travel_to.
@@ -10578,6 +11089,7 @@ std::string GCode::travel_to(const Point& point, ExtrusionRole role, std::string
     // if a retraction would be needed, try to use reduce_crossing_wall to plan a
     // multi-hop travel path inside the configuration space
     if (m_config.reduce_crossing_wall
+        && !m_np_guard
         && !m_avoid_crossing_perimeters.disabled_once()
         && m_layer != nullptr   // BELT_MOD: a brim apron layer has no Layer to avoid crossing
         && m_writer.is_current_position_clear())
@@ -10646,6 +11158,50 @@ std::string GCode::travel_to(const Point& point, ExtrusionRole role, std::string
                                                        m_bygroup_hop_b_deg, m_bygroup_hop_c_deg,
                                                        m_bygroup_hop_bc_dist_deg);
         m_need_change_layer_lift_z = false;
+        this->set_last_pos(point);
+        return gcode;
+    }
+
+    // UNLAYERED_MOD: nonplanar layers -- once curved material is printed, never move sideways
+    // below it: rise vertically, cross at the safe height, descend vertically onto the target.
+    if (m_np_guard) {
+        const double dest_z = z == DBL_MAX ? m_nominal_z : z;
+        const Vec2d  from2d = this->point_to_gcode(this->last_pos());
+        const Vec2d  to2d   = this->point_to_gcode(point);
+        double       high   = std::max({ m_np_safe_z, m_nominal_z, dest_z });
+        if (m_np_enabled && trafo.linear().isApprox(Matrix3d::Identity()) && m_writer.is_current_position_clear()) {
+            // Everything printed within a millimetre of the XY path. The configured z-hop is the clearance over it,
+            // and it replaces the retraction's own pending lift (audit: lift, guard + lift, dive). Direct moves: the
+            // writer's pending lift is dropped, not added on top.
+            const double under  = np_hmap_query(m_np_hmap, from2d, to2d);
+            const double from_z = m_writer.get_position().z();
+            const double hop    = std::max(0.1, double(FILAMENT_CONFIG(z_hop)));
+            if (under <= std::min(from_z, dest_z) + 1e-3 && (to2d - from2d).norm() < 2.) {
+                // A short hop to the neighbouring line with nothing under the straight move: along the surface.
+                gcode += m_writer.travel_to_xyz_direct(Vec3d(to2d.x(), to2d.y(), dest_z), comment);
+            } else {
+                // Longer travels keep the configured z-hop over whatever they cross.
+                high = std::max({ dest_z, under + hop, std::min(from_z, dest_z) + hop });
+                if (high > from_z + 1e-4)
+                    gcode += m_writer.travel_to_xyz_direct(Vec3d(from2d.x(), from2d.y(), high), comment + " (nonplanar lift)");
+                gcode += m_writer.travel_to_xyz_direct(Vec3d(to2d.x(), to2d.y(), std::max(high, from_z)), comment);
+                if (dest_z < std::max(high, from_z))
+                    gcode += m_writer.travel_to_xyz_direct(Vec3d(to2d.x(), to2d.y(), dest_z), comment);
+            }
+            m_need_change_layer_lift_z = false;
+            if (m_nominal_z >= m_np_safe_z)
+                m_np_guard = false;
+            this->set_last_pos(point);
+            return gcode;
+        }
+        gcode += m_writer.travel_to_xyz(Vec3d(from2d.x(), from2d.y(), high), comment + " (nonplanar lift)", m_need_change_layer_lift_z, trafo);
+        gcode += m_writer.travel_to_xyz(Vec3d(to2d.x(), to2d.y(), high), comment, false, trafo);
+        if (dest_z < high)
+            gcode += m_writer.travel_to_xyz(Vec3d(to2d.x(), to2d.y(), dest_z), comment, false, trafo);
+        m_need_change_layer_lift_z = false;
+        // A layer whose own height is above all curved material no longer needs the guard.
+        if (m_nominal_z >= m_np_safe_z)
+            m_np_guard = false;
         this->set_last_pos(point);
         return gcode;
     }
@@ -10853,6 +11409,12 @@ std::string GCode::retract(bool toolchange, bool is_last_retraction, LiftType li
 
     if (m_writer.filament() == nullptr)
         return gcode;
+    if (m_np_guard) { // UNLAYERED_MOD: nonplanar layers, see travel_to
+        m_wipe.reset_path();
+        // A spiral or slope lift starts at the last curved bead and runs below the curved top beside it (audit P0:
+        // a G3 helix dug 0.35 mm into the finished top): lift straight up.
+        lift_type = LiftType::NormalLift;
+    }
     // wipe (if it's enabled for this extruder and we have a stored wipe path and no-zero wipe distance)
     if (FILAMENT_CONFIG(wipe) && m_wipe.has_path() && scale_(FILAMENT_CONFIG(wipe_distance)) > SCALED_EPSILON) {
         Wipe::RetractionValues wipeRetractions = m_wipe.calculateWipeRetractionLengths(*this, toolchange);

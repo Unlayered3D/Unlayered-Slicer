@@ -66,6 +66,14 @@ static wxString format_size(uint64_t bytes)
     return wxString::Format("%.1f kB", double(bytes) / 1024.0);
 }
 
+// Shown in the notes and in the install confirmation when the zip or folder was a whole SD card.
+static wxString full_sd_card_warning()
+{
+    return _L("This looks like a full SD card. Only its printer configuration (sys and macros) will be "
+              "installed; the printer's own config.g, calibration and setup are kept. Firmware, print "
+              "files and the web interface were skipped. Update firmware with the Firmware button.");
+}
+
 SysFilesUpdateDialog::SysFilesUpdateDialog(wxWindow *parent, DynamicPrintConfig *config)
     : DPIDialog(parent, wxID_ANY, _L("Printer Configuration Files"), wxDefaultPosition, wxDefaultSize,
                 wxDEFAULT_DIALOG_STYLE | wxRESIZE_BORDER)
@@ -267,6 +275,8 @@ void SysFilesUpdateDialog::start_install(bool force)
     wxString body = wxString::Format(
         _L("%d file(s) will be written to the printer's SD card, replacing what is there now."),
         int(selected.size()));
+    if (m_job_result && m_job_result->from_full_sd_card)
+        body += "\n\n" + full_sd_card_warning();
     if (m_backup_check->GetValue())
         body += "\n\n" + _L("The files being replaced will be saved to this computer first.");
     else
@@ -520,7 +530,12 @@ void SysFilesUpdateDialog::on_job_finished(wxCommandEvent &evt)
             available += wxString::Format(" - %s", wxString::FromUTF8(m_job_result->available_origin.c_str()));
         m_available_label->SetLabel(wxString::Format(_L("Available: %s"), available));
 
-        m_notes->SetValue(wxString::FromUTF8(m_job_result->available_notes.c_str()));
+        {
+            wxString notes = wxString::FromUTF8(m_job_result->available_notes.c_str());
+            if (m_job_result->from_full_sd_card)
+                notes = full_sd_card_warning() + (notes.IsEmpty() ? wxString() : "\n\n" + notes);
+            m_notes->SetValue(notes);
+        }
         populate_files(*m_job_result);
         set_phase(Phase::Ready);
 

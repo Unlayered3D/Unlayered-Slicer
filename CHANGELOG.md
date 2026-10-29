@@ -2,6 +2,39 @@
 
 All notable changes to Unlayered Slicer are listed here, newest first.
 
+## 0.1.8 — 2026-10-24
+
+### Added
+
+- **Update your Unlayered printer** in the setup wizard: after the printer picker, when an Unlayered
+  printer is picked or already set up. Check for updates reads the printer and the published firmware and
+  printer settings and says what is waiting; when you finish setup, the "Printer update available"
+  notification installs them, firmware first, then the settings, each confirmed. Calibration, name and
+  network settings are never replaced. The printer settings need the free Unlayered account.
+- **Unlayered Agent.** Ask for what you want in plain words ("print this in PETG on my P1S", "make
+  this part stronger", "fix the stringing", "cut the roof at its own angle") and the Agent makes the
+  changes in your slicer for you: printer, filament and process settings, slots, orientation,
+  scale, copies and arrangement, and cut planes. It looks settings up instead of guessing, every
+  change it makes can be undone in one step, and it never exports, sends or prints anything without
+  you confirming in the slicer. It opens in a panel beside the tabs (the button next to Print,
+  View > Show Side Panel, or Ctrl+Shift+B) and needs an Unlayered account: sign in from the panel or
+  the Help menu. Plans: unlayered3d.com/agent.
+- **Side panel** beside the tabs, for the Agent or a web page of your choice, shown next to every
+  tab. Like the web-app tab it talks to the slicer only through the documented bridge
+  ([WEB_APP_BRIDGE.md](WEB_APP_BRIDGE.md)), within the permissions you give it.
+- **Web apps & services** in Preferences > Advanced: the addresses of the web-app tab and the side
+  panel. Blank turns each off.
+- **Setting changes for pages:** `slicer.settingsChanged` says what changed (new, previous, saved and
+  system value), so a page can follow along.
+- **A/C trunnion printers:** *Printer type* A/C converts the exported G-code to machine A/C
+  coordinates (pivot height, C offset, solution policy, transition clearance).
+
+### Fixed
+
+- Crash reports now include where in the slicer a crash happened. The location was dropped for
+  being too long, so reports from crashes inside the slicer's own code arrived with only the error
+  code.
+
 ## 0.1.7 — 2026-10-23
 
 ### Added

@@ -1,0 +1,21 @@
+# Justified hits for tools/check_boundary.py, one per line:   path-glob:python-regex
+# A hit on a line of a matching file is allowed when the regex also matches that line.
+# Keep each entry as narrow as it can be, and say why above it.
+
+# HTTP's User-Agent header and the web view's user-agent string: not a product name.
+*:User[- ]Agent
+
+# Upstream OrcaSlicer's printer-agent framework (IPrinterAgent, CrealityPrintAgent and the Bambu, Creality, Moonraker,
+# Orca, Qidi and Snapmaker implementations, the Python plug-in binding): the code that connects to
+# printers. Not ours, and not a product name.
+src/slic3r/Utils/*Print*Agent*:\bAgent\b|AgentInfo|AgentTypes
+src/slic3r/Utils/NetworkAgentFactory.*:\bAgent\b|AgentInfo|AgentTypes
+src/slic3r/Utils/BBLNetworkPlugin.*:// Agent Lifecycle
+src/slic3r/plugin/*:\bAgent\b|AgentInfo
+src/libslic3r/PrintConfig.cpp:L\("Printer Agent"\)
+src/slic3r/GUI/Tab.cpp:Printer Agent
+src/slic3r/GUI/GUI_App.cpp:// Agent already gone
+
+# The one-time migration of the side panel's pre-rename configuration keys (AppConfig): it has to
+# name the old prefix to read it.
+src/libslic3r/AppConfig.*:agent_app_\*|"agent_app_"

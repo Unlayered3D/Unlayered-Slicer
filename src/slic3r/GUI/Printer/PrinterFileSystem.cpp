@@ -1864,6 +1864,13 @@ void StaticBambuLib::reset()
 
 void StaticBambuLib::release()
 {
+    // Once, and only for a camera library that was loaded and still is: at quit the network
+    // plug-in may already have unloaded it (BBLNetworkPlugin::shutdown on macOS), and Bambu_Deinit
+    // would then run freed code. get() on a library never loaded would only look it up to deinit it.
+    static bool released = false;
+    if (released || !module || module != Slic3r::NetworkAgent::get_bambu_source_entry())
+        return;
+    released = true;
     if (auto f = get().Bambu_Deinit)
         f();
 }

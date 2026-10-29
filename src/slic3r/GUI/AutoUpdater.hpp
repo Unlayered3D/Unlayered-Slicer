@@ -13,6 +13,8 @@
 #include "slic3r/Utils/AppUpdater.hpp"
 #include "slic3r/Utils/UnlayeredAccount.hpp"
 
+#include <wx/string.h>
+
 class wxWindow;
 
 namespace Slic3r {
@@ -20,6 +22,13 @@ class AppConfig;
 namespace GUI {
 
 class GUI_App;
+
+// The application's name for the window title: the plain name, plus the edition label the account
+// provider reports for the signed-in account (UnlayeredAccount::Profile::edition_label), if any.
+// Cosmetic only -- nothing in the application is enabled or disabled by it. No round trip.
+wxString app_title_name();
+// Re-applies the window title after the account or its profile changed. GUI thread only.
+void refresh_app_title();
 
 // The account-based self-update ("Restart to update").
 //
@@ -49,6 +58,8 @@ public:
     ~AutoUpdater();
 
     UnlayeredAccount &account() { return *m_account; }
+    // For a worker thread that must keep the account alive until its request returns.
+    std::shared_ptr<UnlayeredAccount> account_ptr() { return m_account; }
 
     // Once, after the main window exists: loads the stored sign-in, re-checks it with the site in the
     // background, sweeps old downloads and announces a just-finished update.
@@ -93,6 +104,9 @@ public:
 private:
     enum class State { Idle, Downloading, Ready };
 
+    // Re-checks the sign-in with the site off the GUI thread, then re-applies the window title
+    // (which carries the provider's edition label, see app_title_name).
+    void refresh_profile_in_background();
     void start_download();
     void on_download_finished(bool ok, const boost::filesystem::path &installer, const std::string &error,
                               unsigned http_status);

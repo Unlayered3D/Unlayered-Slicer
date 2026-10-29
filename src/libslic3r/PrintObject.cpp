@@ -10,6 +10,8 @@
 #include "I18N.hpp"
 #include "Layer.hpp"
 #include "MutablePolygon.hpp"
+#include "NonplanarTop.hpp"
+#include "NonplanarTopSlice.hpp"
 #include "PrintConfig.hpp"
 #include "SLA/IndexedMesh.hpp"
 #include "Support/SupportMaterial.hpp"
@@ -603,6 +605,9 @@ void PrintObject::prepare_infill()
     // by the cummulative area of the previous $layerm->fill_surfaces.
     this->detect_surfaces_type();
     m_print->throw_if_canceled();
+    // UNLAYERED_MOD: nonplanar layers -- the curved shell is the top: the planar tops under it are internal.
+    if (nonplanar_top_requested(*this))
+        nonplanar_top_retype_surfaces(*this);
 
     // Decide what surfaces are to be filled.
     // Here the stTop / stBottomBridge / stBottom infill is turned to just stInternal if zero top / bottom infill layers are configured.
@@ -698,6 +703,10 @@ void PrintObject::prepare_infill()
     // to remove only half of the combined infill
     this->bridge_over_infill();
     m_print->throw_if_canceled();
+
+    // UNLAYERED_MOD: nonplanar layers -- the curved shell is the top: no top shells, solid or bridges under it.
+    if (nonplanar_top_requested(*this))
+        nonplanar_top_shell_authority(*this);
 
     // Orca: authoritative wave-overhang floor-layer pass. MUST run LAST after
     // every surface-classification stage (process_external_surfaces,
@@ -866,7 +875,8 @@ bool PrintObject::need_z_contouring() const
             return true;
     }
 
-    return false;
+    // UNLAYERED_MOD: nonplanar layers run in the same step and share its mesh.
+    return nonplanar_top_requested(*this);
 }
 
 //void PrintObject::contour_z()
@@ -966,6 +976,20 @@ void PrintObject::contour_z()
     // the original min_z(), so recompute it from the transformed bounding box.
     BoundingBoxf3 rotated_bbox = mesh.bounding_box();
     imesh.ground_level_offset(-rotated_bbox.min.z());
+
+    // UNLAYERED_MOD: nonplanar layers first, so Z contouring sees the planar material that is left
+    // (it skips the curved shell paths).
+    // Only where the slice frame keeps world Z vertical: the clearance model assumes the nozzle
+    // runs along the slice frame's Z. A tilted cut-plane segment (virtual or real 5-axis) is skipped.
+    const bool np_upright = (trafo.linear() * Vec3d::UnitZ()).normalized().z() > 1. - 1e-9 &&
+                            (trafo.linear().transpose() * Vec3d::UnitZ()).normalized().z() > 1. - 1e-9;
+    if (nonplanar_top_requested(*this) && ! np_upright)
+        BOOST_LOG_TRIVIAL(info) << "Nonplanar layers: skipped for a segment printed in a tilted frame";
+    if (nonplanar_top_requested(*this) && np_upright) {
+        m_print->set_status(40, L("Nonplanar layers"));
+        make_nonplanar_top(*this, imesh, ceilings);
+        m_print->throw_if_canceled();
+    }
 
     std::mutex mtx;
     size_t completed = 0;
@@ -2782,8 +2806,39 @@ void PrintObject::apply_wave_overhang_floor_layer_authority()
             continue;
         const int floor_layers = rconf.wave_overhang_floor_layers.value;
 
+        // Unlayered: the TOP shells are not the wave's to overrule. A top surface a few layers above
+        // a wave strip propagates stInternalSolid down through the shadow, and the pass below used to
+        // demote all of it to sparse -- a P1S Halo casing with a wave 5 layers under its top printed
+        // 1 top layer over sparse instead of 6 shells (2026-10-12). Per layer, the zone within
+        // top_shell_layers (or top_shell_thickness, whichever reaches further) below a real top
+        // surface keeps its classification. Collected before the parallel pass rewrites fill_surfaces.
+        std::vector<Polygons> top_zone(m_layers.size());
+        {
+            std::vector<Polygons> tops(m_layers.size());
+            for (size_t i = 0; i < m_layers.size(); ++i)
+                for (const Surface &s : m_layers[i]->m_regions[region_id]->fill_surfaces.surfaces)
+                    if (s.surface_type == stTop)
+                        polygons_append(tops[i], to_polygons(s.expolygon));
+            const int    n_top     = rconf.top_shell_layers.value;
+            const double thickness = rconf.top_shell_thickness.value;
+            for (size_t i = 0; i < m_layers.size(); ++i) {
+                if (m_layers[i]->wave_overhang_shadow_polygons.empty())
+                    continue;
+                Polygons zone;
+                for (size_t j = i + 1; j < m_layers.size(); ++j) {
+                    const bool by_count     = int(j - i) <= n_top - 1;
+                    const bool by_thickness = thickness > 0. && m_layers[j]->print_z - m_layers[i]->print_z < thickness - EPSILON;
+                    if (!by_count && !by_thickness)
+                        break;
+                    append(zone, tops[j]);
+                }
+                if (!zone.empty())
+                    top_zone[i] = union_(zone);
+            }
+        }
+
         tbb::parallel_for(tbb::blocked_range<size_t>(0, m_layers.size()),
-            [this, region_id, floor_layers](const tbb::blocked_range<size_t> &range) {
+            [this, region_id, floor_layers, &top_zone](const tbb::blocked_range<size_t> &range) {
                 for (size_t idx_layer = range.begin(); idx_layer < range.end(); ++ idx_layer) {
                     m_print->throw_if_canceled();
                     Layer *layer = m_layers[idx_layer];
@@ -2827,7 +2882,14 @@ void PrintObject::apply_wave_overhang_floor_layer_authority()
                     if (! covered.empty())
                         covered = union_(covered);
 
-                    const Polygons &shadow = layer->wave_overhang_shadow_polygons;
+                    // Top shells stay as classified (see top_zone above), except on this layer's own
+                    // wave strip, which the wave fills.
+                    Polygons shadow = layer->wave_overhang_shadow_polygons;
+                    if (! top_zone[idx_layer].empty()) {
+                        shadow = diff(shadow, own.empty() ? top_zone[idx_layer] : diff(top_zone[idx_layer], own));
+                        if (shadow.empty())
+                            continue;
+                    }
                     LayerRegion *layerm = layer->m_regions[region_id];
                     Surfaces &surfs = layerm->fill_surfaces.surfaces;
                     Surfaces new_surfaces;
@@ -5016,6 +5078,16 @@ void PrintObject::update_slicing_parameters()
         // BELT_MOD -- the frame is raised by the belt schedule offset, so the schedule must reach that
         // much further; the leading layers below the object's own material are empty and skipped.
         object_max_z += (float) m_belt_schedule_offset;
+        // UNLAYERED_MOD -- a plain object lifted off the bed keeps its lift in the slice frame
+        // (update_slice_frame()), so the layers must reach from the bed to its top, not only its height.
+        if (! this->print()->config().belt_printer.value && tempTrafo.linear().isIdentity(1e-12)) {
+            const ModelObject &mo = *this->model_object();
+            const double lift = mo.instances.size() > 1 && ! this->instances().empty()
+                ? mo.instance_bounding_box(*this->instances().front().model_instance).min.z()
+                : mo.bounding_box_exact().min.z();
+            if (lift > EPSILON)
+                object_max_z += (float) lift;
+        }
     }
 
     if (!m_slicing_params.valid) {
@@ -5067,6 +5139,12 @@ SlicingParameters PrintObject::slicing_parameters(const DynamicPrintConfig &full
     const Transform3d tempTrafo = layer_rotation_trafo(object_config, print_config.enable_nonplanar.value);
 
     object_max_z = (float) model_object.mesh().transformed_bounding_box(tempTrafo).size().z();
+    // UNLAYERED_MOD -- a plain object lifted off the bed is sliced from the bed up (update_slicing_parameters()).
+    if (! print_config.belt_printer.value && tempTrafo.linear().isIdentity(1e-12)) {
+        const double lift = model_object.bounding_box_exact().min.z();
+        if (lift > EPSILON)
+            object_max_z += (float) lift;
+    }
 
     return SlicingParameters::create_from_config(print_config, object_config, object_max_z, object_extruders, object_shrinkage_compensation);
 }

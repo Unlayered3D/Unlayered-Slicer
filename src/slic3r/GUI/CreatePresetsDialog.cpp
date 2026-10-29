@@ -589,6 +589,8 @@ static std::string get_filament_id(std::string vendor_typr_serial)
     return user_filament_id;
 }
 
+std::string create_filament_id(const std::string& vendor_type_serial) { return get_filament_id(vendor_type_serial); }
+
 static json get_config_json(const Preset* preset) {
     json j;
     // record the headers

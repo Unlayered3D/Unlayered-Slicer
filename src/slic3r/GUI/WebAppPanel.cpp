@@ -2,6 +2,7 @@
 
 #include "WebAppBridge.hpp"
 
+#include "AutoUpdater.hpp"
 #include "I18N.hpp"
 #include "slic3r/GUI/GUI_App.hpp"
 #include "slic3r/GUI/Widgets/WebView.hpp"
@@ -17,7 +18,12 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <cstdint>
+#include <iomanip>
+#include <random>
 #include <set>
+#include <sstream>
+#include <thread>
 
 #include <wx/button.h>
 #include <wx/sizer.h>
@@ -50,10 +56,10 @@ const char* const ENV_URL      = "ORCA_WEB_APP_URL";
 const char* const LEGACY_DEV_URL = "http://127.0.0.1:8765";
 const char* const ENV_TITLE    = "ORCA_WEB_APP_TITLE";
 const char* const ENV_DEVTOOLS = "ORCA_WEB_APP_DEVTOOLS";
-// The agent slot's counterparts. Devtools stays shared: it is a property of the developer, not
-// of a tab.
-const char* const ENV_AGENT_URL   = "ORCA_AGENT_APP_URL";
-const char* const ENV_AGENT_TITLE = "ORCA_AGENT_APP_TITLE";
+// The side panel slot's counterparts. Devtools stays shared: it is a property of the developer,
+// not of a tab. ORCA_AGENT_APP_URL is the variable's former name, honoured in the dev edition only.
+const char* const ENV_SIDE_PANEL_URL   = "ORCA_SIDE_PANEL_URL";
+const char* const ENV_SIDE_PANEL_TITLE = "ORCA_SIDE_PANEL_TITLE";
 // The Universe slot's counterparts, for pointing the tab at a local copy of the site.
 // The one-shot visibility tag this edition applies (WebAppSlot::visibility_once). Shared by the
 // two tabs that ship switched on, so both arrive in the same single pass over the configuration.
@@ -69,15 +75,27 @@ const char* const ENV_UNIVERSE_TITLE = "ORCA_UNIVERSE_APP_TITLE";
 // Like *_allow_export they have no AppConfig default, so "absent" survives long enough for
 // ensure_seeded to tell an installation that predates the key from a user who switched it off.
 const char* const SETTING_WEB_APP_ALLOW_INSTALL      = "web_app_allow_install";
-const char* const SETTING_AGENT_APP_ALLOW_INSTALL    = "agent_app_allow_install";
+const char* const SETTING_SIDE_PANEL_ALLOW_INSTALL    = "side_panel_allow_install";
 const char* const SETTING_UNIVERSE_APP_ALLOW_INSTALL = "universe_app_allow_install";
+// The <slot>_allow_printer keys (WebAppSlot::key_allow_printer), for the same reason. Off for
+// every slot; the side panel's is switched in Preferences > Developer (dev edition).
+const char* const SETTING_WEB_APP_ALLOW_PRINTER      = "web_app_allow_printer";
+const char* const SETTING_SIDE_PANEL_ALLOW_PRINTER = "side_panel_allow_printer";
+const char* const SETTING_UNIVERSE_APP_ALLOW_PRINTER = "universe_app_allow_printer";
 
 wxString env_or_empty(const char* name)
 {
     wxString value;
-    if (wxGetEnv(name, &value))
+    if (name != nullptr && wxGetEnv(name, &value))
         return value;
     return wxString();
+}
+
+// The slot's address override from the environment, or empty.
+wxString env_url_of(const WebAppSlot& slot)
+{
+    wxString url = env_or_empty(slot.env_url);
+    return url;
 }
 
 // Percent-encode a string for use as a query-parameter value. wxURI has no public encoder, and
@@ -98,6 +116,28 @@ wxString percent_encode(const wxString& value)
             out += static_cast<wxChar>(hex[c & 0x0F]);
         }
     }
+    return out;
+}
+
+// The decoded value of `name` in a URL query ("reason=x&next=%2Fapp"), or empty.
+wxString query_value(const wxString& query, const wxString& name)
+{
+    wxStringTokenizer tok(query, "&");
+    while (tok.HasMoreTokens()) {
+        const wxString pair = tok.GetNextToken();
+        if (pair.BeforeFirst('=') == name)
+            return wxURI::Unescape(pair.AfterFirst('='));
+    }
+    return wxString();
+}
+
+// "https://site/app?host=x" -> "/app?host=x"
+wxString path_and_query(const wxString& url)
+{
+    const wxURI uri(url);
+    wxString    out = uri.GetPath().empty() ? wxString("/") : uri.GetPath();
+    if (uri.HasQuery())
+        out += "?" + uri.GetQuery();
     return out;
 }
 
@@ -133,26 +173,43 @@ void ensure_seeded(const WebAppSlot& slot)
         }
         // Taking a tab away clears its address as well: is_enabled() wants the flag AND a
         // non-empty url, so an emptied address means the tab cannot be restored by flipping one
-        // boolean in the configuration file. Adding one leaves the address to the defaults below,
-        // which fill it precisely because an earlier edition emptied it.
+        // boolean in the configuration file. Adding one back restores the shipped address when an
+        // earlier edition emptied it -- the one case a stored blank is not the user's choice.
         if (!slot.visibility_once_enable)
             cfg->set(slot.key_url, "");
+        else if (slot.default_url != nullptr && !cfg->has(slot.key_url))
+            cfg->set(slot.key_url, slot.default_url);
         cfg->set(slot.key_disable_once, slot.visibility_once);
+    }
+
+    // The one-shot address, for a configuration an earlier release seeded with none (see
+    // WebAppSlot::reseed_once). After the visibility change, which fills the address of a fresh
+    // installation itself, so there this only records the tag.
+    if (slot.reseed_once != nullptr && slot.key_reseed_once != nullptr && slot.default_url != nullptr &&
+        cfg->get(slot.key_reseed_once) != slot.reseed_once) {
+        if (!cfg->has(slot.key_url)) {
+            BOOST_LOG_TRIVIAL(info) << "WebAppPanel[" << slot.id << "]: one-shot address";
+            cfg->set(slot.key_url, slot.default_url);
+            cfg->set_bool(slot.key_enabled, true);
+            cfg->set_bool(slot.key_allow_settings, slot.default_allow_settings);
+            if (slot.default_title != nullptr && !cfg->has(slot.key_title))
+                cfg->set(slot.key_title, slot.default_title);
+        }
+        cfg->set(slot.key_reseed_once, slot.reseed_once);
     }
 
     // The defaults this build carries, applied per key rather than by one all-or-nothing flag: a
     // key added in a later release has to be able to reach an installation seeded before it
     // existed.
     //
-    // The address and the label are authoritative, not a fallback for when the key is missing.
-    // These tabs have no Preferences UI, so a value already in the configuration cannot be a
-    // choice the user made -- it can only be what an earlier build seeded. Deferring to it would
-    // mean a renamed tab or a moved address reached fresh installations and no others, which is
-    // the worst of both. A development machine points a tab elsewhere with ORCA_*_APP_URL, which
-    // wins over this and is never written back.
-    if (slot.default_url != nullptr && cfg->get(slot.key_url) != slot.default_url)
+    // The address and the label are seeded ONLY when the key is absent altogether: the user edits
+    // the address in Preferences > Advanced > "Web apps & services", and a blank there means "off",
+    // so neither a value nor a blank already in the configuration is ever overwritten. (AppConfig
+    // deliberately gives these keys no default, so "absent" survives until here.) A development
+    // machine points a tab elsewhere with ORCA_*_URL, which wins over this and is never written back.
+    if (slot.default_url != nullptr && !cfg->contains(slot.key_url))
         cfg->set(slot.key_url, slot.default_url);
-    if (slot.default_title != nullptr && cfg->get(slot.key_title) != slot.default_title)
+    if (slot.default_title != nullptr && !cfg->contains(slot.key_title))
         cfg->set(slot.key_title, slot.default_title);
     if (first_seed)
         cfg->set_bool(slot.key_allow_settings, slot.default_allow_settings);
@@ -162,6 +219,8 @@ void ensure_seeded(const WebAppSlot& slot)
     // installations it has to reach, and a false the user chose is non-empty and left alone.
     if (!cfg->has(slot.key_allow_install))
         cfg->set_bool(slot.key_allow_install, slot.default_allow_install);
+    if (slot.key_allow_printer != nullptr && !cfg->has(slot.key_allow_printer))
+        cfg->set_bool(slot.key_allow_printer, slot.default_allow_printer);
 
     // Recorded here rather than after the overlay below, because the defaults above are a seed in
     // their own right and a shipped build never reaches the overlay at all. Without this the
@@ -187,9 +246,9 @@ void ensure_seeded(const WebAppSlot& slot)
         // once -- which is exactly what happened when extra_origins was introduced. AppConfig::has
         // treats an empty string as absent, so a key present-but-blank is still fillable, and a
         // value the user actually set is never touched.
-        if (seed.contains("url") && seed["url"].is_string() && !cfg->has(slot.key_url))
+        if (seed.contains("url") && seed["url"].is_string() && !cfg->contains(slot.key_url))
             cfg->set(slot.key_url, seed["url"].get<std::string>());
-        if (seed.contains("title") && seed["title"].is_string() && !cfg->has(slot.key_title))
+        if (seed.contains("title") && seed["title"].is_string() && !cfg->contains(slot.key_title))
             cfg->set(slot.key_title, seed["title"].get<std::string>());
         // A slot whose site serves downloads from a different host than the page needs that host
         // named or openProjectFromUrl refuses every fetch. Seeded like the strings above, so an
@@ -272,20 +331,23 @@ const WebAppSlot& WebAppSlot::generic()
         s.key_allow_settings = SETTING_WEB_APP_ALLOW_SETTINGS;
         s.key_allow_export   = SETTING_WEB_APP_ALLOW_EXPORT;
         s.key_allow_install  = SETTING_WEB_APP_ALLOW_INSTALL;
+        s.key_allow_printer  = SETTING_WEB_APP_ALLOW_PRINTER;
         s.key_disable_once   = SETTING_WEB_APP_DISABLE_ONCE;
         s.env_url            = ENV_URL;
         s.env_title          = ENV_TITLE;
         s.seed_file          = "default.json";
-        // Still withdrawn. This tab hosts whatever a developer points it at, which is not a
-        // feature of the shipped product; the tag is the one the customer edition applied, so an
-        // installation that has already had it taken away is left alone.
+        // The one-shot an earlier edition applied (it emptied an address left over from development
+        // builds). It only ever runs once per installation, before the user could have set an
+        // address in Preferences, so it never takes away an address the user chose; with one set
+        // the tab shows like any other slot.
         s.visibility_once        = "customer-edition-2026-09-19";
         s.visibility_once_enable = false;
-        s.default_url            = nullptr; // ships with no address, so the tab cannot appear
+        s.default_url            = nullptr; // ships with no address: the tab shows once one is set
         s.default_title          = nullptr;
         s.default_allow_settings = false;
         s.default_allow_export   = false;
         s.default_allow_install  = false;
+        s.default_allow_printer  = false;
         s.download_hosts     = nullptr;
         s.legacy_url         = LEGACY_DEV_URL;
         s.live_theme         = false; // reloads on a theme toggle, as it always has
@@ -294,37 +356,49 @@ const WebAppSlot& WebAppSlot::generic()
     return s_slot;
 }
 
-const WebAppSlot& WebAppSlot::agent()
+const WebAppSlot& WebAppSlot::side_panel()
 {
     static const WebAppSlot s_slot = [] {
         WebAppSlot s{};
-        s.id                 = "agent_app";
-        s.key_enabled        = SETTING_AGENT_APP_ENABLED;
-        s.key_url            = SETTING_AGENT_APP_URL;
-        s.key_title          = SETTING_AGENT_APP_TITLE;
-        s.key_allow_local    = SETTING_AGENT_APP_ALLOW_LOCAL;
-        s.key_path_roots     = SETTING_AGENT_APP_PATH_ROOTS;
-        s.key_download_hosts = SETTING_AGENT_APP_DOWNLOAD_HOSTS;
-        s.key_extra_origins  = SETTING_AGENT_APP_EXTRA_ORIGINS;
-        s.key_seeded         = SETTING_AGENT_APP_SEEDED;
-        s.key_allow_settings = SETTING_AGENT_APP_ALLOW_SETTINGS;
-        s.key_allow_export   = SETTING_AGENT_APP_ALLOW_EXPORT;
-        s.key_allow_install  = SETTING_AGENT_APP_ALLOW_INSTALL;
-        s.key_disable_once   = SETTING_AGENT_APP_DISABLE_ONCE;
-        s.env_url            = ENV_AGENT_URL;
-        s.env_title          = ENV_AGENT_TITLE;
-        s.seed_file          = "agent.json";
-        // A shipped tab again. The tag differs from the customer edition's, so an installation
-        // that release took the tab away from gets it back exactly once; a fresh installation has
-        // no tag at all and so also matches. Either way the address below is filled, because the
-        // withdrawal cleared it.
+        s.id                 = "side_panel";
+        s.key_enabled        = SETTING_SIDE_PANEL_ENABLED;
+        s.key_url            = SETTING_SIDE_PANEL_URL;
+        s.key_title          = SETTING_SIDE_PANEL_TITLE;
+        s.key_allow_local    = SETTING_SIDE_PANEL_ALLOW_LOCAL;
+        s.key_path_roots     = SETTING_SIDE_PANEL_PATH_ROOTS;
+        s.key_download_hosts = SETTING_SIDE_PANEL_DOWNLOAD_HOSTS;
+        s.key_extra_origins  = SETTING_SIDE_PANEL_EXTRA_ORIGINS;
+        s.key_seeded         = SETTING_SIDE_PANEL_SEEDED;
+        s.key_allow_settings = SETTING_SIDE_PANEL_ALLOW_SETTINGS;
+        s.key_allow_export   = SETTING_SIDE_PANEL_ALLOW_EXPORT;
+        s.key_allow_install  = SETTING_SIDE_PANEL_ALLOW_INSTALL;
+        s.key_allow_printer  = SETTING_SIDE_PANEL_ALLOW_PRINTER;
+        s.key_disable_once   = SETTING_SIDE_PANEL_DISABLE_ONCE;
+        s.env_url            = ENV_SIDE_PANEL_URL;
+        s.env_title          = ENV_SIDE_PANEL_TITLE;
+        s.seed_file          = "side_panel.json";
+        // Enabled once; whether it shows is then down to its address (blank = off).
         s.visibility_once        = FORWARD_EDITION_TAG;
         s.visibility_once_enable = true;
+#if UNLAYERED_SIDE_PANEL
+        // A build with UNLAYERED_SIDE_PANEL_EDITION (or the dev edition) seeds this default page, at
+        // the address the build passed (UNLAYERED_SIDE_PANEL_DEFAULT_URL); it is seeded only when the
+        // key is absent, and the user can change or blank it like any other.
+        s.default_url            = UNLAYERED_SIDE_PANEL_DEFAULT_URL;
+        s.default_title          = "Assistant";
+        // A side panel page is there to work on the plate with the user, so a build that seeds it
+        // grants it the settings family by default; any other build leaves it to the user.
+        s.default_allow_settings = true;
+        // 0.1.7 seeded this slot's keys with no address; give those installations the page once.
+        s.reseed_once            = "side-panel-on-0.1.8";
+#endif
+        s.key_reseed_once        = SETTING_SIDE_PANEL_RESEED_ONCE;
         s.default_allow_export   = false;
         s.default_allow_install  = false;
+        s.default_allow_printer  = false;
         s.download_hosts     = nullptr;
         s.legacy_url         = nullptr; // no build ever seeded this slot with a dead address
-        s.live_theme         = true;    // the page holds a conversation; re-theme it in place
+        s.live_theme         = true;    // the page may hold state; re-theme it in place
         return s;
     }();
     return s_slot;
@@ -346,11 +420,12 @@ const WebAppSlot& WebAppSlot::universe()
         s.key_allow_settings = SETTING_UNIVERSE_APP_ALLOW_SETTINGS;
         s.key_allow_export   = SETTING_UNIVERSE_APP_ALLOW_EXPORT;
         s.key_allow_install  = SETTING_UNIVERSE_APP_ALLOW_INSTALL;
+        s.key_allow_printer  = SETTING_UNIVERSE_APP_ALLOW_PRINTER;
         s.key_disable_once   = SETTING_UNIVERSE_APP_DISABLE_ONCE;
         s.env_url            = ENV_UNIVERSE_URL;
         s.env_title          = ENV_UNIVERSE_TITLE;
         s.seed_file          = "universe.json";
-        // Shares the agent's tag: the two tabs arrive together and this slot has no separate
+        // Shares the side panel's tag: the two arrive together and this slot has no separate
         // history to respect -- it has never shipped switched on.
         s.visibility_once        = FORWARD_EDITION_TAG;
         s.visibility_once_enable = true;
@@ -365,6 +440,7 @@ const WebAppSlot& WebAppSlot::universe()
         // The user still confirms every install in a native dialog that shows the profile's
         // machine, envelope and any risky custom G-code, and a profile never carries a print host.
         s.default_allow_install  = true;
+        s.default_allow_printer  = false;
         // Universe answers a download with a redirect to blob storage, which is a DIFFERENT
         // host from the page and whose sub-domain belongs to the deployment -- so no exact
         // host can be baked in, and a leading dot matches the family. Without this every
@@ -373,8 +449,8 @@ const WebAppSlot& WebAppSlot::universe()
         s.download_hosts     = ".vercel-storage.com";
         s.legacy_url         = nullptr; // no build ever seeded this slot with a dead address
         // Browsing state is cheap to rebuild and the site themes itself from a cookie on load,
-        // so a reload on a theme toggle is the honest behaviour here -- unlike the agent tab,
-        // whose page holds a conversation that a reload would throw away.
+        // so a reload on a theme toggle is the honest behaviour here -- unlike the side panel,
+        // whose page may hold state a reload would throw away.
         s.live_theme         = false;
         return s;
     }();
@@ -387,7 +463,8 @@ const WebAppSlot& WebAppSlot::universe()
 
 wxString WebAppPanel::configured_url(const WebAppSlot& slot)
 {
-    const wxString from_env = env_or_empty(slot.env_url);
+
+    const wxString from_env = env_url_of(slot);
     if (!from_env.empty())
         return from_env;
 
@@ -411,19 +488,20 @@ wxString WebAppPanel::configured_title(const WebAppSlot& slot)
         if (!title.empty())
             return title;
     }
+    // A blank stored label is never a choice (Preferences has no "no label"), and 0.1.7 configs carry
+    // one for the side panel, so the slot's own name comes before the generic one.
+    if (slot.default_title != nullptr)
+        return wxString::FromUTF8(slot.default_title);
     return _L("Web App");
 }
 
 bool WebAppPanel::is_enabled(const WebAppSlot& slot)
 {
-    // Not in a release build, whatever the config or the ORCA_*_APP_URL environment says:
-    // - the generic slot is a developer harness, not part of the product;
-    // - the second slot is not part of this release.
-    // The dev edition keeps both.
-    if (std::string(slot.id) == WebAppSlot::generic().id || std::string(slot.id) == WebAppSlot::agent().id)
-        return false;
+    // Every slot, in every edition: shown when it is enabled and has an address. No slot is
+    // special-cased; what a slot hosts is configuration (Preferences > Advanced > "Web apps &
+    // services").
     // An environment override implies the developer wants the tab, whatever the config says.
-    if (!env_or_empty(slot.env_url).empty())
+    if (!env_url_of(slot).empty())
         return true;
 
     ensure_seeded(slot);
@@ -546,6 +624,7 @@ WebAppPanel::WebAppPanel(wxWindow* parent, const WebAppSlot& slot)
 
 WebAppPanel::~WebAppPanel()
 {
+    *m_alive = false;
     SetEvtHandlerEnabled(false);
     // Out of the notify_all set before the bridge goes, so no event can reach a half-destroyed
     // panel.
@@ -598,6 +677,8 @@ void WebAppPanel::load_home()
         return;
     }
 
+    if (IsShown() && open_signed_in(m_home_url))
+        return;
     load_url(m_home_url);
 }
 
@@ -645,10 +726,12 @@ bool WebAppPanel::Show(bool show)
 {
     BOOST_LOG_TRIVIAL(info) << "WebAppPanel[" << m_slot.id << "]: " << (show ? "shown" : "hidden")
                             << (m_url_deferred.empty() ? "" : ", its page not loaded yet");
-    if (show && m_browser != nullptr && !m_url_deferred.empty()) {
+    if (show && m_browser != nullptr && !m_url_deferred.empty() && !m_session_pending) {
         // m_url_deferred is cleared in OnLoaded, not here, so a failed load retries next time
-        // the tab is shown.
-        m_browser->LoadURL(m_url_deferred);
+        // the tab is shown. The sign-in link is fetched only now: it lasts a minute, and a tab can
+        // stay hidden far longer than that.
+        if (!(m_url_deferred == m_home_url && open_signed_in(m_home_url)))
+            m_browser->LoadURL(m_url_deferred);
     }
     if (m_bridge)
         m_bridge->on_tab_shown(show);
@@ -828,6 +911,11 @@ void WebAppPanel::OnNavigating(wxWebViewEvent& evt)
         return;
     }
 
+    if (intercept_site_sign_in(url)) {
+        evt.Veto();
+        return;
+    }
+
     if (is_navigable(url))
         return;
 
@@ -848,6 +936,111 @@ void WebAppPanel::OnNewWindow(wxWebViewEvent& evt)
     // embedded view cannot complete.
     launch_external(evt.GetURL());
     evt.Veto();
+}
+
+// ---------------------------------------------------------------------------------------------
+// The application's account, for a tab hosted on the configured account provider's own origin
+// (AppConfig account_provider_url). Pages anywhere else never see the account.
+// ---------------------------------------------------------------------------------------------
+
+wxString WebAppPanel::account_site_origin() const
+{
+    AutoUpdater* updater = wxGetApp().auto_updater();
+    if (updater == nullptr)
+        return wxString();
+    const wxString site = origin_of(wxString::FromUTF8(updater->account().site_url().c_str()));
+    // Only the provider's own origin may be handed its session. A local development page, or any
+    // other configured address, never sees the account at all; with no provider, nothing does.
+    return !site.empty() && site == origin_of(m_home_url) ? site : wxString();
+}
+
+bool WebAppPanel::open_signed_in(const wxString& url)
+{
+    if (m_session_offered || m_browser == nullptr || account_site_origin().empty())
+        return false;
+    if (!wxGetApp().auto_updater()->account().signed_in())
+        return false; // the page signs in when the person asks (intercept_site_sign_in)
+    // Once per panel: the cookie the link sets lasts a week, and reloads keep it.
+    m_session_offered = true;
+    follow_session_link(path_and_query(url), url);
+    return true;
+}
+
+bool WebAppPanel::intercept_site_sign_in(const wxString& url)
+{
+    const wxString site = account_site_origin();
+    if (site.empty() || origin_of(url) != site)
+        return false;
+    const wxURI uri(url);
+    if (uri.GetPath() != "/login")
+        return false;
+    // A link is on its way and will replace whatever this was.
+    if (m_session_pending)
+        return true;
+    // A link was followed moments ago and the site wants a sign-in all the same (it had expired,
+    // or the account was refused): show the site's own page rather than go round again.
+    if (wxGetUTCTimeMillis() - m_session_link_ms < 30000)
+        return false;
+
+    wxString next = query_value(uri.GetQuery(), "next");
+    // Back to the home page with its query intact: a sign-in link that names only the page's path
+    // would otherwise drop the ?host= marker that tells the page it is inside the application.
+    if (!next.StartsWith("/") || next.StartsWith("//") || next == wxURI(m_home_url).GetPath())
+        next = path_and_query(m_home_url);
+    // Not from inside the navigation callback: the sign-in dialog is modal.
+    CallAfter([this, next, url]() { sign_in_natively(next, url); });
+    return true;
+}
+
+void WebAppPanel::sign_in_natively(const wxString& next, const wxString& login_url)
+{
+    AutoUpdater* updater = wxGetApp().auto_updater();
+    if (updater == nullptr || m_browser == nullptr)
+        return;
+    if (!updater->account().signed_in()) {
+        std::shared_ptr<bool> alive     = m_alive;
+        bool                  signed_in = false;
+        // The same browser sign-in as Help > Sign in and the updater.
+        updater->sign_in(this, [&signed_in](bool ok) { signed_in = ok; });
+        // Cancelled or failed: stay on the page that offered the sign-in; its button asks again.
+        if (!*alive || !signed_in)
+            return;
+    }
+    follow_session_link(next, login_url);
+}
+
+void WebAppPanel::follow_session_link(const wxString& next, const wxString& fallback_url)
+{
+    AutoUpdater* updater = wxGetApp().auto_updater();
+    if (updater == nullptr || m_browser == nullptr)
+        return;
+    m_session_pending = true;
+
+    std::shared_ptr<UnlayeredAccount> account  = updater->account_ptr();
+    std::shared_ptr<bool>             alive    = m_alive;
+    const std::string                 next_u8  = next.ToUTF8().data();
+    const std::string                 fallback = fallback_url.ToUTF8().data();
+    std::thread([this, alive, account, next_u8, fallback]() {
+        std::string path, error;
+        unsigned    status = 0;
+        const bool  ok     = account->fetch_web_session_path(next_u8, path, status, error);
+        const std::string link = ok ? account->site_url() + path : std::string();
+        wxGetApp().CallAfter([this, alive, ok, link, fallback, status, error]() {
+            if (!*alive || m_browser == nullptr)
+                return;
+            m_session_pending = false;
+            m_session_link_ms = wxGetUTCTimeMillis();
+            if (ok) {
+                m_browser->LoadURL(wxString::FromUTF8(link.c_str()));
+                return;
+            }
+            // A provider without the route, the network, a refused account: the page loads as it
+            // would have, and its own sign-in still works.
+            BOOST_LOG_TRIVIAL(info) << "WebAppPanel: no sign-in link from the account provider ("
+                                    << (status ? "HTTP " + std::to_string(status) : error) << "); loading " << fallback;
+            m_browser->LoadURL(wxString::FromUTF8(fallback.c_str()));
+        });
+    }).detach();
 }
 
 void WebAppPanel::OnLoaded(wxWebViewEvent& evt)
@@ -960,11 +1153,47 @@ bool WebAppPanel::allows_install() const
     return cfg != nullptr && m_slot.key_allow_install != nullptr && cfg->get_bool(m_slot.key_allow_install);
 }
 
+bool WebAppPanel::allows_printer() const
+{
+    AppConfig* cfg = wxGetApp().app_config;
+    return cfg != nullptr && m_slot.key_allow_printer != nullptr && cfg->get_bool(m_slot.key_allow_printer);
+}
+
 void WebAppPanel::notify_all(const std::string& method, const json& data)
 {
     for (WebAppPanel* panel : s_live)
         if (panel->bridge() != nullptr)
             panel->bridge()->notify(method, data);
+}
+
+namespace {
+unsigned s_project_generation = 0;
+}
+
+const std::string& WebAppPanel::instance_id()
+{
+    // 128 random bits, hex. Not derived from anything on the machine (slicer_uuid stays private).
+    static const std::string id = [] {
+        std::random_device rd;
+        std::ostringstream oss;
+        for (int i = 0; i < 4; ++i)
+            oss << std::hex << std::setw(8) << std::setfill('0') << static_cast<uint32_t>(rd());
+        return oss.str();
+    }();
+    return id;
+}
+
+unsigned WebAppPanel::project_generation() { return s_project_generation; }
+
+void WebAppPanel::project_changed(const std::string& reason, const std::string& source, const std::string& slot)
+{
+    ++s_project_generation;
+    json data = {{"reason", reason}, {"source", source}, {"generation", s_project_generation}};
+    if (!slot.empty())
+        data["slot"] = slot;
+    BOOST_LOG_TRIVIAL(info) << "WebAppPanel: project changed (" << reason << ", " << source << "), generation "
+                            << s_project_generation;
+    notify_all("slicer.projectChanged", data);
 }
 
 bool WebAppPanel::origin_is_allowed() const

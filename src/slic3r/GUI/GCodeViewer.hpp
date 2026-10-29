@@ -204,7 +204,7 @@ private:
     bool m_gl_data_initialized{ false };
     unsigned int m_last_result_id{ 0 };
     //BBS: save m_gcode_result as well
-    const GCodeProcessorResult* m_gcode_result;
+    const GCodeProcessorResult* m_gcode_result{ nullptr };
     std::array<unsigned int, static_cast<size_t>(EMoveType::Count)> m_move_type_counts{};
     std::array<std::array<float, static_cast<size_t>(PrintEstimatedStatistics::ETimeMode::Count)>, static_cast<size_t>(EMoveType::Count)> m_move_type_times{};
     std::array<float, static_cast<size_t>(EMoveType::Count)> m_move_type_distances{};
@@ -404,6 +404,36 @@ public:
     }
 
     libvgcode::EViewType get_view_type() const { return m_viewer.get_view_type(); }
+
+    // Automation (Actions/PreviewActions.cpp): what the legend's controls do, callable outside the
+    // ImGui frame. Each setter does what the matching legend click does (the toggle, then
+    // update_moves_slider()) and nothing when the state already matches.
+    // The colouring combo's pick: also moves the combo's own selection (m_view_type_sel). False when
+    // the combo does not offer `type` for the loaded G-code (Tool never; Section only with >1 section).
+    bool select_view_type(libvgcode::EViewType type);
+    std::vector<libvgcode::EViewType> get_offered_view_types() const;
+    // Option rows (Travel, Wipe, Retract, Unretract, Seams, Filament changes).
+    const std::vector<libvgcode::EOptionType>& get_options() const { return m_viewer.get_options(); }
+    bool is_option_visible(libvgcode::EOptionType type) const { return m_viewer.is_option_visible(type); }
+    void set_option_visible(libvgcode::EOptionType type, bool visible);
+    // Feature-type rows.
+    std::vector<libvgcode::EGCodeExtrusionRole> get_extrusion_roles() const { return m_viewer.get_extrusion_roles(); }
+    bool is_extrusion_role_visible(libvgcode::EGCodeExtrusionRole role) const { return m_viewer.is_extrusion_role_visible(role); }
+    void set_extrusion_role_visible(libvgcode::EGCodeExtrusionRole role, bool visible);
+    // Section rows (Section view only; set_view_type to any other view shows them all again).
+    std::vector<int16_t> get_used_cut_segments_ids() const { return m_viewer.get_used_cut_segments_ids(); }
+    bool is_cut_segment_visible(int16_t segment_id) const { return m_viewer.is_cut_segment_visible(segment_id); }
+    void set_cut_segment_visible(int16_t segment_id, bool visible);
+    // "Show stealth mode" / "Show normal mode".
+    libvgcode::ETimeMode get_time_mode() const { return m_viewer.get_time_mode(); }
+    std::vector<libvgcode::ETimeMode> get_time_modes() const { return m_viewer.get_time_modes(); }
+    void set_time_mode(libvgcode::ETimeMode mode);
+    // The legend's colour scale for a range view (min, max).
+    std::array<float, 2> get_color_range(libvgcode::EViewType type) const { return m_viewer.get_color_range(type).get_range(); }
+    // The tool-position window's vertex.
+    size_t get_current_vertex_id() const { return m_viewer.get_current_vertex_id(); }
+    size_t get_vertices_count() const { return m_viewer.get_vertices_count(); }
+    float  get_estimated_time_at(size_t id) const { return m_viewer.get_estimated_time_at(id); }
 
     // ORCA: darken the layers not scrubbed to while using the preview layer slider
     void set_dim_previous_layers(bool value) { m_viewer.set_dim_previous_layers(value); }

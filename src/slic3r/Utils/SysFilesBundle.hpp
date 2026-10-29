@@ -63,6 +63,11 @@ struct SysFilePackage
     // "it did not upload my file" is otherwise impossible to diagnose.
     std::vector<std::pair<std::string, std::string>> skipped;
 
+    // The source was a whole SD card image (sys_looks_like_full_sd_card): only its configuration
+    // folders were read, and its firmware, print files and web interface were left out (listed in
+    // `skipped`). The dialog says so before anything is installed.
+    bool from_full_sd_card = false;
+
     uint64_t       total_bytes() const;
     const SysFile *find(const std::string &path) const;
 };
@@ -103,6 +108,22 @@ const std::vector<std::string> &sys_machine_specific_names();
 // installed, from any source: copying it from another card hands this printer another one's
 // calibration or identity, and no release has a reason to carry one.
 bool sys_is_machine_specific(const std::string &card_path);
+
+// True when a package (paths relative to its root, any wrapper folder already removed) is a whole
+// SD card image rather than a configuration package: it has sys/ or macros/ AND something only a
+// card carries - firmware/, gcodes/, www/, menu/, or a README / START HERE note at the root. Such
+// a package is read for its configuration folders (sys_allowed_roots()) only; everything else is
+// left out BEFORE the size limits, which still apply to every file that is read.
+bool sys_looks_like_full_sd_card(const std::vector<std::string> &paths);
+
+// Files a whole SD card image carries that are never installed from one, on top of
+// sys_machine_specific_names(): today sys/config.g, because a card's is the generic ship
+// config.g and would replace the printer's tuned one. Configuration releases leave it out too.
+// An ordinary configuration zip or folder may still install sys/config.g.
+bool sys_is_card_kept_config(const std::string &card_path);
+
+// True for a path that sits inside one of sys_allowed_roots(), e.g. "macros/Load Filament".
+bool sys_is_config_folder_path(const std::string &relative_path);
 
 // Parses the manifest.json carried by a package:
 //   { "version": "...", "date": "...", "machine": "...", "notes": "...",

@@ -189,6 +189,8 @@ void KBShortcutsDialog::fill_shortcuts()
             { ctrl + "V", L("Paste from clipboard") },
             // Configuration
             { ctrl + "P", L("Preferences") },
+            // Unlayered: the side panel beside the tabs
+            { ctrl + shift + "B", L("Show/Hide the side panel") },
             //3D control
 #ifdef __APPLE__
             { ctrl + shift + "M", L("Show/Hide 3Dconnexion devices settings dialog") },
@@ -271,7 +273,7 @@ void KBShortcutsDialog::fill_shortcuts()
             { "E", L("Gizmo brim ears") },
             { "I", L("Zoom in") },
             { "O", L("Zoom out") },
-            { "V", L("Toggle printable for object/part") },
+            { "V", L("Toggle printable for object/instance") },
             { std::string(L_CONTEXT("Menu", "Keyboard Shortcut")) + " / " + shift + "F10", L("Open the context menu for the selection") },
             { L_CONTEXT("Space", "Keyboard Shortcut"), L("Open actions speed dial") },
 

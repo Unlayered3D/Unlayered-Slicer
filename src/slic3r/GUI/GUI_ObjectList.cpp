@@ -2508,7 +2508,7 @@ void ObjectList::load_modifier(const wxArrayString& input_files, ModelObject& mo
                     input_file, LoadStrategy::LoadModel, nullptr, nullptr,
                     [&is_user_cancel, &linear, &angle, &split_compound](Slic3r::Step& file, double& linear_value,
                                                                                      double& angle_value, bool& is_split) -> int {
-                        if (wxGetApp().app_config->get_bool("enable_step_mesh_setting")) {
+                        if (step_mesh_dialog_wanted()) {
                             StepMeshDialog mesh_dlg(nullptr, file, linear, angle);
                             if (mesh_dlg.ShowModal() == wxID_OK) {
                                 linear_value = mesh_dlg.get_linear_deflection();

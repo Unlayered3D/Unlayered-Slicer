@@ -1,4 +1,5 @@
 #include "WebAppPresetShare.hpp"
+#include "WebAppDialogs.hpp"
 
 #include "WebAppBridge.hpp" // WebAppBridgeError
 #include "WebAppSettings.hpp"
@@ -506,7 +507,7 @@ InstallResult install_printer_preset(const fs::path& file, const wxString& tab_t
         return fail(WAB_INTERNAL, "no preset bundle");
     // The download took a while; the world may have moved on since the call was accepted.
     if (!mainframe->IsEnabled())
-        return fail(WAB_BUSY, "a dialog is open");
+        return fail(WAB_BUSY, WebAppDialogs::busy_message());
     if (app.plater() != nullptr && app.plater()->is_background_process_slicing())
         return fail(WAB_BUSY, "the slicer is busy slicing");
 
@@ -604,6 +605,7 @@ InstallResult install_printer_preset(const fs::path& file, const wxString& tab_t
                                              wxString::Format(_L("Also install the %s printer profiles"), wxString::FromUTF8(vendor.c_str()));
     bool install_vendor = false;
     {
+        WebAppDialogs::HumanOnlyScope persons_install; // the per-install confirmation is the consent
         PrinterProfileInstallDialog dlg(mainframe, wxString::Format(_L("Install printer profile from %s"), tab_title), summary, review,
                                         option);
         if (dlg.ShowModal() != wxID_OK) {

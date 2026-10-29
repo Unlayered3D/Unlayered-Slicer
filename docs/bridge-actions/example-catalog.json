@@ -1,0 +1,63 @@
+{
+  "catalogVersion": "example0000000001",
+  "total": 5,
+  "actions": [
+    {
+      "id": "edit.undo", "domain": "edit", "label": "Undo", "summary": "Undo the last edit on the plate, as Edit > Undo does.",
+      "risk": "mutate", "confirm": "none", "gate": "settings", "longRunning": false, "bridgeMethod": null,
+      "target": {"kind": "none", "required": false},
+      "params": {"type": "object", "additionalProperties": false, "properties": {}},
+      "effects": ["geometry", "structure", "plates"], "timeoutMs": 50000,
+      "ui": ["MainFrame.cpp::menu::Undo"], "examples": [{"target": null, "params": {}}], "since": "0.2.0",
+      "enabled": true, "disabledReason": null
+    },
+    {
+      "id": "object.mirror", "domain": "object", "label": "Mirror", "summary": "Mirror objects or parts along a plate axis.",
+      "risk": "mutate", "confirm": "none", "gate": "settings", "longRunning": false, "bridgeMethod": null,
+      "target": {"kind": "objects", "required": true},
+      "params": {"type": "object", "additionalProperties": false, "required": ["axis"],
+                 "properties": {"axis": {"type": "string", "enum": ["x", "y", "z"], "description": "Plate axis to mirror along."}}},
+      "effects": ["geometry"], "timeoutMs": 50000,
+      "ui": ["GUI_Factories.cpp::menu::Along X Axis", "GUI_Factories.cpp::menu::Along Y Axis", "GUI_Factories.cpp::menu::Along Z Axis"],
+      "examples": [{"target": {"objects": [{"index": 0}]}, "params": {"axis": "x"}}], "since": "0.2.0",
+      "enabled": true, "disabledReason": null
+    },
+    {
+      "id": "object.clone", "domain": "object", "label": "Clone", "summary": "Add copies of the selected objects as new objects, optionally arranging the plate.",
+      "risk": "mutate", "confirm": "none", "gate": "settings", "longRunning": true, "bridgeMethod": null,
+      "target": {"kind": "objects", "required": true},
+      "params": {"type": "object", "additionalProperties": false, "required": ["count"],
+                 "properties": {"count": {"type": "integer", "minimum": 1, "maximum": 100, "description": "Number of copies to add."},
+                                "arrange": {"type": "boolean", "default": true, "description": "Arrange the plate afterwards."}}},
+      "effects": ["structure", "plates"], "timeoutMs": 50000,
+      "ui": ["GUI_Factories.cpp::menu::Clone", "MainFrame.cpp::menu::Clone Selected"],
+      "examples": [{"target": {"objects": [{"index": 0}]}, "params": {"count": 2}}], "since": "0.2.0",
+      "enabled": false, "disabledReason": "nothing is selected"
+    },
+    {
+      "id": "preset.delete", "domain": "preset", "label": "Delete preset", "summary": "Delete a user preset. The person confirms in a slicer dialog.",
+      "risk": "destructive", "confirm": "native", "gate": "settings", "longRunning": false, "bridgeMethod": null,
+      "target": {"kind": "none", "required": false},
+      "params": {"type": "object", "additionalProperties": false, "required": ["type", "name"],
+                 "properties": {"type": {"type": "string", "enum": ["print", "filament", "printer"]},
+                                "name": {"type": "string", "minLength": 1, "maxLength": 200}}},
+      "effects": ["presets"], "timeoutMs": 50000,
+      "ui": ["Tab.cpp::tabbutton::m_btn_delete_preset"],
+      "examples": [{"target": null, "params": {"type": "filament", "name": "My PETG"}}], "since": "0.2.0",
+      "enabled": true, "disabledReason": null
+    },
+    {
+      "id": "settings.set", "domain": "settings", "label": "Change settings", "summary": "Change print, filament or printer settings as unsaved edits (typed method).",
+      "risk": "mutate", "confirm": "none", "gate": "settings", "longRunning": false, "bridgeMethod": "slicer.setSettings",
+      "target": {"kind": "none", "required": false},
+      "params": {"type": "object", "additionalProperties": false, "required": ["type"],
+                 "description": "Typed method: params are documented, not validated by the catalog. Also takes values: {key: value} (1-64 entries), which the dialect cannot express.",
+                 "properties": {"type": {"type": "string", "enum": ["print", "filament", "printer"]},
+                                "slot": {"type": "integer", "minimum": 0, "maximum": 63},
+                                "ifDirty": {"type": "string", "enum": ["ask", "discard", "prompt"], "default": "ask"}}},
+      "effects": ["settings"], "timeoutMs": 50000,
+      "ui": [], "examples": [], "since": "0.1.5",
+      "enabled": true, "disabledReason": null
+    }
+  ]
+}

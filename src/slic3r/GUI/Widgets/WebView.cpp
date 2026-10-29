@@ -4,6 +4,9 @@
 
 #include <boost/log/trivial.hpp>
 
+#include <cstdlib>
+#include <optional>
+
 #include <wx/webviewarchivehandler.h>
 #include <wx/webviewfshandler.h>
 #if wxUSE_WEBVIEW_EDGE
@@ -104,6 +107,9 @@ DWORD DownloadAndInstallWV2RT() {
 class WebViewEdge : public wxWebViewEdge
 {
 public:
+    WebViewEdge() = default;
+    explicit WebViewEdge(const wxWebViewConfiguration& config) : wxWebViewEdge(config) {}
+
     bool SetUserAgent(const wxString &userAgent) override
     {
         bool dark = userAgent.Contains("dark");
@@ -272,7 +278,9 @@ wxWebView* WebView::CreateWebView(wxWindow * parent, wxString const & url)
     BOOST_LOG_TRIVIAL(trace) << __FUNCTION__ << ": " << url2.ToUTF8();
 
 #ifdef __WIN32__
-    wxWebView* webView = new WebViewEdge;
+    wxWebView* webView = nullptr;
+    if (webView == nullptr)
+        webView = new WebViewEdge;
 #elif defined(__WXOSX__)
     wxWebView* webView = new WebViewWebKit;
 #else

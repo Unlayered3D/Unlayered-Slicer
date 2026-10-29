@@ -2,6 +2,7 @@
 
 #include <thread>
 
+#include <boost/algorithm/string/trim.hpp>
 #include <boost/format.hpp>
 #include <boost/log/trivial.hpp>
 
@@ -25,8 +26,19 @@ FeedCredential printer_feed_credential()
 {
     FeedCredential cred;
     AutoUpdater *updater = wxGetApp().auto_updater();
-    if (!updater)
-        return cred; // before post_init: no account object yet, so no site to bind a token to
+    if (!updater) {
+        // Before post_init, i.e. inside the first-run setup wizard (guide 21update): no account
+        // object yet. Read the stored sign-in the way AutoUpdater::stored_sign_in() does - no
+        // network - and bind the token to the same configured site.
+        AppConfig *config = wxGetApp().app_config;
+        if (!config)
+            return cred;
+        UnlayeredAccount account(boost::algorithm::trim_copy(config->get(SETTING_ACCOUNT_PROVIDER_URL)));
+        account.load();
+        cred.site_url = account.site_url();
+        cred.token    = account.device_token();
+        return cred;
+    }
     UnlayeredAccount &account = updater->account();
     cred.site_url             = account.site_url();
     cred.token                = account.device_token();
@@ -61,36 +73,52 @@ PrinterUpdateSkips PrinterUpdateOffer::skips() const
         });
 }
 
+PrinterUpdateOffer::Request PrinterUpdateOffer::make_request(const std::string &host, const std::string &password)
+{
+    Request req;
+    req.host          = host;
+    req.password      = password;
+    AppConfig *config = wxGetApp().app_config;
+    req.api_base      = config ? config->github_api_base() : std::string();
+    // Stealth mode keeps the anonymous checks only, as AutoUpdater does: the firmware feed is
+    // public and asks nothing about who is asking, the configuration feed needs the account.
+    req.credential = printer_feed_credential();
+    req.ask_config = !req.credential.empty() && config && !config->get_stealth_mode();
+    return req;
+}
+
 void PrinterUpdateOffer::on_printer_selected(const DynamicPrintConfig &printer_config)
 {
     const auto *host_type = printer_config.option<ConfigOptionEnum<PrintHostType>>("host_type");
     if (!host_type || host_type->value != htUnlayered || !printer_config.has("print_host"))
         return;
-    Request req;
-    req.host = printer_config.opt_string("print_host");
-    if (req.host.empty())
+    const std::string host = printer_config.opt_string("print_host");
+    if (host.empty())
         return; // a USB-only printer is updated from its dialog; nothing here scans ports
-    if (m_hosts.count(req.host))
+    // Asked for by the setup wizard (guide 21update): checked again even when this session already
+    // did, one at a time. The retry delay for a printer that did not answer still applies.
+    const bool after_setup = m_app.app_config && m_app.app_config->get(CHECK_AFTER_SETUP_KEY) == "1";
+    if (after_setup ? m_after_setup_busy : m_hosts.count(host) > 0)
         return;
-    if (auto it = m_retry_at.find(req.host); it != m_retry_at.end() && std::chrono::steady_clock::now() < it->second)
+    if (auto it = m_retry_at.find(host); it != m_retry_at.end() && std::chrono::steady_clock::now() < it->second)
         return;
-    m_hosts.insert(req.host);
+    m_hosts.insert(host);
+    if (after_setup)
+        m_after_setup_busy = true;
 
-    if (printer_config.has("printhost_apikey"))
-        req.password = printer_config.opt_string("printhost_apikey");
+    Request req = make_request(host, printer_config.has("printhost_apikey") ? printer_config.opt_string("printhost_apikey") : std::string());
     req.preset_name = wxGetApp().preset_bundle ? wxGetApp().preset_bundle->printers.get_edited_preset().name : std::string();
-    req.api_base    = m_app.app_config->github_api_base();
-    // Stealth mode keeps the anonymous checks only, as AutoUpdater does: the firmware feed is
-    // public and asks nothing about who is asking, the configuration feed needs the account.
-    req.credential = printer_feed_credential();
-    req.ask_config = !req.credential.empty() && !m_app.app_config->get_stealth_mode();
+    req.after_setup = after_setup;
 
-    BOOST_LOG_TRIVIAL(info) << "printer updates: checking " << req.host << (req.ask_config ? " (firmware and configuration)" : " (firmware)");
+    BOOST_LOG_TRIVIAL(info) << "printer updates: checking " << req.host << (req.ask_config ? " (firmware and configuration)" : " (firmware)")
+                            << (req.after_setup ? ", asked for by the setup wizard" : "");
     auto alive = m_alive;
     std::thread([this, alive, req]() {
         Answer answer = check(req);
         wxGetApp().CallAfter([this, alive, req, answer]() {
-            if (*alive)
+            // Not while closing: m_alive stays true until OnExit, but on_checked uses the plater,
+            // which the main frame's destruction has already freed by then.
+            if (*alive && !wxGetApp().is_closing())
                 on_checked(req, answer);
         });
     }).detach();
@@ -167,8 +195,36 @@ PrinterUpdateOffer::Answer PrinterUpdateOffer::check(const Request &req)
     return a;
 }
 
+void PrinterUpdateOffer::check_now(const std::string &host, const std::string &password, std::shared_ptr<std::atomic<bool>> alive,
+                                   std::function<void(const CheckResult &)> done)
+{
+    const Request req = make_request(host, password);
+    BOOST_LOG_TRIVIAL(info) << "printer updates: setup wizard checks " << req.host
+                            << (req.ask_config ? " (firmware and configuration)" : " (firmware)");
+    std::thread([alive, req, done]() {
+        const Answer a = check(req);
+        CheckResult  r;
+        r.reachable    = a.reachable;
+        r.error        = a.error;
+        r.machine_name = a.board.machine_name;
+        r.facts        = a.facts;
+        r.config_asked = a.config_asked;
+        r.outcome      = classify_printer_update_check(a.reachable, a.facts);
+        BOOST_LOG_TRIVIAL(info) << "printer updates: setup wizard check of " << req.host << ": outcome " << int(r.outcome)
+                                << ", firmware " << a.facts.running_firmware << " -> '" << a.facts.available_firmware
+                                << "', configuration " << (a.facts.config_known ? a.facts.installed_config : std::string("unknown"))
+                                << " -> '" << a.facts.available_config << "'" << (a.error.empty() ? "" : " (" + a.error + ")");
+        wxGetApp().CallAfter([alive, r, done]() {
+            if (alive && *alive && !wxGetApp().is_closing())
+                done(r);
+        });
+    }).detach();
+}
+
 void PrinterUpdateOffer::on_checked(const Request &req, const Answer &a)
 {
+    if (req.after_setup)
+        m_after_setup_busy = false;
     if (!a.reachable) {
         // Not a check: the printer may simply be off. Let a later selection try again, not soon.
         BOOST_LOG_TRIVIAL(info) << "printer updates: " << req.host << " did not answer (" << a.error << ")";
@@ -181,16 +237,39 @@ void PrinterUpdateOffer::on_checked(const Request &req, const Answer &a)
                             << ", configuration " << (f.config_known ? f.installed_config : std::string("unknown"))
                             << "; feeds offer firmware '" << f.available_firmware << "', configuration '"
                             << f.available_config << "'";
-    if (!m_boards.insert(f.board_id).second)
+    if (!m_boards.insert(f.board_id).second && !req.after_setup)
         return; // the same machine, reached at another address this session
 
-    const PrinterUpdateDecision decision = decide_printer_update(f, skips());
-    if (!decision.any())
-        return;
+    // Asked for by the setup wizard: done once a feed has answered, whatever it said. "Skip this
+    // version" is not consulted - the person asked - and "up to date" is said too.
+    if (req.after_setup) {
+        if (classify_printer_update_check(true, f) == PrinterUpdateCheckOutcome::NoFeed) {
+            BOOST_LOG_TRIVIAL(info) << "printer updates: no feed answered; the setup wizard's check stays pending";
+            return;
+        }
+        m_app.app_config->set(CHECK_AFTER_SETUP_KEY, "");
+    }
+
+    const PrinterUpdateDecision decision = decide_printer_update(f, req.after_setup ? no_printer_update_skips() : skips());
 
     Plater *plater = m_app.plater();
     if (!plater || !plater->get_notification_manager())
         return;
+
+    if (!decision.any()) {
+        if (req.after_setup) {
+            const std::string who  = !a.board.machine_name.empty() ? a.board.machine_name : req.preset_name;
+            std::string       text = (boost::format(_u8L("Your Unlayered printer %1% is up to date: firmware %2%")) %
+                                (who.empty() ? req.host : who) % f.running_firmware).str();
+            if (f.config_known && !f.available_config.empty())
+                text += "\n" + (boost::format(_u8L("Printer settings %1%")) % f.installed_config).str();
+            else if (!a.config_asked)
+                text += "\n" + _u8L("Sign in to Unlayered (Help menu) to check its printer settings too.");
+            plater->get_notification_manager()->push_notification(NotificationType::UnlayeredPrinterUpdateAvailable,
+                                                                  NotificationManager::NotificationLevel::RegularNotificationLevel, text);
+        }
+        return;
+    }
 
     std::string text;
     if (decision.firmware && decision.config)

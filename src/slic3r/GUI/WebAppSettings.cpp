@@ -1,6 +1,8 @@
 #include "WebAppSettings.hpp"
 
+#include "GUI_App.hpp"
 #include "PartPlate.hpp"
+#include "Tab.hpp"
 #include "libslic3r/GCode/GCodeProcessor.hpp"
 #include "libslic3r/Print.hpp"
 #include "libslic3r/PrintConfig.hpp"
@@ -262,6 +264,100 @@ json slice_summary_json(PartPlate* plate)
         summary["cost"]       = stats.total_cost;
     }
     return summary;
+}
+
+// Per-variant settings: see the header.
+VariantKeys variant_keys_for(Preset::Type type)
+{
+    switch (type) {
+    case Preset::TYPE_PRINT: return {"print_extruder_id", "print_extruder_variant", &print_options_with_variant};
+    case Preset::TYPE_FILAMENT: return {"", "filament_extruder_variant", &filament_options_with_variant};
+    default: return {"printer_extruder_id", "printer_extruder_variant", &printer_options_with_variant_1};
+    }
+}
+
+// Values per variant: 1, or 2 for the printer's machine limits (normal and silent mode).
+int variant_stride(Preset::Type type, const std::string& key)
+{
+    if (type == Preset::TYPE_PRINTER && printer_options_with_variant_2.count(key) > 0)
+        return 2;
+    return variant_keys_for(type).keys->count(key) > 0 ? 1 : 0;
+}
+
+int printer_extruder_count()
+{
+    PresetBundle* bundle = wxGetApp().preset_bundle;
+    const auto*   types  = bundle != nullptr ? bundle->printers.get_edited_preset().config.option<ConfigOptionEnumsGeneric>("extruder_type")
+                                             : nullptr;
+    return types != nullptr ? int(types->values.size()) : 0;
+}
+
+// The variant index `extruder` edits in `cfg` (a config of `tab`'s type), or -1.
+int variant_index_for(Tab& tab, const DynamicPrintConfig& cfg, int extruder)
+{
+    PresetBundle* bundle = wxGetApp().preset_bundle;
+    if (bundle == nullptr || extruder < 0 || extruder >= printer_extruder_count())
+        return -1;
+    const auto*       types = bundle->printers.get_edited_preset().config.option<ConfigOptionEnumsGeneric>("extruder_type");
+    const VariantKeys vk    = variant_keys_for(tab.type());
+    return cfg.get_index_for_extruder(extruder + 1, vk.id_name, ExtruderType(types->values[extruder]),
+                                      tab.get_actual_nozzle_volume_type(extruder), vk.variant_name);
+}
+
+// getSettingsSchema's `variants`: which index each extruder edits, and what the variant is.
+json variants_json(Tab& tab, const DynamicPrintConfig& cfg)
+{
+    json        out = json::array();
+    const auto* names = cfg.option<ConfigOptionStrings>(variant_keys_for(tab.type()).variant_name);
+    for (int e = 0; e < printer_extruder_count(); ++e) {
+        const int index = variant_index_for(tab, cfg, e);
+        json      v     = {{"extruder", e}, {"index", index}};
+        if (names != nullptr && index >= 0 && index < int(names->values.size()))
+            v["variant"] = names->values[index];
+        out.push_back(std::move(v));
+    }
+    return out;
+}
+
+// The serialised value(s) of one variant of `key`: stride values from index * stride.
+std::string variant_value_text(const ConfigOption* opt, int index, int stride)
+{
+    const auto* vec = dynamic_cast<const ConfigOptionVectorBase*>(opt);
+    if (vec == nullptr)
+        return opt->serialize();
+    const std::vector<std::string> all = vec->vserialize();
+    std::string                    out;
+    for (int j = 0; j < stride; ++j)
+        if (size_t(index * stride + j) < all.size())
+            out += (out.empty() ? "" : ",") + all[size_t(index * stride + j)];
+    return out;
+}
+
+bool apply_tab_couplings(Tab& tab, const ConfigBase& config, const std::vector<std::string>& keys)
+{
+    // Each wants the boost::any the field would have produced (Tab.cpp casts).
+    bool coupled = false;
+    for (const std::string& key : keys) {
+        if (key == "pellet_flow_coefficient" || key == "filament_diameter") {
+            if (auto* floats = dynamic_cast<const ConfigOptionFloats*>(config.option(key)); floats != nullptr && !floats->values.empty()) {
+                tab.on_value_change(key, boost::any(floats->values.front()));
+                coupled = true;
+            }
+        } else if (key == "enable_prime_tower" || key == "single_extruder_multi_material" || key == "purge_in_prime_tower") {
+            if (auto* flag = dynamic_cast<const ConfigOptionBool*>(config.option(key)); flag != nullptr) {
+                tab.on_value_change(key, boost::any(flag->value));
+                coupled = true;
+            }
+        } else if (key == "gcode_flavor") {
+            tab.on_value_change(key, boost::any());
+            coupled = true;
+        }
+    }
+    if (coupled) {
+        tab.update_dirty();
+        tab.reload_config();
+    }
+    return coupled;
 }
 
 } // namespace WebAppSettings

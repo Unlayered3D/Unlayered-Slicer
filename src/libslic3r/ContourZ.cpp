@@ -66,6 +66,11 @@ static bool contour_extrusion_path(LayerRegion *region, const ContourZSurface &s
 
 	    //BOOST_LOG_TRIVIAL(info) << "contour_extrusion_path: role=" << path.role();
 
+    // UNLAYERED_MOD: a nonplanar layers shell path already follows the surface.
+    // A path contoured before (nonplanar layers: the planar layer under a curved shell) keeps its Z.
+    if (path.nonplanar_shell || path.z_contoured)
+        return false;
+
     if (path.role() != erTopSolidInfill && path.role() != erIroning && path.role() != erExternalPerimeter && path.role() != erPerimeter) {
             //BOOST_LOG_TRIVIAL(info) << "contour_extrusion_path: skipping role=" << path.role();
 

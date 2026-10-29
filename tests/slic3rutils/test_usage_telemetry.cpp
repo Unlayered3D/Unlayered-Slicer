@@ -422,6 +422,58 @@ TEST_CASE("Usage diagnostics crash marker names the callers", "[UsageTelemetry]"
     boost::system::error_code ec;
     fs::remove_all(dir, ec);
 }
+
+#if defined(_M_X64)
+// A hang says where the main thread is stuck: its top frame (a wait inside Windows), then the
+// callers from the first frame outside Windows' own modules -- here, this test program.
+__declspec(noinline) void hang_here_for(DWORD ms) { ::Sleep(ms); }
+
+TEST_CASE("Usage diagnostics hang marker names where the main thread waits", "[UsageTelemetry]")
+{
+    const std::string old_data_dir = data_dir();
+    fs::path dir = fs::temp_directory_path() / fs::unique_path("usage-hang-%%%%-%%%%");
+    fs::create_directories(dir / "usage");
+    set_data_dir(dir.string());
+    AppConfig config;
+    config.set("usage_diagnostics_url", "http://127.0.0.1:9/api/slicer/telemetry");
+    config.set("usage_diagnostics_hang_s", "1");
+    grant(config);
+    UsageTelemetry::start(config, false);
+    if (UsageTelemetry::disabled_by_environment()) {
+        UsageTelemetry::shutdown();
+        set_data_dir(old_data_dir);
+        SKIP("UNLAYERED_NO_TELEMETRY is set on this machine");
+    }
+    auto marker = [&]() {
+        for (fs::directory_iterator it(dir / "usage"), end; it != end; ++it)
+            if (it->path().filename().string().rfind("session-", 0) == 0)
+                return json::parse(slurp(it->path()), nullptr, false);
+        return json();
+    };
+    UsageTelemetry::heartbeat(); // this thread is the one that beats
+    hang_here_for(8000);         // the watchdog looks every 5 s; 1 s without a beat is a hang here
+
+    json hung = marker();
+    INFO(hung.dump());
+    REQUIRE(hung.is_object());
+    CHECK(hung.value("exception", std::string()) == "hang");
+    const std::string at = hung.value("at", std::string());
+    CHECK(at.find("slic3rutils_tests.exe+0x") != std::string::npos);
+    CHECK(at.rfind("slic3rutils_tests.exe", 0) != 0); // the top frame is the wait, inside Windows
+    CHECK(at.find('\\') == std::string::npos);
+
+    // Beating again clears both.
+    UsageTelemetry::heartbeat();
+    json again = marker();
+    CHECK(!again.contains("exception"));
+    CHECK(!again.contains("at"));
+
+    UsageTelemetry::shutdown();
+    set_data_dir(old_data_dir);
+    boost::system::error_code ec;
+    fs::remove_all(dir, ec);
+}
+#endif
 #endif
 
 // Real Application-log events (EvtRenderEventXml) from a Windows 11 machine, paths shortened.

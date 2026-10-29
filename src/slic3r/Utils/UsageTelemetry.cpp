@@ -109,6 +109,7 @@ struct State
     std::atomic<int64_t>    last_beat_ms{0}; // steady clock; 0 until the first beat
     int64_t                 hang_after_ms{HANG_AFTER_MS};
     std::atomic<bool>       hung{false};
+    std::string             hang_at; // where the main thread was when it stopped beating (Windows)
     bool                    watchdog_running{false};
     std::condition_variable watchdog_wake;
     int64_t                 alive_written_ms{0}; // steady clock
@@ -330,8 +331,11 @@ void write_marker_locked(State &s)
                    {"alive", alive},       {"phase", s.phase},     {"consented", s.on.load()}};
     // A session that dies while frozen (typically force-quit) is a hang, not a crash. A crash
     // handler that runs later rewrites the marker with the signal or exception instead.
-    if (s.hung)
+    if (s.hung) {
         marker["exception"] = "hang";
+        if (!s.hang_at.empty())
+            marker["at"] = s.hang_at;
+    }
     write_file(marker_path(s.session), marker.dump());
     s.alive_written_ms = steady_ms();
     copy_cstr(g_crash_marker.path, sizeof(g_crash_marker.path), marker_path(s.session).string());
@@ -341,6 +345,9 @@ void write_marker_locked(State &s)
     g_crash_marker.alive   = alive;
     g_crash_marker.consented = s.on.load();
 }
+
+void hang_location(char *out, size_t size);
+void sanitize_token(char *s);
 
 // Marks the marker "hang" while the main thread has not called heartbeat() for HANG_AFTER_S, and
 // refreshes "alive" every minute. Detached on purpose: see state().
@@ -359,7 +366,22 @@ void watchdog_loop()
                 BOOST_LOG_TRIVIAL(warning) << "usage diagnostics: the main thread has not responded for "
                                            << (now - beat) / 1000 << " s";
             s.hung = hung;
+            s.hang_at.clear();
             write_marker_locked(s);
+            if (hung) {
+                // Then where the main thread is stuck (Windows). Not under the mutex: if the walk itself
+                // blocks (the main thread holding the loader lock), the marker already says "hang", and
+                // a heartbeat that comes back can still take the mutex.
+                char at[200];
+                lock.unlock();
+                hang_location(at, sizeof(at));
+                sanitize_token(at);
+                lock.lock();
+                if (s.started && s.hung && at[0]) {
+                    s.hang_at = at;
+                    write_marker_locked(s);
+                }
+            }
         } else if (now - s.alive_written_ms >= ALIVE_EVERY_MS)
             write_marker_locked(s);
     }
@@ -437,6 +459,28 @@ void code_location_raw(const void *address, char *out, size_t size)
 }
 
 #if defined(_M_X64)
+// One frame up from `ctx`, from the unwind tables. False when there is nothing more to read.
+bool unwind_one(CONTEXT &ctx)
+{
+    DWORD64 image_base = 0;
+    PRUNTIME_FUNCTION entry = RtlLookupFunctionEntry(ctx.Rip, &image_base, nullptr);
+    if (!entry) {
+        // A leaf function (strlen, a tiny accessor, a system call stub) has no unwind data and has
+        // not touched the stack pointer: its return address is at the top of the stack.
+        __try {
+            ctx.Rip = *reinterpret_cast<const DWORD64 *>(ctx.Rsp);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            return false;
+        }
+        ctx.Rsp += sizeof(DWORD64);
+    } else {
+        PVOID   handler_data = nullptr;
+        DWORD64 establisher  = 0;
+        RtlVirtualUnwind(UNW_FLAG_NHANDLER, image_base, ctx.Rip, entry, &ctx, &handler_data, &establisher, nullptr);
+    }
+    return ctx.Rip != 0;
+}
+
 // Appends ">module+0xoffset" for the callers of the faulting function (up to 5), so a crash inside a
 // library call (imgui, wx, the GL driver) names who made it. Walks the unwind tables from the
 // exception's own CONTEXT: no allocation, nothing is read through a guessed pointer.
@@ -446,23 +490,7 @@ void append_caller_chain(const CONTEXT *record, char *out, size_t size)
         return;
     CONTEXT ctx = *record;
     for (int frame = 0; frame < 5; ++frame) {
-        DWORD64 image_base = 0;
-        PRUNTIME_FUNCTION entry = RtlLookupFunctionEntry(ctx.Rip, &image_base, nullptr);
-        if (!entry) {
-            // A leaf function (strlen, a tiny accessor) has no unwind data and has not touched the stack
-            // pointer: its return address is at the top of the stack.
-            __try {
-                ctx.Rip = *reinterpret_cast<const DWORD64 *>(ctx.Rsp);
-            } __except (EXCEPTION_EXECUTE_HANDLER) {
-                return;
-            }
-            ctx.Rsp += sizeof(DWORD64);
-        } else {
-            PVOID   handler_data = nullptr;
-            DWORD64 establisher  = 0;
-            RtlVirtualUnwind(UNW_FLAG_NHANDLER, image_base, ctx.Rip, entry, &ctx, &handler_data, &establisher, nullptr);
-        }
-        if (ctx.Rip == 0)
+        if (!unwind_one(ctx))
             return;
         char one[80];
         code_location_raw(reinterpret_cast<const void *>(ctx.Rip), one, sizeof(one));
@@ -471,6 +499,91 @@ void append_caller_chain(const CONTEXT *record, char *out, size_t size)
             return;
         std::snprintf(out + used, size - used, ">%s", one);
     }
+}
+
+// The thread heartbeat() runs on (the main thread), for where a hang is; set by its first beat.
+std::atomic<HANDLE> g_beat_thread{nullptr};
+wchar_t             g_windows_dir[MAX_PATH] = {0};
+
+// Code in a module under the Windows folder: ntdll, user32, a GPU driver from the DriverStore.
+bool in_windows_module(DWORD64 address)
+{
+    HMODULE module = nullptr;
+    if (g_windows_dir[0] == 0 ||
+        !GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                            reinterpret_cast<LPCWSTR>(address), &module) || !module)
+        return false;
+    wchar_t path[MAX_PATH] = {0};
+    if (GetModuleFileNameW(module, path, MAX_PATH) == 0)
+        return false;
+    return _wcsnicmp(path, g_windows_dir, wcslen(g_windows_dir)) == 0;
+}
+
+// The main thread's top frame, then up to 5 callers from the first frame outside Windows' own
+// modules (a hung thread's top frames are nearly always a wait inside ntdll or user32), with ">.."
+// where frames were skipped. Only reads: no allocation, faults while walking are caught.
+void walk_hang_stack(const CONTEXT &start, char *out, size_t size)
+{
+    CONTEXT ctx = start;
+    __try {
+        code_location_raw(reinterpret_cast<const void *>(ctx.Rip), out, size);
+        bool own = !in_windows_module(ctx.Rip), skipped = false;
+        for (int frame = 0, emitted = 0; frame < 64 && emitted < 5 && unwind_one(ctx); ++frame) {
+            if (!own) {
+                if (in_windows_module(ctx.Rip)) {
+                    skipped = true;
+                    continue;
+                }
+                own = true;
+            }
+            char one[80];
+            code_location_raw(reinterpret_cast<const void *>(ctx.Rip), one, sizeof(one));
+            const char  *sep  = skipped && emitted == 0 ? ">..>" : ">";
+            const size_t used = std::strlen(out);
+            if (used + std::strlen(sep) + std::strlen(one) + 1 >= size)
+                break;
+            std::snprintf(out + used, size - used, "%s%s", sep, one);
+            ++emitted;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+}
+
+// Where the main thread is right now. It is suspended only for GetThreadContext (nothing that could
+// wait on a lock it holds runs meanwhile), then walked running: a hung thread's stack stays put.
+void hang_location(char *out, size_t size)
+{
+    out[0]        = 0;
+    HANDLE thread = g_beat_thread.load();
+    if (!thread || ::GetThreadId(thread) == ::GetCurrentThreadId())
+        return;
+    CONTEXT ctx{};
+    ctx.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
+    if (::SuspendThread(thread) == DWORD(-1))
+        return;
+    const BOOL got = ::GetThreadContext(thread, &ctx);
+    ::ResumeThread(thread);
+    if (got)
+        walk_hang_stack(ctx, out, size);
+}
+
+void remember_beat_thread()
+{
+    if (g_beat_thread.load())
+        return;
+    if (g_windows_dir[0] == 0) {
+        const UINT n = ::GetWindowsDirectoryW(g_windows_dir, MAX_PATH);
+        if (n == 0 || n >= MAX_PATH - 1)
+            g_windows_dir[0] = 0;
+        else if (g_windows_dir[n - 1] != L'\\') {
+            g_windows_dir[n]     = L'\\';
+            g_windows_dir[n + 1] = 0;
+        }
+    }
+    HANDLE thread = nullptr;
+    if (::DuplicateHandle(::GetCurrentProcess(), ::GetCurrentThread(), ::GetCurrentProcess(), &thread,
+                          THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_LIMITED_INFORMATION, FALSE, 0))
+        g_beat_thread = thread; // kept for the life of the process
 }
 #else
 void append_caller_chain(const CONTEXT *, char *, size_t) {}
@@ -489,6 +602,11 @@ LONG WINAPI crash_filter(EXCEPTION_POINTERS *info)
     }
     return g_previous_filter ? g_previous_filter(info) : EXCEPTION_CONTINUE_SEARCH;
 }
+#endif
+
+#if !defined(_WIN32) || !defined(_M_X64)
+void hang_location(char *out, size_t) { out[0] = 0; }
+void remember_beat_thread() {}
 #endif
 
 #ifndef _WIN32
@@ -564,7 +682,7 @@ void append_str(char *&p, char *end, const char *s)
 // addresses of up to five of the slicer's own frames below it, as offsets into the executable (the
 // same ">" chain the Windows filter writes). The faulting instruction comes from the signal's saved
 // context: backtrace() from inside the handler would start at the handler and skip it.
-// "ext" first when the fault itself is outside it (a system library, Python): abort() is one.
+// "ext.<arch>" first when the fault itself is outside it (a system library, Python): abort() is one.
 // Symbolicate an offset with
 //   atos -arch arm64 -o UnlayeredSlicer.app/Contents/MacOS/UnlayeredSlicer -l 0x100000000 <0x100000000 + offset>
 // using the very build that crashed (the version and arch are in the event).
@@ -592,8 +710,15 @@ void crash_location(const ucontext_t *uc, char *out, size_t size)
         append_str(p, end, "UnlayeredSlicer.x86_64+");
 #endif
         append_hex(p, end, pc - g_main_begin);
-    } else
-        append_str(p, end, "ext");
+    } else {
+        // Which slice of the universal binary the offsets that follow belong to: without it the
+        // offsets of an "ext" crash cannot be symbolized.
+#if defined(__arm64__)
+        append_str(p, end, "ext.arm64");
+#else
+        append_str(p, end, "ext.x86_64");
+#endif
+    }
 
     int       frames = 0;
     uintptr_t last   = pc;
@@ -1008,8 +1133,15 @@ void start(AppConfig &config, bool first_run)
             json props = {{"version", marker.value("version", std::string())}};
             // Where it was and what ended it (older markers have neither).
             for (const char *key : {"phase", "exception", "at", "recorded_by"})
-                if (marker.contains(key) && marker[key].is_string() && !marker[key].get<std::string>().empty())
-                    props[key] = marker[key].get<std::string>().substr(0, 190);
+                if (marker.contains(key) && marker[key].is_string() && !marker[key].get<std::string>().empty()) {
+                    std::string value = marker[key].get<std::string>();
+                    if (value.size() > 190) {
+                        // A caller chain is cut at a frame boundary, never inside "module+0x...".
+                        const size_t frame = value.rfind('>', 190);
+                        value.resize(frame != std::string::npos && frame > 0 ? frame : 190);
+                    }
+                    props[key] = std::move(value);
+                }
             // "alive" is refreshed by every flush, so this is the uptime to within a few minutes.
             int64_t started = marker.value("started", int64_t(0)), alive = marker.value("alive", started);
             if (started > 0 && alive >= started)
@@ -1059,6 +1191,7 @@ void start(AppConfig &config, bool first_run)
 void heartbeat()
 {
     State &s = state();
+    remember_beat_thread();
     s.last_beat_ms = steady_ms();
     if (s.hung.load()) {
         std::lock_guard<std::mutex> lock(s.mutex);
@@ -1354,8 +1487,10 @@ std::string redact_message(const std::string &message, const std::vector<std::st
     static const std::regex quoted(R"("[^"]*"|'[^']*'|\xE2\x80\x9C.*?\xE2\x80\x9D|\xC2\xAB.*?\xC2\xBB)");
     out = std::regex_replace(out, quoted, "<...>");
     // A path runs on through directory names with spaces in them (C:\Users\Jane Smith\...): every
-    // part followed by a separator is still the path. Hiding too much is the safe direction.
-    static const std::regex path(R"([A-Za-z]:[\\/](?:[^\\/\n]*[\\/])*\S*|\\\\(?:[^\\/\n]*[\\/])*\S*|(^|\s)/(?:[^/\n]*/)+\S*)");
+    // part followed by a separator is still the path. Hiding too much is the safe direction. Paths
+    // from the home folder (~/...), relative ones (./, ../) and any word with two separators in it
+    // (Clouds/MEGA/ArcWelder) are paths too.
+    static const std::regex path(R"([A-Za-z]:[\\/](?:[^\\/\n]*[\\/])*\S*|\\\\(?:[^\\/\n]*[\\/])*\S*|(^|\s)(?:/(?:[^/\n]*/)+\S*|(?:~|\.\.?)[\\/](?:[^\\/\n]*[\\/])*\S*|[^\s\\/:]+(?:[\\/][^\s\\/]*){2,}))");
     out = std::regex_replace(out, path, "$1<path>");
     // A model, project or G-code file named without a path.
     static const std::regex file(R"(\S*\.(?:stl|3mf|obj|step|stp|amf|ply|gcode|bgcode|gco|svg|drc|zip)\b)", std::regex::icase);

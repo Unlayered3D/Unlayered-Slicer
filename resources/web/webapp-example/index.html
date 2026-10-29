@@ -26,21 +26,22 @@
 
   ---------------------------------------------------------------------------------------------
 
-  A minimal, complete client for the Unlayered Slicer Web App Bridge. It exercises every method
-  and event in protocol v1 -- including the preset-settings family behind the per-tab opt-in --
-  and is deliberately dependency-free, unbuilt and readable top to bottom. It doubles as the
-  acceptance harness for the bridge: if a method works here, it works.
+  A complete client for the web-app bridge. It can call every method and shows every event in
+  WEB_APP_BRIDGE.md (protocol v1): the open methods, the settings family, the plate edits, the
+  slicing modes and slice issues, the export family and plate hand-off, printer profiles, the
+  printer family and the action catalog with turns and undoTurn. It is dependency-free, unbuilt
+  and readable top to bottom. It is also the acceptance harness for the bridge: if a method works
+  here, it works.
 
   This file is MIT-licensed, unlike the rest of this repository (AGPL-3.0), so that it can be
   copied wholesale into a web application under any licence. Copy it. That is what it is for.
 
-  The protocol is specified in WEB_APP_BRIDGE.md at the repository root.
-
-  To point the slicer at this page, set in Preferences > General > Web application:
-      Address:  file:///<resources dir>/web/webapp-example/index.html
-  ...or, more usefully, serve this directory over http://127.0.0.1:<port>/ and use that.
-  Note that a file:// address is not a trusted origin, so the bridge will report itself absent --
-  which is itself a useful thing to see this page do.
+  To try it: serve this directory over http://127.0.0.1:<port>/ (for example
+  `python -m http.server 8765`) and set Preferences > Advanced > Web apps & services >
+  Web-app tab URL (or Side panel URL) to that address. Then turn on the permissions you want to
+  exercise next to it. A file:// address is not a trusted origin, so the bridge reports itself
+  absent -- which is a useful thing to see this page do. In an ordinary browser every button
+  stays disabled and the page explains why.
 -->
 <style>
   :root {
@@ -55,111 +56,130 @@
   }
   * { box-sizing: border-box; }
   body {
-    margin: 0; padding: 24px; background: var(--bg); color: var(--fg);
+    margin: 0; padding: 24px 16px; background: var(--bg); color: var(--fg);
     font-family: "Segoe UI", -apple-system, BlinkMacSystemFont, Roboto, Arial, sans-serif;
     font-size: 14px; line-height: 1.55;
   }
-  main { max-width: 760px; margin: 0 auto; }
+  main { max-width: 860px; margin: 0 auto; }
   h1 { font-size: 20px; margin: 0 0 4px; }
   h2 { font-size: 14px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted);
        margin: 28px 0 10px; font-weight: 600; }
-  .sub { color: var(--muted); margin: 0 0 24px; }
+  h3 { font-size: 13px; margin: 14px 0 8px; color: var(--muted); font-weight: 600; }
+  .sub { color: var(--muted); margin: 0 0 16px; }
   section { background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: 18px; }
   .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-bottom: 10px; }
   input[type=text] {
-    flex: 1 1 260px; font: inherit; padding: 7px 10px; border-radius: 5px;
+    flex: 1 1 220px; min-width: 0; font: inherit; padding: 7px 10px; border-radius: 5px;
     border: 1px solid var(--line); background: var(--bg); color: var(--fg);
   }
   button {
-    font: inherit; font-weight: 500; padding: 7px 16px; border-radius: 5px;
+    font: inherit; font-weight: 500; padding: 7px 14px; border-radius: 5px;
     border: 1px solid var(--btn-bg); background: var(--btn-bg); color: var(--btn-fg); cursor: pointer;
   }
   button.ghost { background: transparent; color: var(--fg); border-color: var(--line); }
   button:disabled { opacity: .45; cursor: default; }
   pre {
     background: var(--code-bg); border: 1px solid var(--line); border-radius: 5px;
-    padding: 12px; overflow: auto; max-height: 260px; margin: 0;
+    padding: 12px; overflow: auto; max-height: 320px; margin: 0;
     font-family: Consolas, "SF Mono", Menlo, monospace; font-size: 12.5px;
   }
   .pill { display: inline-block; padding: 2px 9px; border-radius: 999px; font-size: 12px;
           border: 1px solid var(--line); }
   .pill.ok { color: var(--ok); border-color: var(--ok); }
   .pill.err { color: var(--err); border-color: var(--err); }
-  .log { font-family: Consolas, "SF Mono", Menlo, monospace; font-size: 12.5px; }
-  .log div { padding: 2px 0; border-bottom: 1px solid var(--line); }
+  .log { font-family: Consolas, "SF Mono", Menlo, monospace; font-size: 12.5px; max-height: 340px; overflow: auto; }
+  .log div { padding: 2px 0; border-bottom: 1px solid var(--line); word-break: break-word; }
   .log .e { color: var(--err); }
   .log .o { color: var(--ok); }
   .log .ev { color: var(--muted); }
   .log .ev b { color: var(--fg); font-weight: 600; }
-  .mrow { display: flex; gap: 8px; align-items: flex-start; margin-bottom: 8px; }
-  .mrow code { flex: 0 0 200px; padding-top: 8px; font-size: 12px; word-break: break-all; }
+  .mrow { display: flex; gap: 8px; align-items: flex-start; margin-bottom: 8px; flex-wrap: wrap; }
+  .mrow code { flex: 0 0 210px; padding-top: 8px; font-size: 12px; word-break: break-all; }
   .mrow textarea {
-    flex: 1 1 280px; min-height: 34px; resize: vertical; padding: 6px 8px; border-radius: 5px;
+    flex: 1 1 260px; min-width: 0; min-height: 34px; resize: vertical; padding: 6px 8px; border-radius: 5px;
     border: 1px solid var(--line); background: var(--bg); color: var(--fg);
     font-family: Consolas, "SF Mono", Menlo, monospace; font-size: 12.5px;
   }
   .mrow button { flex: 0 0 auto; }
+  img.thumb { max-width: 240px; border: 1px solid var(--line); border-radius: 5px; display: block; margin-top: 8px; }
   footer { color: var(--muted); font-size: 12.5px; margin-top: 28px; }
   a { color: inherit; }
+  label { display: inline-flex; gap: 6px; align-items: center; }
 </style>
 </head>
 <body>
 <main>
   <h1>Web App Bridge — reference client</h1>
   <p class="sub">
-    A complete, dependency-free client for protocol v1.
+    Calls every method and shows every event of protocol v1.
     Status: <span id="status" class="pill">detecting…</span>
   </p>
 
   <h2>1 &nbsp;Handshake</h2>
   <section>
     <div class="row">
-      <button id="btnInfo">slicer.getInfo</button>
-      <button id="btnClear" class="ghost">Clear log</button>
+      <button id="btnInfo" class="needs-bridge">slicer.getInfo</button>
+      <button id="btnClear" class="ghost">Clear logs</button>
+      <span id="slotInfo" class="pill">slot: unknown</span>
+      <span id="accountInfo" class="pill">account: unknown</span>
     </div>
     <pre id="info">Not called yet.</pre>
   </section>
 
-  <h2>2 &nbsp;Hand a file over by URL &mdash; the recommended path</h2>
+  <h2>2 &nbsp;Hand a file over</h2>
   <section>
+    <h3>By URL &mdash; the recommended path</h3>
     <div class="row">
       <input type="text" id="url" placeholder="https://your-app.example/download/abc123">
       <input type="text" id="name" placeholder="part.3mf" style="flex:0 1 150px">
     </div>
     <div class="row">
       <input type="text" id="sha" placeholder="sha256 (optional, but do send it)">
-      <button id="btnUrl">slicer.openProjectFromUrl</button>
+      <button id="btnUrl" data-needs="slicer.openProjectFromUrl">slicer.openProjectFromUrl</button>
     </div>
-  </section>
-
-  <h2>3 &nbsp;Hand a local file over by path &mdash; loopback only</h2>
-  <section>
+    <h3>By path &mdash; loopback origin or explicit opt-in only</h3>
     <div class="row">
       <input type="text" id="path" placeholder="C:\path\to\part.3mf">
-      <button id="btnPath">slicer.openProject</button>
+      <button id="btnPath" data-needs="slicer.openProject">slicer.openProject</button>
     </div>
-    <p class="sub" style="margin:0">
-      Absent from <code>capabilities</code> unless the page is on a loopback origin, or the user has
-      enabled <em>Allow the web application to open local files</em>. The path must also sit under
-      <code>web_app_path_roots</code>.
-    </p>
   </section>
 
-  <h2>4 &nbsp;Preset settings &mdash; behind the per-tab opt-in</h2>
+  <h2>3 &nbsp;Read the plate &mdash; the export family and hand-off</h2>
+  <section>
+    <p class="sub">
+      Each flow gets a handle, reads every chunk with <code>slicer.readExportChunk</code>, offers
+      the assembled file as a download, then calls <code>slicer.discardExport</code>.
+    </p>
+    <div class="row">
+      <button id="flowExport" data-needs="slicer.exportProject">Export project &amp; read it</button>
+      <button id="flowRequest" data-needs="slicer.requestHandoff">Request hand-off &amp; read it</button>
+      <button id="flowTake" data-needs="slicer.takeHandoff">Take pending hand-off</button>
+      <button id="flowPreset" data-needs="slicer.exportPrinterPreset">Export printer preset &amp; read it</button>
+      <button id="flowThumb" data-needs="slicer.exportThumbnail">Plate picture</button>
+    </div>
+    <div id="flowOut" class="sub" style="margin:0">No export yet.</div>
+    <img id="thumb" class="thumb" alt="" hidden>
+  </section>
+
+  <h2>4 &nbsp;Every method</h2>
   <section>
     <p class="sub" style="margin:0 0 12px">
-      One row per method; edit the JSON parameters and send. Rows are enabled from
-      <code>capabilities</code>, so they stay grey until the user ticks <em>Allow &hellip; to change
-      print settings</em> for this tab (Preferences &#9656; General) &mdash; watch
-      <code>slicer.capabilitiesChanged</code> arrive in the event log when they do. A
-      <code>1013</code> reply arms <em>Retry with ifDirty:"discard"</em>.
+      One row per method. Edit the JSON parameters and send. A row is enabled only while its
+      method is in <code>capabilities</code>: most need a permission that the user turns on per
+      slot (Preferences &#9656; Advanced &#9656; Web apps &amp; services), and
+      <code>slicer.capabilitiesChanged</code> re-enables rows when they do.
+      <code>"$handle"</code> is replaced by the last export handle, and <code>"$turn"</code> by the
+      turn below. A turn is a grouping this page defines: every call sent with the same turn is
+      undone together by <code>slicer.undoTurn</code>.
     </p>
-    <div id="settingsRows"></div>
     <div class="row">
+      <label><input type="checkbox" id="useTurn"> attach <code>turn</code> to every call</label>
+      <input type="text" id="turn" style="flex:0 1 220px">
+      <button id="btnNewTurn" class="ghost needs-bridge">New turn</button>
       <button id="btnRetryDiscard" disabled>Retry with ifDirty:"discard"</button>
-      <span id="settingsAccess" class="pill">settingsAccess: unknown</span>
     </div>
-    <pre id="settingsResult">No settings call yet.</pre>
+    <div id="methodRows"></div>
+    <pre id="methodResult">No call yet.</pre>
   </section>
 
   <h2>Events &mdash; every <code>slicer.*</code> event the page receives</h2>
@@ -178,53 +198,226 @@
 "use strict";
 
 // ---------------------------------------------------------------------------------------------
-// Detection. Feature-detect; never parse the user agent -- see WEB_APP_BRIDGE.md section 2.
+// Detection. Feature-detect; never parse the user agent (WEB_APP_BRIDGE.md section 2).
 // ---------------------------------------------------------------------------------------------
 
 function bridge() { return window.__slicerBridge || null; }
+const $ = id => document.getElementById(id);
 
 function log(message, kind) {
-  const el = document.getElementById("log");
+  const el = $("log");
   const row = document.createElement("div");
   row.className = kind || "";
   row.textContent = new Date().toTimeString().slice(0, 8) + "  " + message;
   el.insertBefore(row, el.firstChild);
-  while (el.childNodes.length > 200) el.removeChild(el.lastChild);
+  while (el.childNodes.length > 300) el.removeChild(el.lastChild);
 }
 
 function setStatus(text, kind) {
-  const el = document.getElementById("status");
-  el.textContent = text;
-  el.className = "pill " + (kind || "");
+  $("status").textContent = text;
+  $("status").className = "pill " + (kind || "");
+}
+
+let capabilities = [];
+let lastHandle = "";
+function newTurn() { $("turn").value = "turn-" + Math.random().toString(16).slice(2, 10); }
+
+// ---------------------------------------------------------------------------------------------
+// Every method, grouped as WEB_APP_BRIDGE.md groups them, with a starting set of parameters.
+// ---------------------------------------------------------------------------------------------
+
+const METHODS = [
+  ["Presets and settings (4.1)", [
+    ["slicer.selectPreset",        { type: "printer", name: "", ifDirty: "ask" }],
+    ["slicer.listPresets",         { type: "filament", query: "", compatibleOnly: true, limit: 20 }],
+    ["slicer.getSettingsSchema",   { type: "print", query: "infill", includeCode: false, limit: 20 }],
+    ["slicer.getSettings",         { type: "print", keys: ["layer_height", "sparse_infill_density", "wall_loops"] }],
+    ["slicer.setSettings",         { type: "print", values: { sparse_infill_density: "35%" }, turn: "$turn" }],
+    ["slicer.addFilamentSlot",     { preset: "Generic PETG" }],
+    ["slicer.saveFilamentPreset",  { slot: 0, name: "My PLA (custom)", overwrite: false, ifDirty: "ask" }],
+    ["slicer.listPrinterModels",   { query: "voron", includeNotInstalled: true, limit: 10 }],
+    ["slicer.addPrinter",          { model: "", nozzle: "0.4", select: true, ifDirty: "ask" }],
+  ]],
+  ["The plate (4.1)", [
+    ["slicer.getPlate",            {}],
+    ["slicer.setCutPlanes",        { object: 0, mode: "replace", frame: "world",
+                                     planes: [{ point: [110, 110, 10], normal: [0, 0.17, 0.985] }], turn: "$turn" }],
+    ["slicer.setOrientation",      { object: 0, face: "+x", turn: "$turn" }],
+    ["slicer.setObjectFilament",   { object: 0, filament: 2, turn: "$turn" }],
+    ["slicer.setScale",            { object: 0, factor: 1.5, turn: "$turn" }],
+    ["slicer.moveObject",          { object: 0, center: true, turn: "$turn" }],
+    ["slicer.arrange",             { spacingMm: 5, turn: "$turn" }],
+    ["slicer.setCopies",           { object: 0, count: 4, arrange: true, turn: "$turn" }],
+    ["slicer.fillBed",             { object: 0, turn: "$turn" }],
+  ]],
+  ["Slicing (4.1)", [
+    ["slicer.slice",               {}],
+    ["slicer.getSliceResult",      {}],
+    ["slicer.getSliceIssues",      {}],
+    ["slicer.getSliceModes",       {}],
+    ["slicer.setSliceMode",        { id: "local" }],
+  ]],
+  ["Export family (4.2) and hand-off (4.3)", [
+    ["slicer.exportProject",       {}],
+    ["slicer.readExportChunk",     { handle: "$handle", offset: 0 }],
+    ["slicer.discardExport",       { handle: "$handle" }],
+    ["slicer.exportThumbnail",     {}],
+    ["slicer.requestHandoff",      {}],
+    ["slicer.takeHandoff",         {}],
+  ]],
+  ["Printer profiles (4.4)", [
+    ["slicer.exportPrinterPreset", {}],
+    ["slicer.installPrinterPreset", { url: "https://profiles.example.com/my-printer.json", filename: "My Printer.json" }],
+  ]],
+  ["Printers (4.6)", [
+    ["slicer.listPrinters",        {}],
+    ["slicer.printerStatus",       { printer: "" }],
+    ["slicer.exportGcode",         { plate: "current" }],
+    ["slicer.print",               { printer: "", plate: "current" }],
+    ["slicer.printerControl",      { printer: "", action: "pause" }],
+    ["slicer.sendToPrinter",       { printer: "", plate: "current" }],
+    ["slicer.selectPrinter",       { printer: "" }],
+    ["slicer.printHostJobs",       {}],
+    ["slicer.cancelPrintHostJob",  { id: 0 }],
+  ]],
+  ["Action catalog (4.7)", [
+    ["slicer.listActions",         { detail: "summary" }],
+    ["slicer.invokeAction",        { id: "", params: {}, turn: "$turn" }],
+    ["slicer.getSelection",        {}],
+    ["slicer.getModelTree",        { plate: -1 }],
+    ["slicer.select",              { objects: [0] }],
+    ["slicer.undoTurn",            { turn: "$turn" }],
+  ]],
+];
+
+// Every event the slicer can send (WEB_APP_BRIDGE.md 4.5). All are logged verbatim.
+const SLICER_EVENTS = [
+  "slicer.projectOpened", "slicer.openProjectFromUrl.progress",
+  "slicer.presetChanged", "slicer.settingsChanged", "slicer.plateChanged", "slicer.projectChanged",
+  "slicer.sliceStarted", "slicer.sliceFinished", "slicer.handoff", "slicer.presetInstalled",
+  "slicer.themeChanged", "slicer.capabilitiesChanged",
+  "slicer.exportFinished", "slicer.printSent", "slicer.printerControlDone",
+  "slicer.sendFinished", "slicer.printHostJobCancelled",
+  "slicer.actionFinished", "slicer.selectionChanged", "slicer.actionsChanged",
+];
+
+let lastCall = null;   // {method, box} of the last send, for the 1013 retry
+
+function buildMethodRows() {
+  const host = $("methodRows");
+  for (const [group, methods] of METHODS) {
+    const h = document.createElement("h3");
+    h.textContent = group;
+    host.appendChild(h);
+    for (const [method, params] of methods) {
+      const row = document.createElement("div");
+      row.className = "mrow";
+      const label = document.createElement("code");
+      label.textContent = method;
+      const box = document.createElement("textarea");
+      box.value = JSON.stringify(params);
+      box.rows = 1;
+      const btn = document.createElement("button");
+      btn.textContent = "Send";
+      btn.dataset.needs = method;
+      btn.addEventListener("click", () => callMethod(method, box));
+      row.appendChild(label); row.appendChild(box); row.appendChild(btn);
+      host.appendChild(row);
+    }
+  }
+}
+
+// capabilities is the only correct way to decide what you may call.
+function applyCapabilities(caps) {
+  capabilities = caps || [];
+  for (const btn of document.querySelectorAll("[data-needs]")) btn.disabled = !capabilities.includes(btn.dataset.needs);
+  for (const btn of document.querySelectorAll(".needs-bridge")) btn.disabled = !bridge();
+}
+
+function substitute(value) {
+  if (value === "$handle") return lastHandle;
+  if (value === "$turn") return $("turn").value;
+  if (Array.isArray(value)) return value.map(substitute);
+  if (value && typeof value === "object") {
+    const out = {};
+    for (const k of Object.keys(value)) out[k] = substitute(value[k]);
+    return out;
+  }
+  return value;
+}
+
+function showResult(method, code, message, data) {
+  $("methodResult").textContent = method + "  ->  " + code + " " + message + "\n" +
+    JSON.stringify(data === undefined ? null : data, null, 2);
+}
+
+// One call through the shim. Rejections carry {code, message, method, data}.
+async function send(method, params) {
+  const b = bridge();
+  if (!b) throw { code: "no-bridge", message: "not inside the slicer" };
+  params = params || {};
+  if ($("useTurn").checked && params.turn === undefined) params = Object.assign({ turn: $("turn").value }, params);
+  return b.send(method, params);
+}
+
+async function callMethod(method, box) {
+  let params;
+  try { params = box.value.trim() ? JSON.parse(box.value) : {}; }
+  catch (e) { log(method + ": parameters are not valid JSON: " + e.message, "e"); return; }
+  params = substitute(params);
+  lastCall = { method: method, box: box };
+  $("btnRetryDiscard").disabled = true;
+  try {
+    const data = await send(method, params);
+    if (data && data.handle) lastHandle = data.handle;
+    showResult(method, 0, "success", data);
+    log(method + " ok", "o");
+  } catch (e) {
+    // A rejection carries the response data too: for 1013 that is {dirty, type, dirtyKeys}.
+    showResult(method, e.code, e.message, e.data);
+    log(method + " failed: [" + e.code + "] " + e.message, "e");
+    if (e.code === 1013) $("btnRetryDiscard").disabled = false;
+  }
+}
+
+function retryWithDiscard() {
+  if (!lastCall) return;
+  let params = {};
+  try { params = JSON.parse(lastCall.box.value || "{}"); } catch (e) { /* the row was edited */ }
+  params.ifDirty = "discard";
+  lastCall.box.value = JSON.stringify(params);
+  callMethod(lastCall.method, lastCall.box);
 }
 
 // ---------------------------------------------------------------------------------------------
-// Calls
+// Handshake
 // ---------------------------------------------------------------------------------------------
 
 async function getInfo() {
-  const b = bridge();
-  if (!b) { log("no bridge: not running inside the slicer, or not on a trusted origin", "e"); return null; }
   try {
-    const info = await b.send("slicer.getInfo");
-    document.getElementById("info").textContent = JSON.stringify(info, null, 2);
+    const info = await send("slicer.getInfo");
+    $("info").textContent = JSON.stringify(info, null, 2);
     log("getInfo ok: " + info.app.name + " " + info.app.version, "o");
 
     // The AGPL-3.0 source offer. If you host an application whose server runs the slicer for
     // remote users, render this somewhere the user can see it.
-    const src = document.getElementById("source");
-    src.innerHTML = "";
-    src.appendChild(document.createTextNode("Slicing by " + info.app.name + " (" + info.app.license + ") — "));
+    const src = $("source");
+    src.textContent = "Slicing by " + info.app.name + " (" + info.app.license + ") — ";
     const a = document.createElement("a");
     a.href = info.app.sourceUrl;
     a.textContent = "Source";
     src.appendChild(a);
 
-    // capabilities is the only correct way to decide what you may call.
+    const tab = info.tab || {};
+    $("slotInfo").textContent = "slot: " + (tab.slot || "?") + " (" + (tab.layout || "tab") + ")" +
+      " · settings " + !!info.settingsAccess + " · printers " + !!info.printerAccess;
+    // account is {signedIn, provider}: no name, no token, nothing about plans. A page that sells
+    // features checks that on its own server.
+    const acc = info.account || {};
+    $("accountInfo").textContent = acc.signedIn ? "signed in at " + (acc.provider || "?") : "not signed in";
+    $("accountInfo").className = "pill " + (acc.signedIn ? "ok" : "");
+
     applyCapabilities(info.capabilities);
-    const access = document.getElementById("settingsAccess");
-    access.textContent = "settingsAccess: " + info.settingsAccess + " (tab " + (info.tab ? info.tab.slot : "?") + ")";
-    access.className = "pill " + (info.settingsAccess ? "ok" : "");
     return info;
   } catch (e) {
     log("getInfo failed: [" + e.code + "] " + e.message, "e");
@@ -232,226 +425,195 @@ async function getInfo() {
   }
 }
 
-// Wait for the two-stage completion event that carries our request id.
-function awaitOpened(requestId) {
+// ---------------------------------------------------------------------------------------------
+// Opening files: accepted first, then the outcome as slicer.projectOpened (two-stage)
+// ---------------------------------------------------------------------------------------------
+
+function awaitOpened() {
   return new Promise(resolve => {
     const b = bridge();
-    const onOpened = data => {
-      if (data && data.id && data.id !== requestId) return;   // not ours
-      b.off("slicer.projectOpened", onOpened);
-      resolve(data);
-    };
+    const onOpened = data => { b.off("slicer.projectOpened", onOpened); resolve(data); };
     b.on("slicer.projectOpened", onOpened);
     setTimeout(() => { b.off("slicer.projectOpened", onOpened); resolve({ ok: false, error: "timed out" }); }, 180000);
   });
 }
 
-async function openFromUrl() {
+async function openFile(method, params) {
   const b = bridge();
-  if (!b) { log("no bridge", "e"); return; }
-
-  const url  = document.getElementById("url").value.trim();
-  const name = document.getElementById("name").value.trim();
-  const sha  = document.getElementById("sha").value.trim();
-  if (!url) { log("enter a URL first", "e"); return; }
-
-  const onProgress = p => {
-    const pct = p.total ? Math.round(100 * p.received / p.total) + "%" : (p.received + " bytes");
-    setStatus("downloading " + pct);
-  };
-  b.on("slicer.openProjectFromUrl.progress", onProgress);
-
-  const opened = awaitOpened(null);
+  const onProgress = p => setStatus("downloading " + (p.total ? Math.round(100 * p.received / p.total) + "%" : p.received + " bytes"));
+  if (method === "slicer.openProjectFromUrl") b.on("slicer.openProjectFromUrl.progress", onProgress);
+  const opened = awaitOpened();
   try {
-    await b.send("slicer.openProjectFromUrl", { url: url, filename: name, sha256: sha || undefined });
-    log("openProjectFromUrl accepted — waiting for the outcome");
+    await send(method, params);
+    log(method + " accepted — waiting for the outcome");
     setStatus("opening…");
   } catch (e) {
     b.off("slicer.openProjectFromUrl.progress", onProgress);
-    log("openProjectFromUrl rejected: [" + e.code + "] " + e.message, "e");
+    log(method + " rejected: [" + e.code + "] " + e.message, "e");
     setStatus("failed", "err");
     return;
   }
-
   const result = await opened;
   b.off("slicer.openProjectFromUrl.progress", onProgress);
-  if (result.ok) { log("opened: " + result.path, "o"); setStatus("opened", "ok"); }
+  // ok: true means "handed to the slicer", not "on the plate" (WEB_APP_BRIDGE.md, two-stage).
+  if (result.ok) { log("handed to the slicer: " + result.path, "o"); setStatus("handed over", "ok"); }
   else           { log("not opened: " + result.error, "e"); setStatus("failed", "err"); }
 }
 
-async function openByPath() {
-  const b = bridge();
-  if (!b) { log("no bridge", "e"); return; }
+function openFromUrl() {
+  const url = $("url").value.trim();
+  if (!url) { log("enter a URL first", "e"); return; }
+  const sha = $("sha").value.trim();
+  openFile("slicer.openProjectFromUrl", { url: url, filename: $("name").value.trim(), sha256: sha || undefined });
+}
 
-  const path = document.getElementById("path").value.trim();
+function openByPath() {
+  const path = $("path").value.trim();
   if (!path) { log("enter a path first", "e"); return; }
+  openFile("slicer.openProject", { path: path });
+}
 
-  const opened = awaitOpened(null);
+// ---------------------------------------------------------------------------------------------
+// The export family: a handle, chunks until eof, discard
+// ---------------------------------------------------------------------------------------------
+
+function base64ToBytes(b64) {
+  const bin = atob(b64);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; ++i) out[i] = bin.charCodeAt(i);
+  return out;
+}
+
+async function readAll(handle, filename, sizeBytes) {
+  const parts = [];
+  let offset = 0;
+  for (;;) {
+    const c = await send("slicer.readExportChunk", { handle: handle, offset: offset });
+    parts.push(base64ToBytes(c.base64));
+    if (c.eof) break;
+    if (c.nextOffset <= offset) throw { code: "stalled", message: "a chunk did not advance" };  // a fault, not a retry
+    offset = c.nextOffset;
+    $("flowOut").textContent = "reading " + filename + ": " + offset + " / " + sizeBytes + " bytes";
+  }
+  const blob = new Blob(parts);
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = filename;
+  a.textContent = "Save " + filename + " (" + blob.size + " bytes)";
+  $("flowOut").textContent = "";
+  $("flowOut").appendChild(a);
+  log("read " + filename + ": " + blob.size + " bytes", "o");
+}
+
+async function exportFlow(method) {
+  let body;
   try {
-    await b.send("slicer.openProject", { path: path });
-    log("openProject accepted — waiting for the outcome");
+    body = await send(method, {});
   } catch (e) {
-    log("openProject rejected: [" + e.code + "] " + e.message, "e");
-    setStatus("failed", "err");
+    log(method + " failed: [" + e.code + "] " + e.message, "e");
     return;
   }
-
-  const result = await opened;
-  if (result.ok) { log("opened: " + result.path, "o"); setStatus("opened", "ok"); }
-  else           { log("not opened: " + result.error, "e"); setStatus("failed", "err"); }
-}
-
-// ---------------------------------------------------------------------------------------------
-// Preset settings (WEB_APP_BRIDGE.md section 4.1) and events (section 4.5)
-// ---------------------------------------------------------------------------------------------
-
-// Every settings-family method with a starting set of parameters. Edit them in the page.
-const SETTINGS_METHODS = [
-  ["slicer.listPresets",       { type: "filament", query: "", compatibleOnly: true, limit: 20 }],
-  ["slicer.getSettingsSchema", { type: "print", query: "infill", includeCode: false, limit: 20 }],
-  ["slicer.getSettings",       { type: "print", keys: ["layer_height", "sparse_infill_density", "wall_loops"] }],
-  ["slicer.setSettings",       { type: "print", values: { sparse_infill_density: "35%" } }],
-  ["slicer.selectPreset",      { type: "print", name: "", ifDirty: "ask" }],
-  ["slicer.getPlate",          {}],
-  ["slicer.slice",             {}],
-  ["slicer.getSliceResult",    {}],
-];
-
-// Every unsolicited event the slicer can send. All are logged verbatim.
-const SLICER_EVENTS = [
-  "slicer.presetChanged", "slicer.settingsChanged", "slicer.plateChanged",
-  "slicer.sliceStarted", "slicer.sliceFinished", "slicer.themeChanged", "slicer.capabilitiesChanged",
-];
-
-let lastSettingsCall = null;   // {method, params, textarea} of the last send, for the 1013 retry
-
-function buildSettingsRows() {
-  const host = document.getElementById("settingsRows");
-  for (const [method, params] of SETTINGS_METHODS) {
-    const row = document.createElement("div");
-    row.className = "mrow";
-    const label = document.createElement("code");
-    label.textContent = method;
-    const box = document.createElement("textarea");
-    box.value = JSON.stringify(params);
-    box.rows = 1;
-    const btn = document.createElement("button");
-    btn.textContent = "Send";
-    btn.disabled = true;
-    btn.dataset.method = method;
-    btn.className = "settings-send";
-    btn.addEventListener("click", () => callSettings(method, box));
-    row.appendChild(label); row.appendChild(box); row.appendChild(btn);
-    host.appendChild(row);
-  }
-}
-
-function applyCapabilities(caps) {
-  document.getElementById("btnPath").disabled = !caps.includes("slicer.openProject");
-  document.getElementById("btnUrl").disabled  = !caps.includes("slicer.openProjectFromUrl");
-  for (const btn of document.querySelectorAll(".settings-send")) {
-    // selectPreset is always listed (its printer form is v1); the print/filament forms need the
-    // opt-in, which the presence of any other settings method tells us about.
-    const gated = btn.dataset.method === "slicer.selectPreset"
-      ? caps.includes("slicer.getSettings")
-      : caps.includes(btn.dataset.method);
-    btn.disabled = !gated;
-  }
-}
-
-function showSettingsResult(method, code, message, data) {
-  const head = method + "  ->  " + code + " " + message + "\n";
-  document.getElementById("settingsResult").textContent = head + JSON.stringify(data === undefined ? null : data, null, 2);
-}
-
-async function callSettings(method, box) {
-  const b = bridge();
-  if (!b) { log("no bridge", "e"); return; }
-  let params;
-  try { params = box.value.trim() ? JSON.parse(box.value) : {}; }
-  catch (e) { log(method + ": parameters are not valid JSON: " + e.message, "e"); return; }
-
-  lastSettingsCall = { method: method, params: params, box: box };
-  document.getElementById("btnRetryDiscard").disabled = true;
+  if (method === "slicer.takeHandoff" && !body.pending) { $("flowOut").textContent = "No hand-off is pending."; return; }
+  lastHandle = body.handle;
+  log(method + ": handle " + body.handle + " (" + body.filename + ", " + body.sizeBytes + " bytes)", "o");
   try {
-    const data = await b.send(method, params);
-    showSettingsResult(method, 0, "success", data);
-    log(method + " ok", "o");
+    await readAll(body.handle, body.filename, body.sizeBytes);
   } catch (e) {
-    // A rejection carries the response data too: for 1013 that is {dirty, type, dirtyKeys}.
-    showSettingsResult(method, e.code, e.message, e.data);
-    log(method + " failed: [" + e.code + "] " + e.message, "e");
-    if (e.code === 1013) document.getElementById("btnRetryDiscard").disabled = false;
+    log("reading the export failed: [" + e.code + "] " + e.message, "e");
+  } finally {
+    try { await send("slicer.discardExport", { handle: body.handle }); log("discarded " + body.handle); }
+    catch (e) { log("discardExport failed: [" + e.code + "] " + e.message, "e"); }
   }
 }
 
-function retryWithDiscard() {
-  if (!lastSettingsCall) return;
-  const params = Object.assign({}, lastSettingsCall.params, { ifDirty: "discard" });
-  lastSettingsCall.box.value = JSON.stringify(params);
-  callSettings(lastSettingsCall.method, lastSettingsCall.box);
+async function thumbnailFlow() {
+  try {
+    const t = await send("slicer.exportThumbnail", {});
+    $("thumb").src = "data:" + t.mime + ";base64," + t.base64;
+    $("thumb").hidden = false;
+    log("plate picture " + t.width + "x" + t.height, "o");
+  } catch (e) {
+    // 1008 before the 3D view has been drawn once: let the user supply a picture instead.
+    log("exportThumbnail failed: [" + e.code + "] " + e.message, "e");
+  }
 }
+
+// ---------------------------------------------------------------------------------------------
+// Events
+// ---------------------------------------------------------------------------------------------
 
 function logEvent(name, data) {
-  const el = document.getElementById("events");
+  const el = $("events");
   const row = document.createElement("div");
   row.className = "ev";
   let text = JSON.stringify(data);
   if (text && text.length > 600) text = text.slice(0, 600) + "\u2026";
-  const when = document.createTextNode(new Date().toTimeString().slice(0, 8) + "  ");
+  row.appendChild(document.createTextNode(new Date().toTimeString().slice(0, 8) + "  "));
   const b = document.createElement("b");
   b.textContent = name;
-  row.appendChild(when); row.appendChild(b); row.appendChild(document.createTextNode("  " + text));
+  row.appendChild(b);
+  row.appendChild(document.createTextNode("  " + text));
   el.insertBefore(row, el.firstChild);
-  while (el.childNodes.length > 200) el.removeChild(el.lastChild);
+  while (el.childNodes.length > 300) el.removeChild(el.lastChild);
 }
 
 function subscribeEvents() {
   const b = bridge();
   for (const name of SLICER_EVENTS) b.on(name, data => logEvent(name, data));
-  // What you may call changed under you: re-enable rows from the new list.
+  // What you may call changed under you: re-read it.
   b.on("slicer.capabilitiesChanged", data => { if (data && data.capabilities) applyCapabilities(data.capabilities); getInfo(); });
+  // The user handed the plate to this page: collect it (once).
+  b.on("slicer.handoff", () => exportFlow("slicer.takeHandoff"));
 }
 
 // ---------------------------------------------------------------------------------------------
 // Wiring
 // ---------------------------------------------------------------------------------------------
 
-document.getElementById("btnInfo").addEventListener("click", getInfo);
-document.getElementById("btnUrl").addEventListener("click", openFromUrl);
-document.getElementById("btnPath").addEventListener("click", openByPath);
-document.getElementById("btnClear").addEventListener("click", () => {
-  document.getElementById("log").innerHTML = "";
-  document.getElementById("events").innerHTML = "";
-});
-document.getElementById("btnRetryDiscard").addEventListener("click", retryWithDiscard);
-buildSettingsRows();
+buildMethodRows();
+newTurn();
+applyCapabilities([]);   // nothing is callable until getInfo says so
+$("btnInfo").addEventListener("click", getInfo);
+$("btnUrl").addEventListener("click", openFromUrl);
+$("btnPath").addEventListener("click", openByPath);
+$("btnClear").addEventListener("click", () => { $("log").textContent = ""; $("events").textContent = ""; });
+$("btnRetryDiscard").addEventListener("click", retryWithDiscard);
+$("btnNewTurn").addEventListener("click", newTurn);
+$("flowExport").addEventListener("click", () => exportFlow("slicer.exportProject"));
+$("flowRequest").addEventListener("click", () => exportFlow("slicer.requestHandoff"));
+$("flowTake").addEventListener("click", () => exportFlow("slicer.takeHandoff"));
+$("flowPreset").addEventListener("click", () => exportFlow("slicer.exportPrinterPreset"));
+$("flowThumb").addEventListener("click", thumbnailFlow);
 
+let started = false;
 function start() {
+  if (started) return;
   if (bridge()) {
+    started = true;
     setStatus("bridge available", "ok");
     log("window.__slicerBridge found, version " + bridge().version, "o");
     subscribeEvents();
-    getInfo();
+    applyCapabilities([]);
+    getInfo().then(info => {
+      // A hand-off may have been parked before this page loaded.
+      if (info && info.capabilities.includes("slicer.takeHandoff")) exportFlow("slicer.takeHandoff");
+    });
   } else if (window.wx && typeof window.wx.postMessage === "function") {
-    // Inside a slicer web view, but the shim was not injected -- this origin is not trusted.
+    // Inside a slicer web view, but the shim was not injected: this origin is not trusted.
     setStatus("inside the slicer, untrusted origin", "err");
-    log("window.wx exists but no shim was injected: this origin does not match web_app_url", "e");
-    document.getElementById("btnUrl").disabled = true;
-    document.getElementById("btnPath").disabled = true;
+    log("window.wx exists but no shim was injected: this origin does not match the slot's configured URL", "e");
   } else {
     setStatus("ordinary browser", "");
-    log("no bridge: this page is not running inside the slicer. Everything below is inert.");
-    document.getElementById("btnUrl").disabled = true;
-    document.getElementById("btnPath").disabled = true;
+    log("no bridge: this page is not running inside the slicer, so every button is disabled.");
   }
 }
 
-// The shim is injected after the document loads, so it may not be there yet on first paint.
+// The shim is injected after the document loads, so it may not be there yet on first paint. A
+// late shim still starts the page: start() runs again on slicerbridgeready.
 if (bridge()) start();
 else {
   window.addEventListener("slicerbridgeready", start, { once: true });
-  setTimeout(() => { if (document.getElementById("status").textContent === "detecting…") start(); }, 1200);
+  setTimeout(start, 1200);
 }
 </script>
 </body>

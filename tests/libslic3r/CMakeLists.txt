@@ -25,6 +25,7 @@ add_executable(${_TEST_NAME}_tests
     test_import_parents.cpp
     test_other_slicer_import.cpp
     test_elephant_foot_compensation.cpp
+    test_facet_selectors.cpp
     test_fill_corner_smoothing.cpp
     test_filament_mixer.cpp
     test_fill_plane_path.cpp

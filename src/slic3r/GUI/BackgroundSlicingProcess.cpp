@@ -195,6 +195,16 @@ void BackgroundSlicingProcess::process_fff()
     assert(m_print == m_fff_print);
     PresetBundle& preset_bundle   = *wxGetApp().preset_bundle;
     m_fff_print->is_BBL_printer() = preset_bundle.is_bbl_vendor();
+    // UNLAYERED_MOD -- a plate loaded from a sliced file (a .gcode.3mf with no objects) has
+    // no objects, only its G-code. A config difference in Print::apply (the current filament list vs
+    // the file's) invalidates the "G-code ready" step, and slicing that empty print crashed the export
+    // (print.objects().front() of nothing: "A fatal error occurred: Access violation"). There is
+    // nothing to slice; keep processing the file the plate already holds.
+    if (!m_print->finished() && m_fff_print->objects().empty() && m_current_plate != nullptr &&
+        m_current_plate->is_slice_result_valid() && boost::filesystem::exists(m_current_plate->get_tmp_gcode_path())) {
+        BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ": empty print on a plate with a G-code file, re-using the file";
+        m_fff_print->set_gcode_file_ready();
+    }
     // BBS: add the logic to process from an existed gcode file
     if (m_print->finished()) {
         BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(" %1%: skip slicing, to process previous gcode file") % __LINE__;
@@ -737,9 +747,13 @@ Print::ApplyStatus BackgroundSlicingProcess::apply(const Model& model, const Dyn
     Print::ApplyStatus invalidated = m_print->apply(model, new_config);
 
     // Orca: prevent resetting under gcode viewer mode
+    // UNLAYERED_MOD: ...and for a loaded SLICED 3MF (an exported .gcode.3mf, as a slicing service may
+    // hand a job back). It cannot be resliced either, and the first apply after loading it always sees
+    // a config diff against the Print's previous config, which wiped the plate's G-code result:
+    // Preview came up empty though Print plate stayed enabled.
     if (invalidated != PrintBase::APPLY_STATUS_UNCHANGED) {
         const auto plater = GUI::wxGetApp().mainframe->m_plater;
-        if (plater && plater->only_gcode_mode()) {
+        if (plater && (plater->only_gcode_mode() || plater->using_exported_file())) {
             invalidated = PrintBase::APPLY_STATUS_UNCHANGED;
         }
     }

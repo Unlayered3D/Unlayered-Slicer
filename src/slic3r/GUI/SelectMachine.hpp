@@ -308,6 +308,9 @@ private:
     bool                                m_is_rename_mode{ false };
     bool                                m_check_flag {false};
     bool                                m_ext_change_assist{ false };
+    nlohmann::json                      m_automation_options = nlohmann::json::object();
+    bool                                m_automation_ext_assist_applied{ false };
+    void                                apply_automation_options(MachineObject* obj);
     PrintPageMode                       m_print_page_mode{PrintPageMode::PrintPageModePrepare};
     std::string                         m_print_error_msg;
     std::string                         m_print_error_extra;
@@ -468,6 +471,12 @@ public:
     void finish_mode();
 	void sync_ams_mapping_result(std::vector<FilamentInfo>& result);
     void prepare(int print_plate_idx);
+    // Automation (WebAppBridge slicer.print): the print options a page asked for -- timelapse,
+    // bedLeveling, flowCalibration, nozzleOffsetCalibration, sharedPaProfile ("on" / "off" /
+    // "auto"), jobName, timelapseStorage ("internal" / "external"), extChangeAssist (bool).
+    // Applied whenever the dialog loads the printer's saved choices, only where the option is shown
+    // and offers that value; never saved as the person's defaults. An empty object clears them.
+    void set_automation_options(const nlohmann::json& options);
     void show_status(PrintDialogStatus status, std::vector<wxString> params = std::vector<wxString>(), wxString wiki_url = wxEmptyString);
     void sys_color_changed();
     void reset_timeout();

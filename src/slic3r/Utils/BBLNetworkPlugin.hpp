@@ -202,9 +202,17 @@ public:
     int unload();
 
     /**
-     * Destroy the singleton instance.
-     * Safe to call multiple times - does nothing if already destroyed.
-     * Must be called during application shutdown before main() returns.
+     * At quit: stop the plug-in's own work (discovery off, printer disconnected) so its threads
+     * go quiet before anything they call back into is torn down. Safe to call at any time.
+     */
+    static void stop_for_exit();
+
+    /**
+     * At quit: stop_for_exit(), then destroy the agent; on macOS/Linux also unload the libraries
+     * (see GUI_App::shutdown). On Windows the libraries stay mapped until the process ends, so a
+     * plug-in thread that is still running never executes freed code. The instance itself is kept
+     * (unloaded), so instance() stays valid for anything that runs later.
+     * Safe to call multiple times.
      */
     static void shutdown();
 

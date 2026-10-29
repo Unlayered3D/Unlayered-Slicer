@@ -1031,6 +1031,16 @@ void ConfigManipulation::toggle_print_fff_options(DynamicPrintConfig *config, in
     for (auto el : {"zaa_minimize_perimeter_height", "zaa_min_z", "zaa_dont_alternate_fill_direction", "ironing_expansion"})
         toggle_line(el, has_zaa);
 
+    // UNLAYERED_MOD: nonplanar layers
+    if (config->has("nonplanar_layers")) {
+        const bool has_np = config->opt_bool("nonplanar_layers");
+        for (auto el : {"nonplanar_max_angle", "nonplanar_max_height", "nonplanar_layer_count",
+                        "nonplanar_top_surface_direction_enable", "nonplanar_top_surface_flow_ratio_enable"})
+            toggle_line(el, has_np);
+        toggle_line("nonplanar_top_surface_direction", has_np && config->opt_bool("nonplanar_top_surface_direction_enable"));
+        toggle_line("nonplanar_top_surface_flow_ratio", has_np && config->opt_bool("nonplanar_top_surface_flow_ratio_enable"));
+    }
+
     auto print_seq = config->opt_enum<PrintSequence>("print_sequence");
     bool have_sequential_printing = (print_seq == PrintSequence::ByObject || print_seq == PrintSequence::ByGroup);
     // for (auto el : { "extruder_clearance_radius", "extruder_clearance_height_to_rod", "extruder_clearance_height_to_lid" })

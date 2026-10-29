@@ -4,6 +4,7 @@
 #include <memory>
 #include <vector>
 #include <boost/filesystem/path.hpp>
+#include <nlohmann/json.hpp>
 
 #include <wx/colour.h>
 #include <wx/panel.h>
@@ -68,6 +69,7 @@ namespace UndoRedo {
 
 namespace GUI {
 class SyncAmsInfoDialog;
+struct MixedFilamentResult;
 class MainFrame;
 class ConfigOptionsGroup;
 class ObjectSettings;
@@ -274,6 +276,10 @@ public:
     void edit_mixed_filament(size_t idx);
     void delete_mixed_filament_at(size_t idx);
     void decompose_filament_color(int filament_idx);
+    // The writes the mixed filament dialog's OK makes (create_mixed_filament_from_result), for a
+    // caller that built the result itself: a new mixed slot at the end. False when it cannot be
+    // added (fewer than two physical filaments, the filament limit). color_strs: physical colours.
+    bool add_mixed_filament_from_result(const MixedFilamentResult& result, const std::vector<std::string>& color_strs);
     void recalc_filament_scroll_sizes();
     void update_mixed_filament_list();
     bool has_broken_mixed_filament() const;
@@ -341,8 +347,24 @@ public:
     std::vector<size_t> physical_filament_config_indices() const;
 
     int new_project(bool skip_confirm = false, bool silent = false, const wxString& project_name = wxString());
+    // The next new_project() asks nothing (as skip_confirm), whatever its caller passes: the caller
+    // already settled the save-project and modified-presets questions. For calib.run, whose
+    // Plater::calib_* each start their own new project after the action started one. `false` clears it.
+    void skip_next_new_project_confirm(bool skip = true);
     // BBS: save & backup
     void load_project(wxString const & filename = "", wxString const & originfile = "-");
+    // UNLAYERED_MOD -- the web tab in `slot` asked for this project to be opened (it opens later,
+    // through request_open_project); its slicer.projectChanged then says source "bridge".
+    static void note_bridge_project_open(const std::string& utf8_path, const std::string& slot);
+    // UNLAYERED_MOD -- held while the bridge dispatches a request (actions included): a new/open
+    // project it causes says source "bridge" in slicer.projectChanged.
+    struct BridgeRequestScope
+    {
+        BridgeRequestScope();
+        ~BridgeRequestScope();
+        BridgeRequestScope(const BridgeRequestScope&)            = delete;
+        BridgeRequestScope& operator=(const BridgeRequestScope&) = delete;
+    };
     int save_project(bool saveAs = false);
     //BBS download project by project id
     void import_model_id(wxString download_info);
@@ -361,6 +383,10 @@ public:
     // selected object at the current settings and attach it as a modifier
     // volume of the object (menu action; re-run to refresh).
     void preview_mesh_infill();
+    // Preview Mesh Infill for one object without any dialog (automation): true when the preview
+    // volume was (re)built, or with dry_run would be; false with `error` set when it cannot be, or
+    // with `error` empty when the existing preview is up to date. No undo snapshot is taken.
+    bool generate_infill_preview(int obj_idx, bool dry_run, std::string &error, std::string &warning);
     // Unlayered: SVG infill art tiled over the current plate at print scale (3D view overlay);
     // an empty list clears it. Fed by the Process tab while its SVG settings are on screen.
     void set_svg_infill_preview(const Polylines &lines);
@@ -532,10 +558,81 @@ public:
     void export_gcode_3mf(bool export_all = false);
     void send_gcode_finish(wxString name);
 
-    // Hand the current plate to the external nonplanar slicing service and open the G-code it
-    // returns (NONPLANAR_SLICE_SERVICE.md). Bypasses local slicing entirely.
+    // Hand the current plate to the external slicing service (SLICE_SERVICE_PROTOCOL.md).
+    // The G-code it returns becomes the plate's slice result, exactly where a local slice puts
+    // its own: shown in Preview, exported and printed from there, and invalidated by the same
+    // edits. reslice() starts this instead of a local slice while a service mode is selected in
+    // the Slice dropdown; `quiet` (those automatic starts) reports problems as a notification
+    // rather than a dialog.
     bool can_slice_nonplanar() const;
-    void slice_nonplanar();
+    void slice_nonplanar(bool quiet = false);
+    // What a service slice sends: the current plate as one self-contained 3MF in
+    // <data_dir>/cache/nonplanar -- that plate's objects only, placed as on a one-plate project,
+    // resolved settings inside -- plus the labels, the service's options and the plate's index.
+    // False with `error` when the export fails. Shared with SlicePrepare so the two send exactly
+    // the same thing.
+    struct SliceServiceHandoff
+    {
+        boost::filesystem::path plate_3mf;
+        boost::filesystem::path work_dir;
+        std::string             printer, process, filament, options;
+        std::string             mode;             // the service mode (`mode` field; empty = none)
+        int                     machine_axes = 0; // the printer's documented fact (`machine_axes`)
+        int                     plate_index = 0; // 0-based; sent 1-based as the `plate` field
+    };
+    bool export_slice_service_handoff(SliceServiceHandoff &out, wxString &error);
+    // A hash of everything on the current plate that a slice depends on: the printable instances
+    // and their transforms, each volume's mesh, type, transform, settings and painting, the layer
+    // settings, and the resolved print and plate settings. `geometry_only` leaves the settings
+    // out (the service caches its mesh preparation by geometry alone).
+    uint64_t slice_service_fingerprint(bool geometry_only = false);
+    // NonplanarSliceJob::finalize (GUI thread): the service's G-code for plate `plate_index`, as it
+    // was when `fingerprint` was taken. The plate takes it as its slice result once it is the
+    // current plate and still matches; a result for a plate that has changed since is dropped.
+    void accept_slice_service_result(int job_serial, int plate_index, uint64_t fingerprint,
+                                     const std::string &options_key, const boost::filesystem::path &gcode);
+    // The job ended without a result (failed or cancelled).
+    void slice_service_job_ended(int job_serial);
+    // A slicing-service run is a cloud job: it starts only from the person's own request -- the
+    // Slice button or Ctrl+R, a click on the Preview tab, a plate picked in Preview, the other
+    // slice-plate controls. Those call this; reslice() may then start a service run for the next
+    // couple of seconds, once. Every other way into reslice() (auto-slice after a change, a
+    // result arriving, anything a web app does) never starts one: the plate waits, unsliced, for
+    // the person.
+    void note_user_slice_request();
+    // While one exists, no slicing-service run starts at all, requested or not. The web-app
+    // bridge holds one around every call it handles.
+    struct ServiceSliceBlock
+    {
+        ServiceSliceBlock();
+        ~ServiceSliceBlock();
+        ServiceSliceBlock(const ServiceSliceBlock&)            = delete;
+        ServiceSliceBlock& operator=(const ServiceSliceBlock&) = delete;
+    };
+    // The current plate's valid slice result is the slicing service's (`with_current_options`:
+    // made with the mode and options the service would be sent now).
+    bool current_plate_has_service_result(bool with_current_options = false);
+    // What the slicing service means for plate `plate_index` right now, for the web-app bridge
+    // (slice.result, slice.modes): whether its valid result is the service's (and made with the
+    // options it would be sent now), whether a result is back and waiting for the plate, whether a
+    // service job for it is on the worker (with its last progress), and whether it needs a service
+    // run only the person can start (a service mode is selected, the plate has something printable
+    // and no current service result, and no job is under way).
+    struct SliceServicePlateState
+    {
+        bool        service_result     = false;
+        bool        matches_options    = false;
+        bool        result_waiting     = false;
+        bool        job_running        = false;
+        int         progress           = -1; // 0..100 while job_running and reported, else -1
+        std::string stage;
+        bool        waiting_for_person = false;
+    };
+    SliceServicePlateState slice_service_plate_state(int plate_index);
+    // The slicing notification's Cancel, plus a slicing-service job: stops a local slice in
+    // progress (and the rest of a Slice all chain), and asks the worker to cancel a service job,
+    // which tells the service to stop. Reports what was running. Never starts anything.
+    void cancel_slicing(bool &local_stopped, bool &service_cancelled);
 
     // Preview-only mode (a .gcode file was LOADED, not sliced): the file itself is the artifact,
     // so it can be saved elsewhere or sent to the print host with no slice result behind it.
@@ -569,7 +666,10 @@ public:
     void replace_all_with_stl();
     void reload_all_from_disk();
     // Read the bed mesh from the current printer's host (off the UI thread) and show it on the plate.
-    void fetch_bed_mesh();
+    // `done`, when given, runs once on the UI thread with the outcome: ok with an empty error when
+    // the read finished (the overlay holds the mesh, or none when the printer has none loaded), or
+    // not ok with what went wrong (no capable host, the host's error, cancelled).
+    void fetch_bed_mesh(std::function<void(bool ok, const std::string& error)> done = {});
     // Flip View > Show Bed Mesh; turning it on with nothing loaded yet fetches.
     void toggle_bed_mesh();
     bool has_toolpaths_to_export() const;
@@ -684,6 +784,18 @@ public:
     void update_print_error_info(int code, std::string msg, std::string extra);
 
     bool is_export_gcode_scheduled() const;
+    // Unlayered (WEB_APP_BRIDGE.md 4.6): G-code exports scheduled and print sends that reached a
+    // printer or a print host's upload queue this session, and the last export's path.
+    unsigned    gcode_exports_started() const;
+    unsigned    print_sends_started() const;
+    // Sends to the printer's storage (Send / Send all) that finished.
+    unsigned    send_jobs_finished() const;
+    std::string last_gcode_export_path() const;
+    // The options the next print dialog opens with, for a page that asked through the bridge
+    // (WEB_APP_BRIDGE.md 4.6 slicer.print): {"bambu": {...SelectMachineDialog options}} or
+    // {"upload": {"action": "upload" | "print", "path", "group", "storage"}} for a print host.
+    // The next dialog takes them; an empty object clears them. Never saved as the person's defaults.
+    void        set_next_print_dialog_options(const nlohmann::json& options);
 
     const Selection& get_selection() const;
     int get_selected_object_idx();
@@ -820,6 +932,10 @@ public:
     //BBS: delete the plate, index= -1 means the current plate
     int delete_plate(int plate_index = -1);
     int duplicate_plate(int plate_index = -1);
+    // Move plate `old_index` to `new_index` (the bed's "Move plate to the front" icon moves it to 0)
+    // and make it the current plate; every plate in between shifts by one. No snapshot: the caller
+    // takes it. Returns 0 on success.
+    int move_plate_to_index(int old_index, int new_index);
     //BBS: select the sliced plate by index
     int select_sliced_plate(int plate_index, bool skip_zoom = false);
     //BBS: set bed positions
@@ -1042,7 +1158,13 @@ private:
     // Shared core of preview_mesh_infill / refresh_infill_previews.
     // dry_run: stop after the staleness check and report whether generation
     // would happen, without touching the model.
-    bool generate_infill_preview_for_object(int obj_idx, bool interactive, bool dry_run = false);
+    // What a caller that shows no dialogs (interactive false) learns instead of them.
+    struct InfillPreviewReport
+    {
+        std::string error;   // why no preview was built; empty when it was, or was already up to date
+        std::string warning; // built, with a caveat (a truncated tiling)
+    };
+    bool generate_infill_preview_for_object(int obj_idx, bool interactive, bool dry_run = false, InfillPreviewReport *report = nullptr);
     // Set true during PopupMenu() tracking to suppress immediate error message boxes.
     // The error messages are collected to m_tracking_popup_menu_error_message instead and these error messages
     // are shown after the pop-up dialog closes.

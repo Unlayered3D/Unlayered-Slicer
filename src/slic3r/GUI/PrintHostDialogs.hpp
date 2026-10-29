@@ -2,6 +2,7 @@
 #define slic3r_PrintHostSendDialog_hpp_
 
 #include <string>
+#include <nlohmann/json.hpp>
 #include <vector>
 #include <boost/filesystem/path.hpp>
 
@@ -45,8 +46,14 @@ public:
     virtual void EndModal(int ret) override;
     virtual void init();
     virtual std::map<std::string, std::string> extendedInfo() const { return {}; }
+    // Automation (WebAppBridge slicer.print), before init(): offer only Upload ("upload") or only
+    // Upload and Print ("print"), and preselect the folder, group and storage when the dialog lists
+    // them. The person still presses the button; the choices are not kept as recent values.
+    void set_automation_preset(const std::string& action, const std::string& folder, const std::string& group, const std::string& storage);
 
 protected:
+    bool        m_automation{false};
+    std::string m_auto_action, m_auto_folder, m_auto_group, m_auto_storage;
     wxTextCtrl *txt_filename;
     wxComboBox *combo_groups;
     wxComboBox* combo_storage;
@@ -86,6 +93,11 @@ public:
 
     void append_job(const PrintHostJob &job);
     void get_active_jobs(std::vector<std::pair<std::string, std::string>>& ret);
+    // Automation (WebAppBridge slicer.printHostJobs): every upload of this session -- id (the row),
+    // progress, state, file name and error text -- without the host address.
+    nlohmann::json jobs_json();
+    // Cancels upload `id` as the Cancel button does; false when it has already ended or is unknown.
+    bool cancel_job(int id);
 
     virtual bool Show(bool show = true) override
     {

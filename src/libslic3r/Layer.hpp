@@ -382,6 +382,16 @@ protected:
         AreaGroup(ExPolygon *a, int t, coordf_t d) : area(a), type(t), dist_to_top(d) {}
     };
     std::vector<AreaGroup>                    area_groups;
+
+public:
+    // UNLAYERED_MOD -- the support as generated, before clip_supports_to_neighbours() cut it away
+    // from the other objects on the plate (Support/SupportNeighbourClip.hpp); valid only while
+    // has_unclipped_support is set. unclipped_support_simplified: they were saved after the
+    // simplify step had already run on them. Kept last so no existing member moves.
+    ExtrusionEntityCollection   unclipped_support_fills;
+    ExPolygons                  unclipped_support_islands;
+    bool                        has_unclipped_support        = false;
+    bool                        unclipped_support_simplified = false;
 };
 
 template<typename LayerContainer>

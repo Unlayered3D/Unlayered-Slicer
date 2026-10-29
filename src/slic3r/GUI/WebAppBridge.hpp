@@ -32,6 +32,11 @@ enum WebAppBridgeError
     WAB_TOO_LARGE            = 1011,
     WAB_INTERNAL             = 1012,
     WAB_NEEDS_CONFIRMATION   = 1013, // the call would discard unsaved preset edits; retry with ifDirty
+    WAB_SERVICE_MODE_SELECTED = 1014, // slicer.slice: a slicing-service (cloud) mode is selected; only the person starts it
+    // 1015 is retired and reserved: the slicer makes no entitlement checks, so it never answers
+    // with it. A slicing service refuses a job itself (SLICE_SERVICE_PROTOCOL.md, refusals) and a
+    // page shows its own upgrade UI.
+    WAB_ACTION_DISABLED      = 1016, // the catalog action exists but is disabled right now (data.reason)
 };
 
 // The slicer's side of the Web App bridge: a small, versioned, general-purpose JSON-RPC surface
@@ -50,10 +55,17 @@ enum WebAppBridgeError
 //       Arbitrary process execution, or shell-opening an arbitrary path, on behalf of a page.
 //   any AppConfig read or write
 //       Writing would let a page set print_host, printhost_apikey, download_path -- or the
-//       web_app_url / agent_app_url it is itself loaded from, which would make a pivot to an
+//       web_app_url / side_panel_url it is itself loaded from, which would make a pivot to an
 //       attacker's origin self-perpetuating. Reading exposes slicer_uuid, print host addresses
 //       and cloud tokens. Application settings are the user's; the bridge sees none of them.
-//   anything touching login, cloud tokens or the network agent.
+//   anything touching login or cloud tokens; the network agent only through 4.6 below.
+//
+// Exception, a deliberate design decision (WEB_APP_BRIDGE.md 4.6): the printer family --
+// listPrinters, printerStatus, exportGcode, print, printerControl -- reaches printers the slicer
+// already prints to, Bambu ones through the network agent. It is held to: its own per-tab opt-in
+// (<slot>_allow_printer, off), a native confirmation for every export / print / control the page
+// cannot press (pause and stop excepted), and opaque printer ids -- never an address, access code
+// or API key. Reading print_host / printhost_apikey stays inside the slicer for exactly that.
 //   any passthrough to GUI_App::handle_web_request
 //       That dispatcher belongs to the Home tab and includes the login commands. Routing this
 //       bridge through it would collapse the isolation between the two web views.
@@ -73,9 +85,11 @@ enum WebAppBridgeError
 //
 // Preset SETTINGS -- the values in the Print / Filament / Printer tabs -- ARE exposed,
 // deliberately and narrowly. The policy lives in WebAppSettings.hpp; the shape is:
-//   - eight methods: listPresets, getSettingsSchema, getSettings, setSettings, getPlate, slice,
-//     getSliceResult, plus the widened selectPreset. Nothing else touches presets.
-//   - all of them behind a per-tab opt-in (web_app_allow_settings / agent_app_allow_settings,
+//   - nine methods: listPresets, getSettingsSchema, getSettings, setSettings, getPlate,
+//     setCutPlanes (declarative multiplanar cut planes on one object -- they decide how it is
+//     sliced exactly as a print setting does, so they are gated with the settings), slice,
+//     getSliceResult, plus the widened selectPreset. Nothing else touches presets or the model.
+//   - all of them behind a per-tab opt-in (web_app_allow_settings / side_panel_allow_settings,
 //     both default off): absent from `capabilities` and answered with 1005 while it is off, so a
 //     slicer with the opt-ins off behaves exactly as before they existed.
 //   - three deny lists no configuration widens: print-host addresses and credentials are neither
@@ -130,6 +144,19 @@ public:
     void notify(const std::string& method, const nlohmann::json& data);
     // slicer.capabilitiesChanged with the current list, for Preferences to call after a toggle.
     void notify_capabilities();
+
+    // "Slice with <tab>" (MainFrame), opening the generic tab, and slicer.requestHandoff (the
+    // page): export plate `plate_idx` (-1 = the current one) for this tab's page. With `park`
+    // (the user-initiated forms) it is parked as the pending hand-off and announced
+    // (slicer.handoff); the page collects the details with slicer.takeHandoff, which also works
+    // for a page that loads only afterwards. Without `park` (the page asked, and is waiting on the
+    // reply) the details go straight back in `*body` and nothing is announced, so the page never
+    // sees the same plate twice. Either way the handle it creates is readable with
+    // readExportChunk/discardExport even while <slot>_allow_export is off -- the click, or the
+    // settings permission requestHandoff is gated on, is the consent for that one export.
+    // GUI thread. Returns an error message, empty on success.
+    std::string hand_off_plate(int plate_idx, const std::string& action, bool park = true,
+                               nlohmann::json* body = nullptr);
 
 private:
     // shared_ptr, not unique_ptr: an Http worker thread keeps the state alive for the duration of

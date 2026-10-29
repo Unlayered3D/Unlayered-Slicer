@@ -125,15 +125,16 @@ void when_no_dialog(GUI_App &app, std::function<void()> fn, int attempt = 0)
     auto *timer = new wxTimer();
     timer->Bind(wxEVT_TIMER, [&app, fn, attempt, timer](wxTimerEvent &) {
         timer->Stop();
-        app.CallAfter([timer] { delete timer; });
-        if (app.is_closing() || app.mainframe == nullptr)
-            return;
-        if (app.is_running_wizard() || modal_dialog_open()) {
-            if (attempt < 300)
+        if (!app.is_closing() && app.mainframe != nullptr) {
+            if (!app.is_running_wizard() && !modal_dialog_open())
+                fn(); // at once, so a question waiting on its own timer sees this one open and waits
+            else if (attempt < 300)
                 when_no_dialog(app, fn, attempt + 1);
-            return;
         }
-        fn();
+        // Deleted only after fn returns: fn shows a modal dialog, whose event loop runs queued calls,
+        // and deleting the timer destroys this handler -- and the copy of fn it holds -- while fn
+        // still runs (the captures read after ShowModal() returned were freed memory: a crash).
+        app.CallAfter([timer] { delete timer; });
     });
     timer->StartOnce(attempt == 0 ? 1500 : 2000);
 }

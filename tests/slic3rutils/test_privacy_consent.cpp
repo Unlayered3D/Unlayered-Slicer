@@ -528,6 +528,17 @@ TEST_CASE("Diagnostics allowlist: events, properties and values", "[Privacy]")
     CHECK(allowed_count_key("gizmo:cut"));
     CHECK_FALSE(allowed_count_key("gizmo:"));
     CHECK_FALSE(allowed_count_key("project:bracket"));
+
+    // A crash location with its caller chain survives (it used to be dropped for being over 120).
+    const std::string chain = "UnlayeredSlicer.dll+0x4862937>UnlayeredSlicer.dll+0x3ec547c>UnlayeredSlicer.dll+0x3f8e3cc"
+                              ">UnlayeredSlicer.dll+0x189b228>wxmsw32u_core_vc.dll+0x12345>USER32.dll+0x1a2b3";
+    REQUIRE(chain.size() > 120);
+    REQUIRE(chain.size() <= 190);
+    REQUIRE(filter("crash", {{"version", "0.1.7"}, {"exception", "0xC0000005"}, {"at", chain}}, json(), props, counts));
+    CHECK(props["at"] == chain);
+    // Other properties keep the 120 limit.
+    REQUIRE(filter("crash", {{"version", "0.1.7"}, {"phase", std::string(150, 'a')}}, json(), props, counts));
+    CHECK_FALSE(props.contains("phase"));
 }
 
 TEST_CASE("Usage diagnostics redact paths with spaces and bare model file names", "[Privacy]")
@@ -537,6 +548,13 @@ TEST_CASE("Usage diagnostics redact paths with spaces and bare model file names"
     CHECK(redact_message("Cannot open /home/jane smith/parts/bracket.stl", {}) == "Cannot open <path>");
     CHECK(redact_message("Failed to load bracket_v2.3mf", {}) == "Failed to load <file>");
     CHECK(redact_message("Layer height 0.2 is too small", {}) == "Layer height 0.2 is too small");
+    CHECK(redact_message("The configured post-processing script does not exist: ~/Clouds/MEGA/Models/ArcWelder", {}) ==
+          "The configured post-processing script does not exist: <path>");
+    CHECK(redact_message("Script ~\\tools\\arc failed", {}) == "Script <path> failed");
+    CHECK(redact_message("Script ./tools/arc.py failed", {}) == "Script <path> failed");
+    CHECK(redact_message("Script ../arc failed", {}) == "Script <path> failed");
+    CHECK(redact_message("Missing Clouds/MEGA/ArcWelder here", {}) == "Missing <path> here");
+    CHECK(redact_message("A/B tilt limit", {}) == "A/B tilt limit");
 }
 
 TEST_CASE("Privacy: one click on the region page names the place and its rules", "[Privacy]")

@@ -96,6 +96,19 @@ size_t count_decompose_new_physical_filaments(
     size_t source_physical_idx,
     const std::vector<size_t>* physical_config_indices);
 
+// The Decompose Color dialog's recommendation for one mode (what its card for `mode` shows):
+// physical_* describe the project's physical filaments in order (types as
+// filament_type_for_color_decompose gives them), source_physical_idx is the filament being
+// decomposed (left out of the material list; -1 for none) and preferred_type the material the
+// dialog's selector is on. Shared by the dialog and the filament.decomposeColour action.
+ColorDecomposeResult compute_decompose_result(DecomposeMode mode,
+                                              const wxColour& target,
+                                              int source_physical_idx,
+                                              const std::vector<std::string>& physical_colors,
+                                              const std::vector<std::string>& physical_names,
+                                              const std::vector<std::string>& physical_types,
+                                              const std::string& preferred_type);
+
 bool confirm_create_decompose_missing_components(wxWindow* parent,
     const std::vector<DecomposeMissingComponent>& missing);
 

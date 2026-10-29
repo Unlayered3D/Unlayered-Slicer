@@ -1807,6 +1807,50 @@ static wxString pad_combo_value_for_config(const DynamicPrintConfig &config)
     return config.opt_bool("pad_enable") ? (config.opt_bool("pad_around_object") ? _("Around object") : _("Below object")) : _("None");
 }
 
+// Unlayered (WEB_APP_BRIDGE.md 4.5): what a page is told about a settings change -- "Wall loops:
+// 2 -> 4". Values are the .ini serialisation, cut to 2000 characters; null where there is none.
+nlohmann::json Tab::describe_setting_change(const std::string& opt_key, const nlohmann::json& previous)
+{
+    auto value_of = [&opt_key](const DynamicPrintConfig *config) -> nlohmann::json {
+        const ConfigOption *opt = config ? config->option(opt_key) : nullptr;
+        if (opt == nullptr)
+            return nullptr;
+        std::string text = opt->serialize();
+        if (text.size() > 2000)
+            text.resize(2000);
+        return text;
+    };
+    const Preset  &selected = m_presets->get_selected_preset();
+    const Preset  *parent   = m_presets->get_selected_preset_parent();
+    nlohmann::json change   = {{"key", opt_key},
+                               {"value", value_of(m_config)},
+                               {"saved", value_of(&selected.config)},
+                               {"system", value_of(parent ? &parent->config : nullptr)}};
+    if (const ConfigOptionDef *def = m_config->def()->get(opt_key)) {
+        change["label"]    = def->full_label.empty() ? def->label : def->full_label;
+        change["category"] = def->category;
+        std::string tip    = def->tooltip;
+        if (tip.size() > 600)
+            tip.resize(600);
+        change["tooltip"] = tip;
+    }
+    // One cache for both paths: before 2026-10-14 only hand edits updated it, so a hand edit right
+    // after a bridge write reported the value from before that write as "previous".
+    static std::map<std::string, std::pair<std::string, std::string>> s_last_reported; // "type:key" -> (preset, value)
+    const std::string cache_key = std::to_string(int(m_type)) + ":" + opt_key;
+    if (!previous.is_null()) {
+        change["previous"] = previous;
+    } else {
+        auto last          = s_last_reported.find(cache_key);
+        change["previous"] = (last != s_last_reported.end() && last->second.first == selected.name) ?
+                                 nlohmann::json(last->second.second) :
+                                 change["saved"];
+    }
+    if (change["value"].is_string())
+        s_last_reported[cache_key] = {selected.name, change["value"].get<std::string>()};
+    return change;
+}
+
 void Tab::on_value_change(const std::string& opt_key, const boost::any& value)
 {
     // Orca:
@@ -1819,11 +1863,18 @@ void Tab::on_value_change(const std::string& opt_key, const boost::any& value)
 
     // Unlayered: report the edit to embedded web applications (WEB_APP_BRIDGE.md section 4.5),
     // unless it arrived over the bridge, which reports it once itself as source:"bridge".
-    if (!WebAppBridgeWriteScope::active())
+    // `changes` (2026-10-13) carries what a page needs to describe the change -- "Wall loops:
+    // 2 -> 4": the option's label, category and tooltip, the new value, the value just before this
+    // edit, the value saved in the preset and the built-in (system) value. Values are the .ini
+    // serialisation, cut to 2000 characters; null where there is none.
+    if (!WebAppBridgeWriteScope::active()) {
         WebAppPanel::notify_all("slicer.settingsChanged",
                                 nlohmann::json{{"type", WebAppSettings::preset_type_name(m_type)},
                                                {"keys", nlohmann::json::array({opt_key})},
-                                               {"source", "user"}});
+                                               {"source", "user"},
+                                               {"preset", m_presets->get_selected_preset().name},
+                                               {"changes", nlohmann::json::array({describe_setting_change(opt_key)})}});
+    }
 
     // Keep this preset's "plugins" manifest in sync when a plugin picker changes, so full_config() and
     // save_to_json() always find resolved "name;uuid;capability" references and rebuild it nowhere else.
@@ -2747,6 +2798,17 @@ void TabPrint::build()
         optgroup->append_single_option_line("zaa_minimize_perimeter_height", "quality_settings_z_contouring#minimize-wall-height-angle");
         optgroup->append_single_option_line("zaa_min_z", "quality_settings_z_contouring#minimum-z-height");
         optgroup->append_single_option_line("zaa_dont_alternate_fill_direction", "quality_settings_z_contouring#dont-alternate-fill-direction");
+
+        // UNLAYERED_MOD: curved top shells (NonplanarTop.cpp). Not the printer's "Non-planar Printing" group.
+        optgroup = page->new_optgroup(L("Nonplanar layers"), L"param_z_contouring");
+        optgroup->append_single_option_line("nonplanar_layers");
+        optgroup->append_single_option_line("nonplanar_max_angle");
+        optgroup->append_single_option_line("nonplanar_max_height");
+        optgroup->append_single_option_line("nonplanar_layer_count");
+        optgroup->append_single_option_line("nonplanar_top_surface_direction_enable");
+        optgroup->append_single_option_line("nonplanar_top_surface_direction");
+        optgroup->append_single_option_line("nonplanar_top_surface_flow_ratio_enable");
+        optgroup->append_single_option_line("nonplanar_top_surface_flow_ratio");
         // Orca: it's not used yet, so hide it in UI for now
         // optgroup->append_single_option_line("ironing_expansion");
 

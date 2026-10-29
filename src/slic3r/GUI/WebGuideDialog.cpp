@@ -1,6 +1,7 @@
 #include "WebGuideDialog.hpp"
 #include "OtherSlicerImportDialog.hpp"
 #include "AutoUpdater.hpp"
+#include "PrinterUpdateOffer.hpp"
 #include "slic3r/Utils/UsageTelemetry.hpp"
 #include "libslic3r/libslic3r.h"
 #include "ConfigWizard.hpp"
@@ -206,9 +207,183 @@ void GuideFrame::DetectOtherSlicers()
                             << (m_bambu_printers_in.empty() ? std::string() : ", Bambu Lab printers in " + m_bambu_printers_in);
 }
 
+// ---- Unlayered 0.1.8: "Update your Unlayered printer" (guide 21update) ----------------------------
+
+namespace {
+
+bool is_unlayered_host(const DynamicPrintConfig &cfg)
+{
+    const auto *host_type = cfg.option<ConfigOptionEnum<PrintHostType>>("host_type");
+    return host_type && host_type->value == htUnlayered;
+}
+
+// The Unlayered printer the step checks: the selected printer when it is one with an address,
+// otherwise the first set-up Unlayered printer that has one. The same keys PrinterUpdateOffer reads.
+struct UnlayeredPrinterTarget
+{
+    std::string name;
+    std::string host;
+    std::string password;
+};
+
+bool find_unlayered_printer(UnlayeredPrinterTarget &out)
+{
+    PresetBundle *bundle = wxGetApp().preset_bundle;
+    if (!bundle)
+        return false;
+    auto take = [&out](const Preset &preset) {
+        const DynamicPrintConfig &cfg = preset.config;
+        if (!is_unlayered_host(cfg) || !cfg.has("print_host"))
+            return false;
+        const std::string host = cfg.opt_string("print_host");
+        if (host.empty())
+            return false;
+        out.name     = preset.name;
+        out.host     = host;
+        out.password = cfg.has("printhost_apikey") ? cfg.opt_string("printhost_apikey") : std::string();
+        return true;
+    };
+    if (take(bundle->printers.get_edited_preset()))
+        return true;
+    for (const Preset &preset : bundle->printers)
+        if (preset.is_visible && take(preset))
+            return true;
+    return false;
+}
+
+wxString describe_printer_check(const PrinterUpdateOffer::CheckResult &r, const wxString &who, const std::string &host)
+{
+    const PrinterUpdateFacts &f     = r.facts;
+    AppConfig                *config = wxGetApp().app_config;
+    wxString                  text;
+    switch (r.outcome) {
+    case PrinterUpdateCheckOutcome::Unreachable:
+        return wxString::Format(_L("Could not reach %s at %s (%s). Check that the printer is switched on and on the same network "
+                                   "as this computer, then press Check for updates again. Or go on: Unlayered Slicer checks "
+                                   "again once the printer answers."),
+                                who, from_u8(host), from_u8(r.error));
+    case PrinterUpdateCheckOutcome::NoFeed:
+        return wxString::Format(_L("%s answered, but the update server could not be reached. Check this computer's internet "
+                                   "connection and try again, or go on: Unlayered Slicer checks again when it starts."),
+                                who);
+    case PrinterUpdateCheckOutcome::UpToDate:
+        text = wxString::Format(_L("%s is up to date: firmware %s."), who, from_u8(f.running_firmware));
+        if (r.config_asked && !f.available_config.empty())
+            text += " " + wxString::Format(_L("Printer settings %s."), from_u8(f.installed_config));
+        else if (r.config_asked)
+            text += " " + _L("The printer settings could not be checked right now.");
+        break;
+    case PrinterUpdateCheckOutcome::Available: {
+        text = wxString::Format(_L("Updates are waiting for %s:"), who);
+        const PrinterUpdateDecision d = decide_printer_update(f, no_printer_update_skips());
+        if (d.firmware)
+            text += "\n" + wxString::Format(_L("Firmware %s (it runs %s)"), from_u8(f.available_firmware), from_u8(f.running_firmware));
+        if (d.config)
+            text += "\n" + (f.config_known ? wxString::Format(_L("Printer settings %s (it has %s)"), from_u8(f.available_config),
+                                                              from_u8(f.installed_config)) :
+                                             wxString::Format(_L("Printer settings %s"), from_u8(f.available_config)));
+        text += "\n" + _L("When you finish setup, the \"Printer update available\" notification installs them: the firmware "
+                          "first, then the settings, and you confirm each one.");
+        break;
+    }
+    }
+    if (!r.config_asked) {
+        const bool signed_in = AutoUpdater::stored_sign_in(config);
+        text += "\n" + (signed_in && config && config->get_stealth_mode() ?
+                            _L("Stealth mode is on, so the printer settings were not checked.") :
+                            _L("Sign in to your free Unlayered account to check the printer settings too."));
+    }
+    return text;
+}
+
+} // namespace
+
+bool GuideFrame::UnlayeredPrinterInFlow() const
+{
+    // Ticked in the picker (save_userguide_models has just written nozzle_selected).
+    if (m_ProfileJson.is_object() && m_ProfileJson.contains("model") && m_ProfileJson["model"].is_array())
+        for (const json &model : m_ProfileJson["model"]) {
+            if (!model.is_object() || !model.contains("vendor") || !model["vendor"].is_string() ||
+                model["vendor"].get<std::string>() != "Unlayered")
+                continue;
+            if (model.contains("nozzle_selected") && model["nozzle_selected"].is_string() &&
+                !model["nozzle_selected"].get<std::string>().empty())
+                return true;
+        }
+    // Already set up: an installed Unlayered printer, or any printer that connects as one.
+    if (PresetBundle *bundle = wxGetApp().preset_bundle)
+        for (const Preset &preset : bundle->printers)
+            if (preset.is_visible && (is_unlayered_host(preset.config) || (preset.vendor && preset.vendor->name == "Unlayered")))
+                return true;
+    return false;
+}
+
+void GuideFrame::SendPrinterUpdateState()
+{
+    json res           = json::object();
+    res["command"]     = "printer_update_state";
+    res["sequence_id"] = "10002";
+    res["signed_in"]   = AutoUpdater::stored_sign_in(wxGetApp().app_config);
+    res["printer"]     = m_printer_check_printer;
+    res["result"]      = m_printer_check_result;
+    res["checked"]     = m_printer_checked;
+    res["busy"]        = m_printer_check_busy;
+    const wxString strJS = wxString::Format("HandleStudio(%s)", res.dump(-1, ' ', true));
+    wxGetApp().CallAfter([this, strJS] { RunScript(strJS); });
+}
+
+void GuideFrame::CheckPrinterUpdate()
+{
+    if (m_printer_check_busy)
+        return;
+    AppConfig *config = wxGetApp().app_config;
+    auto       send   = [this](const char *command, const std::string &text) {
+        json res           = json::object();
+        res["command"]     = command;
+        res["sequence_id"] = "10002";
+        res["printer"]     = m_printer_check_printer;
+        res["text"]        = text;
+        const wxString strJS = wxString::Format("HandleStudio(%s)", res.dump(-1, ' ', true));
+        wxGetApp().CallAfter([this, strJS, alive = m_alive] {
+            if (*alive)
+                RunScript(strJS);
+        });
+    };
+
+    UnlayeredPrinterTarget target;
+    if (!find_unlayered_printer(target)) {
+        // A new printer has no address yet. The check after the wizard runs as soon as it has one.
+        if (config)
+            config->set(PrinterUpdateOffer::CHECK_AFTER_SETUP_KEY, "1");
+        BOOST_LOG_TRIVIAL(info) << "GuideFrame: printer update step: no Unlayered printer with an address; checking after setup";
+        m_printer_checked       = true;
+        m_printer_check_printer.clear();
+        m_printer_check_result  = into_u8(_L("Unlayered Slicer does not know your printer's network address yet. When setup is "
+                                             "done, press Connection (the signal icon next to Printer in the Prepare tab) and "
+                                             "enter the printer's address. Unlayered Slicer then checks for updates and offers them."));
+        send("printer_update_result", m_printer_check_result);
+        return;
+    }
+
+    m_printer_check_busy    = true;
+    m_printer_check_printer = into_u8(wxString::Format(_L("%s at %s"), from_u8(target.name), from_u8(target.host)));
+    send("printer_update_checking", into_u8(_L("Checking...")));
+    PrinterUpdateOffer::check_now(target.host, target.password, m_alive, [this, target, send](const PrinterUpdateOffer::CheckResult &r) {
+        // check_now() calls this only while the frame is alive, on the UI thread.
+        m_printer_check_busy = false;
+        m_printer_checked    = true;
+        const wxString who   = from_u8(!r.machine_name.empty() ? r.machine_name : target.name);
+        m_printer_check_result = into_u8(describe_printer_check(r, who, target.host));
+        if (AppConfig *config = wxGetApp().app_config)
+            config->set(PrinterUpdateOffer::CHECK_AFTER_SETUP_KEY, printer_update_check_after_setup(r.outcome) ? "1" : "");
+        send("printer_update_result", m_printer_check_result);
+    });
+}
+
 GuideFrame::~GuideFrame()
 {
     m_destroy = true;
+    *m_alive  = false;
     // Test the pointer, not joinable(): a thread that already ran to completion is no longer
     // joinable but is still allocated.
     if (m_load_task) {
@@ -696,6 +871,28 @@ void GuideFrame::OnScriptMessage(wxWebViewEvent &evt)
             res["page"]        = after_signin ? (m_other_slicers_offered ? "5import" : "21") : (m_signin_shown ? "13signin" : "13");
             const wxString strJS = wxString::Format("HandleStudio(%s)", res.dump(-1, ' ', true));
             wxGetApp().CallAfter([this, strJS] { RunScript(strJS); });
+        }
+        else if (strCmd == "request_page_after_models" || strCmd == "request_page_before_filaments") {
+            // Unlayered 0.1.8: "Update your Unlayered printer" (guide 21update) sits between the
+            // printer picker (21) and the filament page (22) when an Unlayered printer is ticked or
+            // already set up. The picker's Next asks where it goes, the filament page's Back too.
+            const bool after_models = strCmd == "request_page_after_models";
+            const bool show         = UnlayeredPrinterInFlow();
+            BOOST_LOG_TRIVIAL(info) << "GuideFrame: printer update step " << (show ? "shown" : "not shown");
+            json res           = json::object();
+            res["command"]     = after_models ? "page_after_models" : "page_before_filaments";
+            res["sequence_id"] = "10002";
+            res["page"]        = show ? "21update" : (after_models ? "22" : "21");
+            const wxString strJS = wxString::Format("HandleStudio(%s)", res.dump(-1, ' ', true));
+            wxGetApp().CallAfter([this, strJS] { RunScript(strJS); });
+        }
+        else if (strCmd == "request_printer_update_state") {
+            // Guide 21update: signed in or not, and the last check's result (Back from page 22).
+            SendPrinterUpdateState();
+        }
+        else if (strCmd == "check_printer_update") {
+            // Guide 21update pressed Check for updates. Reads only; installs nothing.
+            CheckPrinterUpdate();
         }
         else if (strCmd == "request_signin_state") {
             // Guide 13signin: its texts, translated here, and whether the slicer is signed in already

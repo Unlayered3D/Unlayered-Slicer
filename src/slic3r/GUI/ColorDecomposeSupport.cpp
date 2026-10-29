@@ -6,6 +6,7 @@
 #include "libslic3r/Preset.hpp"
 #include "libslic3r/PresetBundle.hpp"
 #include "libslic3r/Utils.hpp"
+#include "libslic3r/ColorDecomposeRecipe.hpp"
 
 #include "nlohmann/json.hpp"
 
@@ -375,6 +376,200 @@ size_t count_decompose_new_physical_filaments(
             ++missing_count;
     }
     return missing_count;
+}
+
+// ---- the dialog's recommendation (moved from ColorDecomposeDialog::compute_decomposition) ----
+
+namespace {
+
+const wxColour kCmywCyan(0, 255, 255);
+const wxColour kCmywMagenta(255, 0, 255);
+const wxColour kCmywYellow(255, 255, 0);
+const wxColour kCmywWhite(255, 255, 255);
+const wxColour kRybwRed(255, 0, 0);
+const wxColour kRybwYellow(255, 255, 0);
+const wxColour kRybwBlue(0, 0, 255);
+const wxColour kRybwWhite(255, 255, 255);
+
+wxColour hex_or(const std::string& hex, const wxColour& fallback)
+{
+    wxColour color(hex);
+    return color.IsOk() ? color : fallback;
+}
+
+bool same_rgb(const wxColour& lhs, const wxColour& rhs)
+{
+    return lhs.Red() == rhs.Red() && lhs.Green() == rhs.Green() && lhs.Blue() == rhs.Blue();
+}
+
+DecomposeBaseColor base_color_from_key(const std::string& key)
+{
+    if (key == "Cyan")    return DecomposeBaseColor::Cyan;
+    if (key == "Magenta") return DecomposeBaseColor::Magenta;
+    if (key == "Yellow")  return DecomposeBaseColor::Yellow;
+    if (key == "White")   return DecomposeBaseColor::White;
+    if (key == "Red")     return DecomposeBaseColor::Red;
+    if (key == "Green")   return DecomposeBaseColor::Green;
+    if (key == "Blue")    return DecomposeBaseColor::Blue;
+    return DecomposeBaseColor::None;
+}
+
+wxColour pure_color_for(DecomposeBaseColor base)
+{
+    switch (base) {
+    case DecomposeBaseColor::Cyan:    return kCmywCyan;
+    case DecomposeBaseColor::Magenta: return kCmywMagenta;
+    case DecomposeBaseColor::Yellow:  return kCmywYellow;
+    case DecomposeBaseColor::White:   return kCmywWhite;
+    case DecomposeBaseColor::Red:     return kRybwRed;
+    case DecomposeBaseColor::Blue:    return kRybwBlue;
+    default:                          return *wxBLACK;
+    }
+}
+
+DecomposeBaseColor base_color_for(DecomposeMode mode, const wxColour& color)
+{
+    if (mode == DecomposeMode::CMYW) {
+        if (same_rgb(color, kCmywCyan))    return DecomposeBaseColor::Cyan;
+        if (same_rgb(color, kCmywMagenta)) return DecomposeBaseColor::Magenta;
+        if (same_rgb(color, kCmywYellow))  return DecomposeBaseColor::Yellow;
+        if (same_rgb(color, kCmywWhite))   return DecomposeBaseColor::White;
+    } else if (mode == DecomposeMode::RYBW) {
+        if (same_rgb(color, kRybwRed))     return DecomposeBaseColor::Red;
+        if (same_rgb(color, kRybwYellow))  return DecomposeBaseColor::Yellow;
+        if (same_rgb(color, kRybwBlue))    return DecomposeBaseColor::Blue;
+        if (same_rgb(color, kRybwWhite))   return DecomposeBaseColor::White;
+    }
+    return DecomposeBaseColor::None;
+}
+
+ColorDecomposeResult from_recipe(const ColorDecomposeRecipeResult& recipe, const wxColour& fallback)
+{
+    ColorDecomposeResult result;
+    result.mode          = recipe.mode;
+    result.matched_color = hex_or(recipe.matched_color_hex, fallback);
+    for (const auto& comp_recipe : recipe.components) {
+        DecomposeComponent comp;
+        comp.colour         = hex_or(comp_recipe.color_hex, fallback);
+        comp.ratio          = comp_recipe.ratio;
+        comp.filament_index = static_cast<int>(comp_recipe.filament_index);
+        comp.base_color     = base_color_from_key(comp_recipe.base_color);
+        if (comp.base_color == DecomposeBaseColor::None)
+            comp.base_color = base_color_for(recipe.mode, comp.colour);
+        result.components.push_back(comp);
+    }
+    return result;
+}
+
+// The target is exactly one of the standard base colours of the preferred type (PLA Basic only):
+// the card shows that base at 100% instead of a mix.
+bool single_base_result(DecomposeMode mode, const wxColour& target, const std::string& preferred_type, ColorDecomposeResult& out)
+{
+    if ((mode != DecomposeMode::CMYW && mode != DecomposeMode::RYBW) || preferred_type != kDecomposePlaBasicType)
+        return false;
+    static const DecomposeBaseColor cmyw_bases[] = {DecomposeBaseColor::Cyan, DecomposeBaseColor::Magenta, DecomposeBaseColor::Yellow,
+                                                    DecomposeBaseColor::White};
+    static const DecomposeBaseColor rybw_bases[] = {DecomposeBaseColor::Red, DecomposeBaseColor::Yellow, DecomposeBaseColor::Blue,
+                                                    DecomposeBaseColor::White};
+    const DecomposeBaseColor* bases = mode == DecomposeMode::CMYW ? cmyw_bases : rybw_bases;
+    const std::string target_hex = decompose_normalize_color_hex(target.GetAsString(wxC2S_HTML_SYNTAX).ToStdString());
+    for (size_t i = 0; i < 4; ++i) {
+        const DecomposeBaseColor   base     = bases[i];
+        DecomposeOfficialComponent official = lookup_decompose_official_component(preferred_type, base, pure_color_for(base));
+        if (decompose_normalize_color_hex(official.color_hex) != target_hex)
+            continue;
+        out               = ColorDecomposeResult{};
+        out.mode          = mode;
+        out.matched_color = hex_or(official.color_hex, target);
+        DecomposeComponent comp;
+        comp.colour         = out.matched_color;
+        comp.ratio          = 100;
+        comp.filament_index = -1;
+        comp.base_color     = base;
+        out.components.push_back(comp);
+        return true;
+    }
+    return false;
+}
+
+ColorDecomposeResult averaged_result(DecomposeMode mode, const std::vector<DecomposeComponent>& components, const wxColour& target)
+{
+    ColorDecomposeResult result;
+    result.mode       = mode;
+    result.components = components;
+    int    total      = 0;
+    double r = 0.0, g = 0.0, b = 0.0;
+    for (const auto& comp : result.components)
+        total += comp.ratio;
+    if (total <= 0)
+        total = 100;
+    for (const auto& comp : result.components) {
+        const double w = static_cast<double>(comp.ratio) / total;
+        r += comp.colour.Red() * w;
+        g += comp.colour.Green() * w;
+        b += comp.colour.Blue() * w;
+    }
+    result.matched_color = result.components.empty() ? target :
+                                                       wxColour(static_cast<unsigned char>(std::clamp(r, 0.0, 255.0)),
+                                                                static_cast<unsigned char>(std::clamp(g, 0.0, 255.0)),
+                                                                static_cast<unsigned char>(std::clamp(b, 0.0, 255.0)));
+    return result;
+}
+
+} // namespace
+
+ColorDecomposeResult compute_decompose_result(DecomposeMode mode,
+                                              const wxColour& target,
+                                              int source_physical_idx,
+                                              const std::vector<std::string>& physical_colors,
+                                              const std::vector<std::string>& physical_names,
+                                              const std::vector<std::string>& physical_types,
+                                              const std::string& preferred_type)
+{
+    const ColorDecomposeRgb target_rgb{static_cast<unsigned char>(target.Red()), static_cast<unsigned char>(target.Green()),
+                                       static_cast<unsigned char>(target.Blue())};
+    if (mode == DecomposeMode::MaterialList) {
+        std::vector<ColorDecomposePhysicalFilament> physical_filaments;
+        physical_filaments.reserve(physical_colors.size());
+        for (size_t i = 0; i < physical_colors.size(); ++i) {
+            if (source_physical_idx >= 0 && i == static_cast<size_t>(source_physical_idx))
+                continue;
+            ColorDecomposePhysicalFilament filament;
+            filament.color_hex      = physical_colors[i];
+            filament.name           = i < physical_names.size() ? physical_names[i] : "";
+            filament.type           = i < physical_types.size() ? physical_types[i] : "";
+            filament.filament_index = static_cast<unsigned int>(i + 1);
+            physical_filaments.push_back(std::move(filament));
+        }
+        auto material_recipe = recommend_from_physical_filaments(target_rgb, physical_filaments, preferred_type);
+        if (material_recipe.valid)
+            return from_recipe(material_recipe, target);
+        std::vector<DecomposeComponent> components;
+        for (size_t i = 0; i < std::min<size_t>(2, physical_filaments.size()); ++i) {
+            DecomposeComponent comp;
+            comp.colour         = wxColour(physical_filaments[i].color_hex);
+            comp.ratio          = 50;
+            comp.filament_index = static_cast<int>(physical_filaments[i].filament_index);
+            components.push_back(comp);
+        }
+        if (components.empty())
+            components.push_back({target, 100, -1});
+        else if (components.size() == 1)
+            components.front().ratio = 100;
+        return averaged_result(DecomposeMode::MaterialList, components, target);
+    }
+
+    ColorDecomposeResult single_base;
+    if (single_base_result(mode, target, preferred_type, single_base))
+        return single_base;
+    const bool cmyw   = mode == DecomposeMode::CMYW;
+    auto       recipe = lookup_standard_recipe(target_rgb, cmyw ? ColorDecomposeRecipeMode::CMYW : ColorDecomposeRecipeMode::RYBW, preferred_type);
+    if (recipe.valid)
+        return from_recipe(recipe, target);
+    return cmyw ? averaged_result(DecomposeMode::CMYW,
+                                  {{kCmywYellow, 50, -1, DecomposeBaseColor::Yellow}, {kCmywCyan, 50, -1, DecomposeBaseColor::Cyan}}, target) :
+                  averaged_result(DecomposeMode::RYBW,
+                                  {{kRybwYellow, 50, -1, DecomposeBaseColor::Yellow}, {kRybwBlue, 50, -1, DecomposeBaseColor::Blue}}, target);
 }
 
 bool confirm_create_decompose_missing_components(wxWindow* parent, const std::vector<DecomposeMissingComponent>& missing)

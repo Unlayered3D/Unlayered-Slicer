@@ -122,6 +122,14 @@ var LangText = {
     orca14: "This slicer can cut a model into sections and print each one along its own build direction, so overhangs and layer lines no longer have to follow a single flat stack. It works differently from ordinary slicing, and the walkthrough is short.",
     orca15: "You can open it again at any time from Help &gt; Multiplanar Tutorial.",
     orca16: "Open the tutorial",
+    // Unlayered 0.1.8: guide 21update "Update your Unlayered printer".
+    unlupd1: "Update your Unlayered printer",
+    unlupd2: "Get the latest firmware and printer settings for your Unlayered printer. Connect it to your network, then press Check for updates. We install the firmware first, then the settings; you confirm each one. Your calibration, name and network settings are never replaced.",
+    unlupd3: "Check for updates",
+    unlupd4: "Do it later",
+    unlupd5: "Later, you find this in the Prepare tab: press Connection (the signal icon next to Printer), then Firmware or Config. When an update is published, Unlayered Slicer also shows a \"Printer update available\" notification.",
+    unlupd6: "Downloading the printer settings needs your free Unlayered account.",
+    unlupd7: "Sign in",
   },
   ca_ES: {
     t1: "Benvingut a Unlayered Slicer",
@@ -237,6 +245,14 @@ var LangText = {
     orca9: "Bambu Cloud Account",
     orca10: "Not connected",
     orca11: "Connected",
+    // Unlayered 0.1.8: guide 21update "Update your Unlayered printer". English until translated.
+    unlupd1: "Update your Unlayered printer",
+    unlupd2: "Get the latest firmware and printer settings for your Unlayered printer. Connect it to your network, then press Check for updates. We install the firmware first, then the settings; you confirm each one. Your calibration, name and network settings are never replaced.",
+    unlupd3: "Check for updates",
+    unlupd4: "Do it later",
+    unlupd5: "Later, you find this in the Prepare tab: press Connection (the signal icon next to Printer), then Firmware or Config. When an update is published, Unlayered Slicer also shows a \"Printer update available\" notification.",
+    unlupd6: "Downloading the printer settings needs your free Unlayered account.",
+    unlupd7: "Sign in",
   },
   es_ES: {
     t1: "Bienvenido a Unlayered Slicer",
@@ -355,6 +371,14 @@ var LangText = {
     orca9: "Bambu Cloud Account",
     orca10: "Not connected",
     orca11: "Connected",
+    // Unlayered 0.1.8: guide 21update "Update your Unlayered printer".
+    unlupd1: "Actualiza tu impresora Unlayered",
+    unlupd2: "Obtén el firmware y los ajustes de impresora más recientes para tu impresora Unlayered. Conéctala a tu red y pulsa Buscar actualizaciones. Primero instalamos el firmware y después los ajustes; tú confirmas cada paso. Tu calibración, el nombre y los ajustes de red nunca se sustituyen.",
+    unlupd3: "Buscar actualizaciones",
+    unlupd4: "Más tarde",
+    unlupd5: "Más adelante lo encontrarás en la pestaña Preparar: pulsa Conexión (el icono de señal junto a Impresora) y después Firmware o Config. Cuando se publica una actualización, Unlayered Slicer también muestra el aviso \"Printer update available\".",
+    unlupd6: "Para descargar los ajustes de la impresora necesitas tu cuenta gratuita de Unlayered.",
+    unlupd7: "Iniciar sesión",
   },
   it_IT: {
     t1: "Benvenuti in Unlayered Slicer",
@@ -472,6 +496,14 @@ var LangText = {
     orca9: "Bambu Cloud Account",
     orca10: "Not connected",
     orca11: "Connected",
+    // Unlayered 0.1.8: guide 21update "Update your Unlayered printer".
+    unlupd1: "Aggiorna la tua stampante Unlayered",
+    unlupd2: "Ottieni il firmware e le impostazioni più recenti per la tua stampante Unlayered. Collegala alla tua rete, poi premi Cerca aggiornamenti. Installiamo prima il firmware, poi le impostazioni; confermi ogni passaggio. La calibrazione, il nome e le impostazioni di rete non vengono mai sostituiti.",
+    unlupd3: "Cerca aggiornamenti",
+    unlupd4: "Più tardi",
+    unlupd5: "In seguito lo trovi nella scheda Prepara: premi Connessione (l'icona del segnale accanto a Stampante), poi Firmware o Config. Quando viene pubblicato un aggiornamento, Unlayered Slicer mostra anche la notifica \"Printer update available\".",
+    unlupd6: "Per scaricare le impostazioni della stampante serve il tuo account Unlayered gratuito.",
+    unlupd7: "Accedi",
   },
   de_DE: {
     t1: "Willkommen im Unlayered Slicer",
@@ -581,6 +613,14 @@ var LangText = {
     orca9: "Bambu Cloud Account",
     orca10: "Not connected",
     orca11: "Connected",
+    // Unlayered 0.1.8: guide 21update "Update your Unlayered printer".
+    unlupd1: "Ihren Unlayered-Drucker aktualisieren",
+    unlupd2: "Holen Sie sich die neueste Firmware und die neuesten Druckereinstellungen für Ihren Unlayered-Drucker. Verbinden Sie ihn mit Ihrem Netzwerk und klicken Sie dann auf „Nach Updates suchen“. Wir installieren zuerst die Firmware, dann die Einstellungen; Sie bestätigen jeden Schritt. Ihre Kalibrierung, der Name und die Netzwerkeinstellungen werden nie ersetzt.",
+    unlupd3: "Nach Updates suchen",
+    unlupd4: "Später erledigen",
+    unlupd5: "Später finden Sie dies im Tab „Vorbereiten“: Klicken Sie auf „Verbindung“ (das Signal-Symbol neben „Drucker“) und dann auf „Firmware“ oder „Config“. Wenn ein Update veröffentlicht wird, zeigt Unlayered Slicer außerdem die Benachrichtigung „Printer update available“.",
+    unlupd6: "Zum Herunterladen der Druckereinstellungen brauchen Sie Ihr kostenloses Unlayered-Konto.",
+    unlupd7: "Anmelden",
   },
   cs_CZ: {
     t1: "Vítejte v Unlayered Slicer",
@@ -690,6 +730,14 @@ var LangText = {
     orca9: "Bambu Cloud Account",
     orca10: "Not connected",
     orca11: "Connected",
+    // Unlayered 0.1.8: guide 21update "Update your Unlayered printer". English until translated.
+    unlupd1: "Update your Unlayered printer",
+    unlupd2: "Get the latest firmware and printer settings for your Unlayered printer. Connect it to your network, then press Check for updates. We install the firmware first, then the settings; you confirm each one. Your calibration, name and network settings are never replaced.",
+    unlupd3: "Check for updates",
+    unlupd4: "Do it later",
+    unlupd5: "Later, you find this in the Prepare tab: press Connection (the signal icon next to Printer), then Firmware or Config. When an update is published, Unlayered Slicer also shows a \"Printer update available\" notification.",
+    unlupd6: "Downloading the printer settings needs your free Unlayered account.",
+    unlupd7: "Sign in",
   },
   fr_FR: {
     t1: "Bienvenue sur Unlayered Slicer",
@@ -818,6 +866,14 @@ var LangText = {
     orca9: "Bambu Cloud Account",
     orca10: "Not connected",
     orca11: "Connected",
+    // Unlayered 0.1.8: guide 21update "Update your Unlayered printer".
+    unlupd1: "Mettre à jour votre imprimante Unlayered",
+    unlupd2: "Obtenez le dernier firmware et les derniers réglages de votre imprimante Unlayered. Connectez-la à votre réseau, puis cliquez sur Rechercher des mises à jour. Nous installons d'abord le firmware, puis les réglages ; vous confirmez chaque étape. Votre calibration, le nom et les réglages réseau ne sont jamais remplacés.",
+    unlupd3: "Rechercher des mises à jour",
+    unlupd4: "Plus tard",
+    unlupd5: "Vous retrouverez cela plus tard dans l'onglet Préparer : cliquez sur Connexion (l'icône de signal à côté d'Imprimante), puis sur Firmware ou Config. Lorsqu'une mise à jour est publiée, Unlayered Slicer affiche aussi la notification « Printer update available ».",
+    unlupd6: "Le téléchargement des réglages de l'imprimante nécessite votre compte Unlayered gratuit.",
+    unlupd7: "Se connecter",
   },
   zh_CN: {
     t1: "欢迎使用Unlayered Slicer",
@@ -950,6 +1006,14 @@ var LangText = {
     orca9: "Bambu Cloud Account",
     orca10: "Not connected",
     orca11: "Connected",
+    // Unlayered 0.1.8: guide 21update "Update your Unlayered printer". English until translated.
+    unlupd1: "Update your Unlayered printer",
+    unlupd2: "Get the latest firmware and printer settings for your Unlayered printer. Connect it to your network, then press Check for updates. We install the firmware first, then the settings; you confirm each one. Your calibration, name and network settings are never replaced.",
+    unlupd3: "Check for updates",
+    unlupd4: "Do it later",
+    unlupd5: "Later, you find this in the Prepare tab: press Connection (the signal icon next to Printer), then Firmware or Config. When an update is published, Unlayered Slicer also shows a \"Printer update available\" notification.",
+    unlupd6: "Downloading the printer settings needs your free Unlayered account.",
+    unlupd7: "Sign in",
   },
   zh_TW: {
     t1: "歡迎使用 Unlayered Slicer",
@@ -1061,6 +1125,14 @@ var LangText = {
     orca9: "Bambu Cloud Account",
     orca10: "Not connected",
     orca11: "Connected",
+    // Unlayered 0.1.8: guide 21update "Update your Unlayered printer". English until translated.
+    unlupd1: "Update your Unlayered printer",
+    unlupd2: "Get the latest firmware and printer settings for your Unlayered printer. Connect it to your network, then press Check for updates. We install the firmware first, then the settings; you confirm each one. Your calibration, name and network settings are never replaced.",
+    unlupd3: "Check for updates",
+    unlupd4: "Do it later",
+    unlupd5: "Later, you find this in the Prepare tab: press Connection (the signal icon next to Printer), then Firmware or Config. When an update is published, Unlayered Slicer also shows a \"Printer update available\" notification.",
+    unlupd6: "Downloading the printer settings needs your free Unlayered account.",
+    unlupd7: "Sign in",
   },
   ru_RU: {
     t1: "Приветствуем в Unlayered Slicer!",
@@ -1179,6 +1251,14 @@ var LangText = {
     orca9: "Bambu Cloud Account",
     orca10: "Not connected",
     orca11: "Connected",
+    // Unlayered 0.1.8: guide 21update "Update your Unlayered printer". English until translated.
+    unlupd1: "Update your Unlayered printer",
+    unlupd2: "Get the latest firmware and printer settings for your Unlayered printer. Connect it to your network, then press Check for updates. We install the firmware first, then the settings; you confirm each one. Your calibration, name and network settings are never replaced.",
+    unlupd3: "Check for updates",
+    unlupd4: "Do it later",
+    unlupd5: "Later, you find this in the Prepare tab: press Connection (the signal icon next to Printer), then Firmware or Config. When an update is published, Unlayered Slicer also shows a \"Printer update available\" notification.",
+    unlupd6: "Downloading the printer settings needs your free Unlayered account.",
+    unlupd7: "Sign in",
   },
   ko_KR: {
     t1: "Unlayered Slicer에 오신 것을 환영합니다",
@@ -1277,6 +1357,14 @@ var LangText = {
     orca9: "Bambu Cloud Account",
     orca10: "Not connected",
     orca11: "Connected",
+    // Unlayered 0.1.8: guide 21update "Update your Unlayered printer". English until translated.
+    unlupd1: "Update your Unlayered printer",
+    unlupd2: "Get the latest firmware and printer settings for your Unlayered printer. Connect it to your network, then press Check for updates. We install the firmware first, then the settings; you confirm each one. Your calibration, name and network settings are never replaced.",
+    unlupd3: "Check for updates",
+    unlupd4: "Do it later",
+    unlupd5: "Later, you find this in the Prepare tab: press Connection (the signal icon next to Printer), then Firmware or Config. When an update is published, Unlayered Slicer also shows a \"Printer update available\" notification.",
+    unlupd6: "Downloading the printer settings needs your free Unlayered account.",
+    unlupd7: "Sign in",
   },
   tr_TR: {
     t1: "Unlayered Slicer'a hoş geldiniz",
@@ -1395,6 +1483,14 @@ var LangText = {
     orca9: "Bambu Cloud Account",
     orca10: "Not connected",
     orca11: "Connected",
+    // Unlayered 0.1.8: guide 21update "Update your Unlayered printer". English until translated.
+    unlupd1: "Update your Unlayered printer",
+    unlupd2: "Get the latest firmware and printer settings for your Unlayered printer. Connect it to your network, then press Check for updates. We install the firmware first, then the settings; you confirm each one. Your calibration, name and network settings are never replaced.",
+    unlupd3: "Check for updates",
+    unlupd4: "Do it later",
+    unlupd5: "Later, you find this in the Prepare tab: press Connection (the signal icon next to Printer), then Firmware or Config. When an update is published, Unlayered Slicer also shows a \"Printer update available\" notification.",
+    unlupd6: "Downloading the printer settings needs your free Unlayered account.",
+    unlupd7: "Sign in",
   },
   pl_PL: {
     t1: "Witamy w Unlayered Slicer",
@@ -1513,6 +1609,14 @@ var LangText = {
     orca9: "Bambu Cloud Account",
     orca10: "Not connected",
     orca11: "Connected",
+    // Unlayered 0.1.8: guide 21update "Update your Unlayered printer". English until translated.
+    unlupd1: "Update your Unlayered printer",
+    unlupd2: "Get the latest firmware and printer settings for your Unlayered printer. Connect it to your network, then press Check for updates. We install the firmware first, then the settings; you confirm each one. Your calibration, name and network settings are never replaced.",
+    unlupd3: "Check for updates",
+    unlupd4: "Do it later",
+    unlupd5: "Later, you find this in the Prepare tab: press Connection (the signal icon next to Printer), then Firmware or Config. When an update is published, Unlayered Slicer also shows a \"Printer update available\" notification.",
+    unlupd6: "Downloading the printer settings needs your free Unlayered account.",
+    unlupd7: "Sign in",
   },
   pt_BR: {
     t1: "Bem-vindo ao Unlayered Slicer",
@@ -1631,6 +1735,14 @@ var LangText = {
     orca9: "Bambu Cloud Account",
     orca10: "Not connected",
     orca11: "Connected",
+    // Unlayered 0.1.8: guide 21update "Update your Unlayered printer".
+    unlupd1: "Atualize sua impressora Unlayered",
+    unlupd2: "Obtenha o firmware e as configurações de impressora mais recentes para sua impressora Unlayered. Conecte-a à sua rede e clique em Verificar atualizações. Instalamos primeiro o firmware e depois as configurações; você confirma cada etapa. Sua calibração, o nome e as configurações de rede nunca são substituídos.",
+    unlupd3: "Verificar atualizações",
+    unlupd4: "Fazer depois",
+    unlupd5: "Depois, você encontra isso na aba Preparar: clique em Conexão (o ícone de sinal ao lado de Impressora) e depois em Firmware ou Config. Quando uma atualização é publicada, o Unlayered Slicer também mostra a notificação \"Printer update available\".",
+    unlupd6: "Baixar as configurações da impressora requer sua conta Unlayered gratuita.",
+    unlupd7: "Entrar",
   },
   lt_LT: {
     t1: "Pasisveikinkite su Unlayered Slicer",
@@ -1748,6 +1860,14 @@ var LangText = {
     orca9: "Bambu Cloud paskyra",
     orca10: "Neprisijungta",
     orca11: "Prisijungta",
+    // Unlayered 0.1.8: guide 21update "Update your Unlayered printer". English until translated.
+    unlupd1: "Update your Unlayered printer",
+    unlupd2: "Get the latest firmware and printer settings for your Unlayered printer. Connect it to your network, then press Check for updates. We install the firmware first, then the settings; you confirm each one. Your calibration, name and network settings are never replaced.",
+    unlupd3: "Check for updates",
+    unlupd4: "Do it later",
+    unlupd5: "Later, you find this in the Prepare tab: press Connection (the signal icon next to Printer), then Firmware or Config. When an update is published, Unlayered Slicer also shows a \"Printer update available\" notification.",
+    unlupd6: "Downloading the printer settings needs your free Unlayered account.",
+    unlupd7: "Sign in",
   },
 };
 

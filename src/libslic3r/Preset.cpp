@@ -292,6 +292,43 @@ void extend_default_config_length(DynamicPrintConfig& config, const bool set_nil
     }
 }
 
+// Unlayered: see Preset.hpp. extend_default_config_length() above does the same resize when a
+// preset is read from disk; this one is for a config that is already in memory (an edited or
+// saved preset, or a filament config about to be joined into the project config), and it says
+// which keys it changed.
+std::vector<std::string> normalize_filament_variant_lengths(DynamicPrintConfig& config, const std::string& preset_name)
+{
+    std::vector<std::string> resized;
+    const ConfigOptionStrings* variants = config.option<ConfigOptionStrings>("filament_extruder_variant");
+    if (variants == nullptr || variants->values.empty())
+        return resized;
+    const size_t variant_count = variants->values.size();
+
+    for (const std::string& key : filament_options_with_variant) {
+        if (key == "filament_extruder_variant")
+            continue; // the list the others are measured against
+        ConfigOption* opt = config.option(key);
+        if (opt == nullptr || !opt->is_vector())
+            continue;
+        ConfigOptionVectorBase* vec = static_cast<ConfigOptionVectorBase*>(opt);
+        const size_t old_size = vec->size();
+        if (old_size == variant_count)
+            continue;
+        const ConfigOption* fallback = nullptr; // only used when the list is empty
+        if (const ConfigOptionDef* def = print_config_def.get(key); def != nullptr)
+            fallback = def->default_value.get();
+        if (old_size == 0 && fallback == nullptr)
+            continue;
+        // A short list repeats its first value (ConfigOptionVector::resize), a long one is cut.
+        vec->resize(variant_count, fallback);
+        resized.push_back(key);
+        BOOST_LOG_TRIVIAL(warning) << "normalize_filament_variant_lengths: filament preset \"" << preset_name << "\": " << key
+                                   << " had " << old_size << " value(s) for " << variant_count
+                                   << " extruder variant(s); resized to " << variant_count;
+    }
+    return resized;
+}
+
 
 VendorProfile VendorProfile::from_ini(const ptree &tree, const boost::filesystem::path &path, bool load_all)
 {
@@ -1391,6 +1428,10 @@ static std::vector<std::string> s_Preset_print_options{
     "zaa_dont_alternate_fill_direction",
     "zaa_min_z",
     "ironing_expansion",
+    // UNLAYERED_MOD: nonplanar layers
+    "nonplanar_layers", "nonplanar_max_angle", "nonplanar_max_height", "nonplanar_layer_count",
+    "nonplanar_top_surface_direction_enable", "nonplanar_top_surface_direction",
+    "nonplanar_top_surface_flow_ratio_enable", "nonplanar_top_surface_flow_ratio",
     // Multi-Axis
     "test_input", "layer_rotation_b", "layer_rotation_c", "print_group",
     "support_direction", "support_direction_b", "support_direction_c", "support_direction_max_lean", "support_section_overlap",

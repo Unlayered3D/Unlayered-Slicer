@@ -31,6 +31,7 @@
 #include "slic3r/Utils/PresetUpdater.hpp"
 #include "PrivacySetupDialog.hpp"
 
+#include <atomic>
 #include <memory>
 #include <unordered_map>
 #include <mutex>
@@ -151,6 +152,20 @@ private:
     // "Bambu Studio" / "OrcaSlicer" when its printer list has Bambu Lab printers: the last page then
     // ticks the network plug-in box.
     std::string                        m_bambu_printers_in;
+
+    // Unlayered 0.1.8, "Update your Unlayered printer" (guide 21update) between the printer picker
+    // and the filament page, shown when an Unlayered printer is ticked or already set up. Its Check
+    // for updates runs PrinterUpdateOffer::check_now() and installs nothing; what the wizard cannot
+    // finish is left to the first check after it (PrinterUpdateOffer::CHECK_AFTER_SETUP_KEY).
+    bool                               UnlayeredPrinterInFlow() const;
+    void                               SendPrinterUpdateState();
+    void                               CheckPrinterUpdate();
+    // False once the frame is gone, for the check's answer arriving after the wizard closed.
+    std::shared_ptr<std::atomic<bool>> m_alive{std::make_shared<std::atomic<bool>>(true)};
+    bool                               m_printer_check_busy{false};
+    bool                               m_printer_checked{false};
+    std::string                        m_printer_check_printer; // "name at address", shown again on Back
+    std::string                        m_printer_check_result;
 
     // User Config
     bool PrivacyUse;

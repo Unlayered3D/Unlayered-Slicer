@@ -7,6 +7,7 @@
 // use the pieces they need (the write-in-progress latch, the slice summary) without depending on
 // the bridge itself.
 
+#include <set>
 #include <string>
 #include <vector>
 
@@ -22,6 +23,7 @@ class ConfigBase;
 namespace GUI {
 
 class PartPlate;
+class Tab;
 
 namespace WebAppSettings {
 
@@ -60,6 +62,37 @@ const char* mode_name(ConfigOptionMode mode);
 // The schema entry for one option, from print_config_def. `cfg` (nullable) supplies `value` as
 // the option's .ini serialisation when it holds the key. Null JSON for an unknown key.
 nlohmann::json option_schema_json(const std::string& key, const ConfigBase* cfg);
+
+// The couplings Tab::on_value_change keeps for the GUI's field handlers (filament_diameter and
+// pellet_flow_coefficient, enable_prime_tower, single_extruder_multi_material,
+// purge_in_prime_tower, gcode_flavor), which Tab::load_config does not run: called after a write
+// of `keys` that `config` holds the new values of, so every automated write path -- setSettings,
+// revertKeys, createFromTemplate, copyExtruder -- leaves the tab as a hand edit would. Returns
+// whether any ran (the caller's tab then needs update_dirty + reload_config, done here).
+bool apply_tab_couplings(Tab& tab, const ConfigBase& config, const std::vector<std::string>& keys);
+
+// Per-variant settings (multi-extruder printers, high-flow nozzles): a vector option of the
+// print, filament or printer preset holds one value per extruder variant, and the tabs' extruder
+// switch / variant combo picks which index a page edits (Tab::switch_excluder). These map an
+// extruder (0-based, as the switch counts) to that index with the same lookup.
+struct VariantKeys
+{
+    const char*                  id_name;      // "print_extruder_id"; "" for filaments
+    const char*                  variant_name; // "print_extruder_variant"
+    const std::set<std::string>* keys;         // the per-variant options of that preset type
+};
+VariantKeys variant_keys_for(Preset::Type type);
+// Values per variant of `key` in a preset of `type`: 0 (not per-variant), 1, or 2 (the printer's
+// machine limits: normal and silent mode).
+int variant_stride(Preset::Type type, const std::string& key);
+// The edited printer's extruder count (its extruder_type list).
+int printer_extruder_count();
+// The variant index `extruder` edits in `cfg` (a config of `tab`'s type), or -1.
+int variant_index_for(Tab& tab, const DynamicPrintConfig& cfg, int extruder);
+// [{extruder, index, variant}] for every extruder of the printer.
+nlohmann::json variants_json(Tab& tab, const DynamicPrintConfig& cfg);
+// The serialised value(s) of one variant: `stride` values from index * stride, comma-joined.
+std::string variant_value_text(const ConfigOption* opt, int index, int stride);
 
 // What a page wants to know after a slice, from the plate's G-code result and its Print's
 // statistics. Null JSON when the plate has no valid slice result.

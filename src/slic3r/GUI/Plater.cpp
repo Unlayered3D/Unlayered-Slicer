@@ -141,6 +141,9 @@
 #include "RemovableDriveManager.hpp"
 #include "InstanceCheck.hpp"
 #include "NotificationManager.hpp"
+#include "ProjectAside.hpp"
+#include "SliceServiceOptionsDialog.hpp"
+#include "AutoUpdater.hpp"
 #include "PresetComboBoxes.hpp"
 #include "MsgDialog.hpp"
 #include "Widgets/MultiNozzleSync.hpp"           // NozzleOption, tryPopUpMultiNozzleDialog, setExtruderNozzleCount
@@ -228,6 +231,57 @@ static bool has_importable_texture(const Slic3r::TexturedMesh& textured_mesh)
 
     return std::any_of(textured_mesh.textures.begin(), textured_mesh.textures.end(),
         [](const Slic3r::TextureImage& texture) { return !texture.data.empty(); });
+}
+
+// ---------------------------------------------------------------------------------------------
+// UNLAYERED_MOD -- slicer.projectChanged (WEB_APP_BRIDGE.md 4.5). new_project and load_project
+// announce a project switch to the web tabs (a page that keeps per-project state starts afresh on it). Not
+// every call of theirs is one: the slicer also uses them internally -- the project set aside for a
+// G-code preview and brought back, G-code opening itself, the crash/rebuild restore -- and those
+// run under a QuietProjectChange. A project the bridge itself asked to open is reported with
+// source "bridge" and the asking tab's slot, so that tab can tell its own open from the person's.
+// ---------------------------------------------------------------------------------------------
+namespace {
+
+int         s_project_change_quiet = 0;
+std::string s_bridge_open_path; // UTF-8, as handed to request_open_project
+std::string s_bridge_open_slot;
+int         s_bridge_request_depth = 0; // > 0 while the bridge dispatches a request (Plater::BridgeRequestScope)
+
+struct QuietProjectChange
+{
+    QuietProjectChange() { ++s_project_change_quiet; }
+    ~QuietProjectChange() { --s_project_change_quiet; }
+    QuietProjectChange(const QuietProjectChange&)            = delete;
+    QuietProjectChange& operator=(const QuietProjectChange&) = delete;
+};
+
+// `filename` is what load_project opened (empty for a new project).
+void announce_project_change(const char* reason, const wxString& filename)
+{
+    if (s_project_change_quiet > 0)
+        return;
+    std::string source = "user", slot;
+    if (!s_bridge_open_path.empty() && !filename.empty() && into_u8(filename) == s_bridge_open_path) {
+        source = "bridge";
+        slot   = s_bridge_open_slot;
+    } else if (s_bridge_request_depth > 0) {
+        source = "bridge"; // a new/open project an action or bridge method did itself
+    }
+    s_bridge_open_path.clear();
+    s_bridge_open_slot.clear();
+    WebAppPanel::project_changed(reason, source, slot);
+}
+
+} // namespace
+
+Plater::BridgeRequestScope::BridgeRequestScope() { ++s_bridge_request_depth; }
+Plater::BridgeRequestScope::~BridgeRequestScope() { --s_bridge_request_depth; }
+
+void Plater::note_bridge_project_open(const std::string& utf8_path, const std::string& slot)
+{
+    s_bridge_open_path = utf8_path;
+    s_bridge_open_slot = slot;
 }
 
 wxDEFINE_EVENT(EVT_SCHEDULE_BACKGROUND_PROCESS,     SimpleEvent);
@@ -4769,6 +4823,11 @@ static bool create_mixed_filament_from_result(
     return true;
 }
 
+bool Sidebar::add_mixed_filament_from_result(const MixedFilamentResult& result, const std::vector<std::string>& color_strs)
+{
+    return create_mixed_filament_from_result(this, result, color_strs);
+}
+
 void Sidebar::add_mixed_filament()
 {
     auto* plater = dynamic_cast<Plater*>(GetParent());
@@ -5622,7 +5681,12 @@ bool Sidebar::is_new_project_in_gcode3mf()
         MessageDialog dlg(wxGetApp().plater(), text, _L("Warning"),
                           wxOK | wxICON_WARNING);
         dlg.ShowModal();
-        p->plater->new_project();
+        {
+            // UNLAYERED_MOD -- leaving a sliced-file preview to edit: no project switch announced
+            // (opening that preview was not announced either).
+            QuietProjectChange quiet;
+            p->plater->new_project();
+        }
         return true;
     }
     return false;
@@ -6731,6 +6795,13 @@ struct Plater::priv
     MenuFactory menus;
 
     SelectMachineDialog* m_select_machine_dlg = nullptr;
+    // Unlayered (WEB_APP_BRIDGE.md 4.6): counted when they really start, so a bridge call that opened
+    // the native Save / Print dialog can tell "sent" from "closed" once the dialog returns.
+    unsigned    gcode_exports_started = 0;
+    unsigned    print_sends_started   = 0;
+    unsigned    send_jobs_finished    = 0;
+    std::string last_gcode_export_path;
+    nlohmann::json next_print_dialog_options = nlohmann::json::object(); // Plater::set_next_print_dialog_options
     SendMultiMachinePage* m_send_multi_dlg = nullptr;
     SendToPrinterDialog* m_send_to_sdcard_dlg = nullptr;
     PublishDialog *m_publish_dlg = nullptr;
@@ -6769,6 +6840,8 @@ struct Plater::priv
     //BBS: add a flag to ignore cancel event
     bool m_ignore_event{false};
     bool m_slice_all{false};
+    // Plater::skip_next_new_project_confirm
+    bool skip_next_new_project_confirm{false};
     bool m_is_slicing {false};
     // Unlayered: a slicer.plateChanged event is queued and not yet delivered (object_list_changed).
     bool m_plate_changed_notify_pending{false};
@@ -7103,6 +7176,14 @@ struct Plater::priv
     bool restart_background_process(unsigned int state);
     // returns bit mask of UpdateBackgroundProcessReturnState
     unsigned int update_restart_background_process(bool force_scene_update, bool force_preview_update);
+    // Applies the model and the settings, composed as update_background_process composes them,
+    // to the current plate's Print.
+    Print::ApplyStatus apply_current_print();
+    // Slicing-service results as plate slice results (the block above
+    // Plater::can_slice_nonplanar explains the arrangement).
+    bool divert_reslice_to_service();
+    bool install_parked_service_result();
+    void drop_current_plate_result();
     void show_delayed_error_message() {
         if (!this->delayed_error_message.empty()) {
             std::string msg = std::move(this->delayed_error_message);
@@ -7856,6 +7937,8 @@ Plater::priv::priv(Plater *q, MainFrame *main_frame)
     if (wxGetApp().is_editor()) {
         auto last_backup = wxGetApp().app_config->get_last_backup_dir();
         this->q->Bind(EVT_RESTORE_PROJECT, [this, last = last_backup](wxCommandEvent& e) {
+            // Startup and GUI-rebuild restore: the same window carrying on, not a project switch.
+            QuietProjectChange quiet; // UNLAYERED_MOD -- slicer.projectChanged
             std::string last_backup = last;
             std::string originfile;
             if (Slic3r::has_restore_data(last_backup, originfile)) {
@@ -8868,6 +8951,67 @@ std::vector<size_t> Plater::priv::load_files(const std::vector<fs::path>& input_
                         // Based on the printer technology field found in the loaded config, select the base for the config,
                         PrinterTechnology printer_technology = Preset::printer_technology(config_loaded);
 
+                        // Unlayered: a BambuStudio project lists in different_settings_to_system only what differs
+                        // from BAMBU's system profile. Everything else is reset to OUR copy of that profile when the
+                        // project presets are built (update_non_diff_values_to_base_config) -- and the copies
+                        // disagree: a BS H2S 0.8 project asking for 4 top shells (BS's own profile value, so not
+                        // listed) printed 3, Orca's. The project is what the user set up, so for a BS import every
+                        // key it carries counts as set. Layout: [print, filament 1..n, printer].
+                        if (en_3mf_file_type == En3mfType::From_BBS && config_loaded.has("different_settings_to_system")) {
+                            auto *fil_d = config_loaded.option<ConfigOptionFloats>("filament_diameter");
+                            const size_t n_fil = fil_d != nullptr ? std::max<size_t>(1, fil_d->values.size()) : 1;
+                            auto present = [&](const std::vector<std::string> &keys) {
+                                std::string out;
+                                for (const std::string &k : keys)
+                                    if (config_loaded.has(k))
+                                        out += (out.empty() ? "" : ";") + k;
+                                return out;
+                            };
+                            auto *diff = config_loaded.option<ConfigOptionStrings>("different_settings_to_system", true);
+                            diff->values.resize(n_fil + 2);
+                            diff->values[0] = present(Preset::print_options());
+                            const std::string fil_keys = present(Preset::filament_options());
+                            for (size_t i = 1; i <= n_fil; ++i)
+                                diff->values[i] = fil_keys;
+                            diff->values[n_fil + 1] = present(Preset::printer_options());
+                        }
+
+                        // Unlayered: BambuStudio has no organic-tree tip/branch diameters, so a BS project
+                        // leaves ours at their defaults (0.8 / 2.0 mm) -- narrower than a 0.8 mm nozzle's
+                        // support lines (0.82), which Print::validate refuses ("tree tip diameter must not be
+                        // smaller than support material extrusion width"). Raise them to the least that passes.
+                        if (en_3mf_file_type == En3mfType::From_BBS) {
+                            const auto *nozzles = config_loaded.option<ConfigOptionFloats>("nozzle_diameter");
+                            const double nozzle = nozzles != nullptr && !nozzles->values.empty() ? nozzles->values.front() : 0.4;
+                            auto width_of = [&](const char *key) {
+                                const auto *o = config_loaded.option<ConfigOptionFloatOrPercent>(key);
+                                return o != nullptr ? o->get_abs_value(nozzle) : 0.;
+                            };
+                            double width = width_of("support_line_width");
+                            if (width <= 0.)
+                                width = width_of("line_width");
+                            // Also list them in the PRINT preset's different_settings_to_system (entry 0): a key not
+                            // listed there is reset to the system profile's value when the project preset is built
+                            // (update_non_diff_values_to_base_config), which put the tip straight back to 0.8.
+                            auto mark_changed = [&](const char *key) {
+                                auto *diff = config_loaded.option<ConfigOptionStrings>("different_settings_to_system", true);
+                                if (diff->values.empty())
+                                    diff->values.emplace_back();
+                                std::string &print_diff = diff->values.front();
+                                print_diff += (print_diff.empty() ? "" : ";") + std::string(key);
+                            };
+                            const FullPrintConfig &defaults = FullPrintConfig::defaults();
+                            if (width > 0. && !config_loaded.has("tree_support_tip_diameter") &&
+                                defaults.tree_support_tip_diameter.value < width) {
+                                config_loaded.set_key_value("tree_support_tip_diameter", new ConfigOptionFloat(width));
+                                mark_changed("tree_support_tip_diameter");
+                            }
+                            if (width > 0. && !config_loaded.has("tree_support_branch_diameter_organic") &&
+                                defaults.tree_support_branch_diameter_organic.value < 2. * width) {
+                                config_loaded.set_key_value("tree_support_branch_diameter_organic", new ConfigOptionFloat(2. * width));
+                                mark_changed("tree_support_branch_diameter_organic");
+                            }
+                        }
                         config.apply(static_cast<const ConfigBase &>(FullPrintConfig::defaults()));
                         // and place the loaded config over the base.
                         config += std::move(config_loaded);
@@ -9264,7 +9408,9 @@ std::vector<size_t> Plater::priv::load_files(const std::vector<fs::path>& input_
                         [](int isUtf8StepFile) {
                             if (!isUtf8StepFile) {
                                 const auto no_warn = wxGetApp().app_config->get_bool("step_not_utf8_no_warn");
-                                if (!no_warn) {
+                                if (NoStepImportDialogs::active())
+                                    BOOST_LOG_TRIVIAL(warning) << "STEP component names are not UTF-8; garbage characters may appear";
+                                else if (!no_warn) {
                                     MessageDialog dlg(nullptr, _L("Component name(s) inside step file not in UTF-8 format!") + "\n\n" + _L("Because of unsupported text encoding, garbage characters may appear!"),
                                                       wxString(SLIC3R_APP_FULL_NAME " - ") + _L("Attention!"), wxOK | wxICON_INFORMATION);
                                     dlg.show_dsa_button(_L("Remember my choice."));
@@ -9276,7 +9422,7 @@ std::vector<size_t> Plater::priv::load_files(const std::vector<fs::path>& input_
                             }
                         },
                         [&is_user_cancel, &linear, &angle, &split_compound](Slic3r::Step& file, double& linear_value, double& angle_value, bool& is_split)-> int {
-                            if (wxGetApp().app_config->get_bool("enable_step_mesh_setting")) {
+                            if (step_mesh_dialog_wanted()) {
                                 StepMeshDialog mesh_dlg(nullptr, file, linear, angle);
                                 if (mesh_dlg.ShowModal() == wxID_OK) {
                                     linear_value = mesh_dlg.get_linear_deflection();
@@ -10720,6 +10866,115 @@ void Plater::priv::process_validation_warnings(const std::vector<StringObjectExc
             process_validation_warning(warning);
 }
 
+Print::ApplyStatus Plater::priv::apply_current_print()
+{
+    const auto& preset_bundle = wxGetApp().preset_bundle;
+    if (preset_bundle->get_printer_extruder_count() > 1) {
+        PartPlate* cur_plate = background_process.get_current_plate();
+        std::vector<int> f_maps = cur_plate->get_real_filament_maps(preset_bundle->project_config);
+        std::vector<int> f_volume_maps = cur_plate->get_filament_volume_maps();
+        if (f_volume_maps.empty()) {
+            f_volume_maps = preset_bundle->get_default_nozzle_volume_types_for_filaments(f_maps);
+        }
+        Print::ApplyStatus invalidated = background_process.apply(this->model, preset_bundle->full_config(false, f_maps, f_volume_maps));
+        background_process.fff_print()->set_extruder_filament_info(get_extruder_filament_info());
+        return invalidated;
+    }
+    return background_process.apply(this->model, preset_bundle->full_config(false));
+}
+
+// ---------------------------------------------------------------------------------------------
+// What the slicing service left on the plates. Plater::can_slice_nonplanar's block
+// comment explains the arrangement; this is its bookkeeping.
+// ---------------------------------------------------------------------------------------------
+namespace {
+
+// A plate's valid result is the service's while the plate's output G-code is still the very file
+// that was installed: keyed by that path, and stamped, because a local slice of the plate later
+// writes its own G-code to the same path (restart_background_process also forgets it then).
+struct ServiceResultStamp
+{
+    std::string options_key;
+    uintmax_t   size  = 0;
+    std::time_t mtime = 0;
+};
+std::map<std::string, ServiceResultStamp> s_service_results;
+
+// A result back from the service that its plate has not taken yet: it is taken when that plate is
+// the current one, a service mode is selected, and the plate still matches the fingerprint.
+struct ParkedServiceResult
+{
+    int         plate       = -1;
+    uint64_t    fingerprint = 0;
+    std::string options_key;
+    fs::path    gcode;
+};
+std::vector<ParkedServiceResult> s_parked_service_results;
+
+// The job on the worker, if any (serial 0 = none): what it is slicing.
+struct ServiceJobInFlight
+{
+    int         serial      = 0;
+    int         plate       = -1;
+    uint64_t    fingerprint = 0;
+    std::string options_key;
+};
+ServiceJobInFlight s_service_job;
+int                s_service_job_serial = 0;
+
+// The person's last request to slice (Plater::note_user_slice_request), and the bridge's block.
+bool                                  s_user_slice_requested = false;
+std::chrono::steady_clock::time_point s_user_slice_requested_at;
+int                                   s_service_slice_blocks = 0;
+// How long a request waits for the reslice() it causes: a tab click reaches the preview through
+// two posted events, never seconds.
+constexpr auto USER_SLICE_REQUEST_TTL = std::chrono::seconds(2);
+
+bool file_stamp(const std::string& path, uintmax_t& size, std::time_t& mtime)
+{
+    boost::system::error_code ec;
+    size = fs::file_size(path, ec);
+    if (ec)
+        return false;
+    mtime = fs::last_write_time(path, ec);
+    return !ec;
+}
+
+bool is_service_result(PartPlate* plate, const std::string* options_key = nullptr)
+{
+    if (plate == nullptr || !plate->is_slice_result_valid())
+        return false;
+    auto it = s_service_results.find(plate->get_tmp_gcode_path());
+    if (it == s_service_results.end())
+        return false;
+    uintmax_t   size  = 0;
+    std::time_t mtime = 0;
+    if (!file_stamp(it->first, size, mtime) || size != it->second.size || mtime != it->second.mtime)
+        return false;
+    return options_key == nullptr || *options_key == it->second.options_key;
+}
+
+void forget_service_result(PartPlate* plate)
+{
+    if (plate != nullptr)
+        s_service_results.erase(plate->get_tmp_gcode_path());
+}
+
+// What a service result was made with besides the plate itself: the service, its mode and its
+// options. A different key is a different slice, like a changed setting.
+std::string slice_service_options_key()
+{
+    return NonplanarSliceClient::configured_url() + "\n" + SliceService::current_mode() + "\n" +
+           SliceService::request_options();
+}
+
+bool slice_service_selected()
+{
+    MainFrame* frame = wxGetApp().mainframe;
+    return frame != nullptr && frame->slice_mode_is_service();
+}
+
+} // namespace
 
 // Update background processing thread from the current config and Model.
 // Returns a bitmask of UpdateBackgroundProcessReturnState.
@@ -10750,20 +11005,7 @@ unsigned int Plater::priv::update_background_process(bool force_validation, bool
 
     background_process.fff_print()->set_check_multi_filaments_compatibility(wxGetApp().app_config->get("enable_high_low_temp_mixed_printing") == "false");
 
-    Print::ApplyStatus invalidated;
-    const auto& preset_bundle = wxGetApp().preset_bundle;
-    if (preset_bundle->get_printer_extruder_count() > 1) {
-        PartPlate* cur_plate = background_process.get_current_plate();
-        std::vector<int> f_maps = cur_plate->get_real_filament_maps(preset_bundle->project_config);
-        std::vector<int> f_volume_maps = cur_plate->get_filament_volume_maps();
-        if (f_volume_maps.empty()) {
-            f_volume_maps = preset_bundle->get_default_nozzle_volume_types_for_filaments(f_maps);
-        }
-        invalidated = background_process.apply(this->model, preset_bundle->full_config(false, f_maps, f_volume_maps));
-        background_process.fff_print()->set_extruder_filament_info(get_extruder_filament_info());
-    }
-    else
-        invalidated = background_process.apply(this->model, preset_bundle->full_config(false));
+    Print::ApplyStatus invalidated = apply_current_print();
 
     if ((invalidated == Print::APPLY_STATUS_CHANGED) || (invalidated == Print::APPLY_STATUS_INVALIDATED))
         // BBS: add only gcode mode
@@ -10954,12 +11196,26 @@ bool Plater::priv::restart_background_process(unsigned int state)
         return false;
     }
 
+    // While a slicing-service mode is selected the service slices the plate
+    // (divert_reslice_to_service). Processing or exporting G-code the plate already has still runs
+    // here; a local slice does not start behind the selected mode's back.
+    if (slice_service_selected() && !m_slice_all && (state & UPDATE_BACKGROUND_PROCESS_FORCE_EXPORT) == 0 &&
+        !this->background_process.empty() && !this->background_process.current_print()->finished()) {
+        BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ": a slicing-service mode is selected, no local slice";
+        return false;
+    }
+
     if ( ! this->background_process.empty() &&
          (state & priv::UPDATE_BACKGROUND_PROCESS_INVALID) == 0 &&
          ( ((state & UPDATE_BACKGROUND_PROCESS_FORCE_RESTART) != 0 && ! this->background_process.finished()) ||
            (state & UPDATE_BACKGROUND_PROCESS_FORCE_EXPORT) != 0 ||
            (state & UPDATE_BACKGROUND_PROCESS_RESTART) != 0 ) ) {
         BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(", Line %1%: print is valid, try to start it now")%__LINE__;
+        // Unlayered: unless the Print already has its G-code (then the start only processes or
+        // exports that file), a real slice is about to write the plate's own G-code over a
+        // service result.
+        if (!this->background_process.current_print()->finished())
+            forget_service_result(background_process.get_current_plate());
         // The print is valid and it can be started.
         if (this->background_process.start()) {
             if (!show_warning_dialog)
@@ -11007,6 +11263,8 @@ void Plater::priv::export_gcode(fs::path output_path, bool output_path_on_remova
     show_warning_dialog = true;
     if (! output_path.empty()) {
         background_process.schedule_export(output_path.string(), output_path_on_removable_media);
+        ++gcode_exports_started;
+        last_gcode_export_path = output_path.string();
         notification_manager->push_delayed_notification(NotificationType::ExportOngoing, []() {return true; }, 1000, 0);
     } else {
         BOOST_LOG_TRIVIAL(info) << "output_path  is empty";
@@ -11039,9 +11297,12 @@ void Plater::priv::export_gcode(fs::path output_path, bool output_path_on_remova
     show_warning_dialog = true;
     if (! output_path.empty()) {
         background_process.schedule_export(output_path.string(), output_path_on_removable_media);
+        ++gcode_exports_started;
+        last_gcode_export_path = output_path.string();
         notification_manager->push_delayed_notification(NotificationType::ExportOngoing, []() {return true; }, 1000, 0);
     } else {
         background_process.schedule_upload(std::move(upload_job));
+        ++print_sends_started;
     }
 
     // If the SLA processing of just a single object's supports is running, restart slicing for the whole object.
@@ -11124,7 +11385,7 @@ bool Plater::priv::replace_volume_with_stl(int object_idx, int volume_idx, const
             bool is_user_cancel = false;
 
             auto callback = [&is_user_cancel, linear, angle, split_compound](Slic3r::Step &file, double &linear_value, double &angle_value, bool &is_split) -> int {
-                if (wxGetApp().app_config->get_bool("enable_step_mesh_setting")) {
+                if (step_mesh_dialog_wanted()) {
                     StepMeshDialog mesh_dlg(nullptr, file, linear, angle);
                     if (mesh_dlg.ShowModal() == wxID_OK) {
                         linear_value = mesh_dlg.get_linear_deflection();
@@ -13373,6 +13634,9 @@ void Plater::priv::on_action_slice_plate(SimpleEvent&)
         Model::setExtruderParams(config, numExtruders);
         Model::setPrintSpeedTable(config, print_config);
         m_slice_all = false;
+        // Posted only by the person's own controls (the Slice button, Ctrl+R, a plate's slice icon,
+        // the filament-grouping prompts), never by a web app: it may start a service run.
+        q->note_user_slice_request();
         q->reslice();
         q->select_view_3D("Preview");
     }
@@ -13459,7 +13723,11 @@ void Plater::priv::open_machine_select_dialog(int plate_idx, PrintFromType print
         m_select_machine_dlg = new SelectMachineDialog(q);
     m_select_machine_dlg->set_print_type(print_type);
     m_select_machine_dlg->prepare(plate_idx);
+    // A page's options (slicer.print) hold for this dialog only.
+    const nlohmann::json options = std::exchange(next_print_dialog_options, nlohmann::json::object());
+    m_select_machine_dlg->set_automation_options(options.value("bambu", nlohmann::json::object()));
     m_select_machine_dlg->ShowModal();
+    m_select_machine_dlg->set_automation_options(nlohmann::json::object());
 }
 
 void Plater::priv::on_action_send_to_multi_machine(SimpleEvent&)
@@ -13500,9 +13768,9 @@ void Plater::priv::on_tab_selection_changing(wxBookCtrlEvent& e)
     int old_sel = e.GetOldSelection();
 
     // Unlayered: re-entering the web application tab retries a load that previously failed, the
-    // same way re-entering the Device tab reloads the missing_connection page below.
-    for (WebAppPanel* panel : {main_frame->m_web_app_view, main_frame->m_agent_view,
-                               main_frame->m_universe_view}) {
+    // same way re-entering the Device tab reloads the missing_connection page below. The agent is
+    // a sidebar, not a page; MainFrame::apply_side_panel_state does the same for it on open.
+    for (WebAppPanel* panel : {main_frame->m_web_app_view, main_frame->m_universe_view}) {
         if (panel == nullptr || panel != main_frame->m_tabpanel->GetPage(new_sel))
             continue;
         if (panel->is_showing_fallback())
@@ -13596,8 +13864,10 @@ void Plater::priv::on_action_export_gcode(SimpleEvent&)
 {
     if (q != nullptr) {
         BOOST_LOG_TRIVIAL(debug) << __FUNCTION__ << ":received export gcode event\n" ;
-        if (q->only_gcode_mode())
-            q->export_loaded_gcode();   // save the file being previewed, no slice behind it
+        // the file being previewed, no slice behind it: a loaded .gcode, or a sliced 3MF with no
+        // objects (a sliced .gcode.3mf handed back without its model), which export_gcode() would silently drop
+        if (q->only_gcode_mode() || (q->using_exported_file() && model.objects.empty()))
+            q->export_loaded_gcode();
         else
             q->export_gcode(false);
     }
@@ -14094,7 +14364,7 @@ void Plater::priv::set_project_name(const wxString& project_name)
     if (!m_project_name.IsEmpty())
         wxGetApp().mainframe->update_title_colour_after_set_title();
 #else
-    wxGetApp().mainframe->SetTitle(m_project_name + " - " + SLIC3R_APP_FULL_NAME);
+    wxGetApp().mainframe->SetTitle(m_project_name + " - " + app_title_name());
     wxGetApp().mainframe->topbar()->SetTitle(m_project_name);
 #endif
 }
@@ -14114,7 +14384,7 @@ void Plater::priv::update_title_dirty_status()
     wxGetApp().mainframe->SetTitle(title);
     wxGetApp().mainframe->update_title_colour_after_set_title();
 #else
-    wxGetApp().mainframe->SetTitle(title + " - " + SLIC3R_APP_FULL_NAME);
+    wxGetApp().mainframe->SetTitle(title + " - " + app_title_name());
     wxGetApp().mainframe->topbar()->SetTitle(title);
 #endif    
 }
@@ -15708,11 +15978,17 @@ Print&          Plater::fff_print()         { return p->fff_print; }
 const SLAPrint& Plater::sla_print() const   { return p->sla_print; }
 SLAPrint&       Plater::sla_print()         { return p->sla_print; }
 
+void Plater::skip_next_new_project_confirm(bool skip) { p->skip_next_new_project_confirm = skip; }
+
 int Plater::new_project(bool skip_confirm, bool silent, const wxString& project_name)
 {
     model().calib_pa_pattern.reset(nullptr);
     model().plates_custom_gcodes.clear();
 
+    if (p->skip_next_new_project_confirm) {
+        p->skip_next_new_project_confirm = false;
+        skip_confirm                     = true;
+    }
     bool transfer_preset_changes = false;
     // BBS: save confirm
     auto check = [this,&transfer_preset_changes](bool yes_or_no) {
@@ -15780,6 +16056,7 @@ int Plater::new_project(bool skip_confirm, bool silent, const wxString& project_
 
     up_to_date(true, false);
     up_to_date(true, true);
+    announce_project_change("new", wxString()); // UNLAYERED_MOD -- slicer.projectChanged
     return wxID_YES;
 }
 
@@ -15923,6 +16200,12 @@ void Plater::load_project(wxString const& filename2,
 
     auto       has_modify = is_flush_config_modified();
     sidebar().set_flushing_volume_warning(has_modify);
+
+    // UNLAYERED_MOD -- slicer.projectChanged. A sliced file (.gcode.3mf) opens as a preview of
+    // output, not as a project to work on, so it is not announced; nor is a load that loaded nothing
+    // (res empty = failed or nothing in the file), nor one while the user's project is set aside.
+    if (!res.empty() && !has_project_aside(*this) && !using_exported_file() && !m_only_gcode)
+        announce_project_change("open", filename);
 
     BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << __LINE__ << " load project done";
 }
@@ -16253,7 +16536,7 @@ bool Plater::up_to_date(bool saved, bool backup)
                                         !Slic3r::has_other_changes(backup));
 }
 
-bool Plater::generate_infill_preview_for_object(int obj_idx, bool interactive, bool dry_run)
+bool Plater::generate_infill_preview_for_object(int obj_idx, bool interactive, bool dry_run, InfillPreviewReport *report)
 {
     static const char *kPreviewVolumeName = "Infill Preview";
     if (obj_idx < 0 || obj_idx >= int(p->model.objects.size()))
@@ -16271,6 +16554,10 @@ bool Plater::generate_infill_preview_for_object(int obj_idx, bool interactive, b
                 ? _L("Mesh infill preview supports the Custom (infill mesh), Gyroid, TPMS-D and Fischer-Koch S sparse infill patterns.")
                 : _L("Mesh infill preview supports the Custom (infill mesh) sparse infill pattern."),
                           _L("Preview Mesh Infill"), wxOK).ShowModal();
+        else if (report)
+            report->error = mesh_backed_tpms_enabled()
+                ? "mesh infill preview needs the Custom (infill mesh), Gyroid, TPMS-D or Fischer-Koch S sparse infill pattern"
+                : "mesh infill preview needs the Custom (infill mesh) sparse infill pattern";
         return false;
     }
     // Replace any previous preview volume; the preview is a modifier without overrides, so it
@@ -16303,6 +16590,8 @@ bool Plater::generate_infill_preview_for_object(int obj_idx, bool interactive, b
                 MessageDialog(this, _L("The object has no Infill Mesh volume and no infill mesh file. Right-click the object and use "
                                        "Add Infill Mesh, or set the infill mesh file in the Strength settings."),
                               _L("Preview Mesh Infill"), wxOK).ShowModal();
+            else if (report)
+                report->error = "the object has no Infill Mesh volume and no infill mesh file (infill_mesh_path)";
             return false;
         }
         const BoundingBoxf3 target = object->raw_mesh_bounding_box();
@@ -16331,11 +16620,15 @@ bool Plater::generate_infill_preview_for_object(int obj_idx, bool interactive, b
         if (lattice.indices.empty()) {
             if (interactive)
                 MessageDialog(this, _L("Mesh infill generation produced no geometry."), _L("Preview Mesh Infill"), wxOK).ShowModal();
+            else if (report)
+                report->error = "mesh infill generation produced no geometry";
             return false;
         }
         if (tiling.truncated && interactive)
             MessageDialog(this, _L("The infill mesh is too small for this object: tiling it would exceed the tile limit, "
                                    "so only the cell itself is shown."), _L("Preview Mesh Infill"), wxOK).ShowModal();
+        else if (tiling.truncated && report)
+            report->warning = "the infill mesh is too small for this object: tiling it would exceed the tile limit, so only the cell is shown";
         replace_preview_volume(TriangleMesh(std::move(lattice)), key);
         return true;
     }
@@ -16343,6 +16636,8 @@ bool Plater::generate_infill_preview_for_object(int obj_idx, bool interactive, b
     if (density_pct <= 0.) {
         if (interactive)
             MessageDialog(this, _L("Sparse infill density is zero."), _L("Preview Mesh Infill"), wxOK).ShowModal();
+        else if (report)
+            report->error = "sparse infill density is zero";
         return false;
     }
     const int    multiline    = std::max(1, full_config.option<ConfigOptionInt>("fill_multiline")->value);
@@ -16383,6 +16678,8 @@ bool Plater::generate_infill_preview_for_object(int obj_idx, bool interactive, b
     if (mesh.empty()) {
         if (interactive)
             MessageDialog(this, _L("Mesh infill generation produced no geometry."), _L("Preview Mesh Infill"), wxOK).ShowModal();
+        else if (report)
+            report->error = "mesh infill generation produced no geometry";
         return false;
     }
 
@@ -16414,6 +16711,17 @@ void Plater::preview_mesh_infill()
     take_snapshot(std::string("Preview mesh infill"));
     if (generate_infill_preview_for_object(obj_idx, /*interactive=*/true))
         update();
+}
+
+bool Plater::generate_infill_preview(int obj_idx, bool dry_run, std::string &error, std::string &warning)
+{
+    InfillPreviewReport report;
+    const bool          built = generate_infill_preview_for_object(obj_idx, /*interactive=*/false, dry_run, &report);
+    error   = report.error;
+    warning = report.warning;
+    if (built && ! dry_run)
+        update();
+    return built;
 }
 
 void Plater::refresh_infill_previews()
@@ -17550,6 +17858,114 @@ void Plater::extract_config_from_project()
         load_files({ into_path(input_file) }, LoadStrategy::LoadConfig);
 }
 
+// ---------------------------------------------------------------------------------------------
+// Unlayered: a project set aside for a G-code preview (ProjectAside.hpp explains the why)
+// ---------------------------------------------------------------------------------------------
+
+namespace {
+
+struct ProjectAside
+{
+    boost::filesystem::path stash;    // the 3MF the project was written to
+    wxString                filename; // its own .3mf; empty when it was never saved
+    wxString                name;     // the title it showed
+    bool                    dirty{false};
+};
+
+std::optional<ProjectAside> s_project_aside;
+
+} // namespace
+
+bool set_project_aside(Plater& plater)
+{
+    if (plater.only_gcode_mode() || plater.using_exported_file() || plater.model().objects.empty())
+        return true; // nothing on the plate the user could lose; a project already aside stays aside
+
+    const fs::path dir = fs::path(data_dir()) / "handoff_stash";
+    boost::system::error_code ec;
+    fs::create_directories(dir, ec);
+    const auto     stamp = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+    const fs::path stash = dir / (std::to_string(stamp) + ".3mf");
+
+    // What save_project writes, minus the file dialog and minus becoming the project's filename.
+    ProjectAside aside{stash, plater.get_project_filename(".3mf"), plater.get_project_name(), plater.is_project_dirty()};
+    if (plater.export_3mf(stash, SaveStrategy::Silence | SaveStrategy::SplitModel | SaveStrategy::ShareMesh) < 0) {
+        BOOST_LOG_TRIVIAL(error) << "set_project_aside: could not write " << stash.string();
+        fs::remove(stash, ec);
+        return false;
+    }
+    if (s_project_aside) // a preview something else closed without restoring: its file stays on disk
+        BOOST_LOG_TRIVIAL(warning) << "set_project_aside: dropping an unrestored stash, kept at " << s_project_aside->stash.string();
+    s_project_aside = aside;
+
+    // The edits are in the stash now; dropping them here keeps the printer switch and the G-code
+    // open that follow free of "modified presets" dialogs (as GUI_App's reset_modifications does).
+    GUI_App&                app        = wxGetApp();
+    const PrinterTechnology technology = app.preset_bundle->printers.get_edited_preset().printer_technology();
+    for (Tab* tab : app.tabs_list)
+        if (tab->supports_printer_technology(technology) && tab->current_preset_is_dirty())
+            tab->m_presets->discard_current_changes();
+    app.load_current_presets(false);
+
+    {
+        QuietProjectChange quiet; // UNLAYERED_MOD -- set aside for a preview, not a new project
+        plater.new_project(true, true);
+    }
+    BOOST_LOG_TRIVIAL(info) << "set_project_aside: \"" << into_u8(aside.name) << "\" (dirty " << aside.dirty << ") -> " << stash.string();
+    return true;
+}
+
+bool has_project_aside(Plater& plater)
+{
+    // UNLAYERED_MOD -- a result handed back as a sliced .gcode.3mf with no objects is what the
+    // plater opens as an exported file (using_exported_file), not G-code-only mode: Prepare then
+    // offered to discard it for an empty plate instead of bringing the project back (2026-10-10).
+    return s_project_aside.has_value() && (plater.only_gcode_mode() || plater.using_exported_file());
+}
+
+bool restore_project_aside(Plater& plater)
+{
+    if (!s_project_aside)
+        return false;
+    const ProjectAside aside = *s_project_aside;
+    s_project_aside.reset(); // first: load_project's own close_with_confirm must not come back here
+
+    boost::system::error_code ec;
+    if (!fs::exists(aside.stash, ec)) {
+        BOOST_LOG_TRIVIAL(error) << "restore_project_aside: " << aside.stash.string() << " is gone";
+        return false;
+    }
+    {
+        QuietProjectChange quiet; // UNLAYERED_MOD -- the same project coming back, not a new one
+        plater.load_project(from_path(aside.stash), "<silence>");
+    }
+    if (plater.only_gcode_mode() || plater.using_exported_file()) { // load_project's preset prompt cancelled: still previewing
+        s_project_aside = aside;
+        return false;
+    }
+    if (plater.model().objects.empty()) {
+        BOOST_LOG_TRIVIAL(error) << "restore_project_aside: could not load " << aside.stash.string() << "; the file is kept";
+        show_error(&plater, wxString::Format(_L("The project could not be brought back. It is saved at\n%s"), from_path(aside.stash)));
+        return false;
+    }
+
+    // Its own file and title again, so Save writes the original exactly as before the preview. A
+    // never-saved project gets its name back with no folder (".3mf" so a dot in it survives
+    // set_project_filename's extension strip), which keeps Save on "Save as".
+    if (!aside.filename.empty())
+        plater.set_project_filename(aside.filename);
+    else
+        plater.set_project_filename((aside.name.empty() ? _L("Untitled") : aside.name) + ".3mf");
+    if (aside.dirty) {
+        // The title's star, and -- what close_with_confirm actually consults -- a pending change.
+        plater.set_plater_dirty(true);
+        Slic3r::put_other_changes();
+    }
+    fs::remove(aside.stash, ec);
+    BOOST_LOG_TRIVIAL(info) << "restore_project_aside: \"" << into_u8(aside.name) << "\" back from " << aside.stash.string();
+    return true;
+}
+
 void Plater::load_gcode()
 {
     // Ask user for a gcode file name.
@@ -17572,8 +17988,14 @@ void Plater::load_gcode(const wxString& filename)
     m_last_loaded_gcode = filename;
 
     // BSS: create a new project when load_gcode, force close previous one
-    if (new_project(false, true) != wxID_YES)
-        return;
+    // Unlayered: unless the project is set aside (ProjectAside.hpp) -- then there is nothing here to
+    // confirm, and the preview being replaced must not trigger the restore in close_with_confirm.
+    const bool project_aside = s_project_aside.has_value() && (m_only_gcode || model().objects.empty());
+    {
+        QuietProjectChange quiet; // UNLAYERED_MOD -- a G-code preview is not a project to work on
+        if (new_project(project_aside, true) != wxID_YES)
+            return;
+    }
 
     m_only_gcode = true;
 
@@ -17659,6 +18081,15 @@ void Plater::load_gcode(const wxString& filename)
     // path ran through the background process and would have uploaded whatever the last slice
     // left behind; it no longer is.
     p->main_frame->update_slice_print_status(MainFrame::eEventPlateUpdate, false, true);
+
+    if (has_project_aside(*this))
+        get_notification_manager()->push_notification(
+            NotificationType::CustomNotification, NotificationManager::NotificationLevel::ImportantNotificationLevel,
+            (boost::format(_u8L("\"%1%\" is set aside while this G-code is previewed.")) % into_u8(s_project_aside->name)).str(),
+            _u8L("Back to the project"), [this](wxEvtHandler*) {
+                wxGetApp().CallAfter([this]() { restore_project_aside(*this); });
+                return true;
+            });
 }
 
 void Plater::reload_gcode_from_disk()
@@ -18495,6 +18926,19 @@ void Plater::reset_with_confirm()
 // BBS: save logic
 int GUI::Plater::close_with_confirm(std::function<bool(bool)> second_check)
 {
+    // Unlayered: what closing would lose is the project set aside for this G-code preview
+    // (ProjectAside.hpp), not the preview: bring it back first so the question below is about it.
+    // A saved project with no unsaved changes is its own file; the stash just goes.
+    if (has_project_aside(*this)) {
+        if (s_project_aside->dirty || s_project_aside->filename.empty())
+            restore_project_aside(*this);
+        else {
+            boost::system::error_code ec;
+            boost::filesystem::remove(s_project_aside->stash, ec);
+            s_project_aside.reset();
+        }
+    }
+
     if (up_to_date(false, false)) {
         if (second_check && !second_check(false)) return wxID_CANCEL;
         model().set_backup_path("");
@@ -18958,6 +19402,9 @@ void Plater::export_gcode_3mf(bool export_all)
         if (export_all)
             plate_idx = PLATE_ALL_IDX;
         export_3mf(output_path, SaveStrategy::Silence | SaveStrategy::SplitModel | SaveStrategy::WithGcode | SaveStrategy::SkipModel, plate_idx); // BBS: silence
+        // Unlayered: counted like a G-code export, for the web-app bridge's slicer.exportFinished.
+        ++p->gcode_exports_started;
+        p->last_gcode_export_path = output_path.string();
 
         RemovableDriveManager& removable_drive_manager = *wxGetApp().removable_drive_manager();
 
@@ -19936,7 +20383,7 @@ void Plater::toggle_bed_mesh()
     }
 }
 
-void Plater::fetch_bed_mesh()
+void Plater::fetch_bed_mesh(std::function<void(bool ok, const std::string& error)> done)
 {
     // Same config the upload path uses: this fork keeps the host on the printer preset.
     DynamicPrintConfig& printer_config = wxGetApp().preset_bundle->printers.get_edited_preset().config;
@@ -19954,6 +20401,9 @@ void Plater::fetch_bed_mesh()
     if (hosts.empty()) {
         notifications->push_notification(NotificationType::CustomNotification, NotificationManager::NotificationLevel::WarningNotificationLevel,
             _u8L("This printer's host type cannot report a bed mesh. Moonraker (Klipper), OctoPrint (Marlin) and Duet/Unlayered (RepRapFirmware) can."));
+        if (done)
+            done(false, "this printer's host type cannot report a bed mesh; Moonraker (Klipper), OctoPrint (Marlin) and "
+                        "Duet (RepRapFirmware) hosts can");
         return;
     }
 
@@ -19980,14 +20430,17 @@ void Plater::fetch_bed_mesh()
             }
             ctl.update_status(100, "");
         },
-        [this, result, host_name](bool canceled, std::exception_ptr& eptr) {
+        [this, result, host_name, done](bool canceled, std::exception_ptr& eptr) {
             if (eptr) {
                 try { std::rethrow_exception(eptr); }
                 catch (const std::exception& ex) { result->ok = false; result->error = ex.what(); }
                 eptr = nullptr;
             }
-            if (canceled)
+            if (canceled) {
+                if (done)
+                    done(false, "the bed mesh read was cancelled");
                 return;
+            }
             NotificationManager* notifications = get_notification_manager();
             BedMeshOverlay&      overlay       = p->partplate_list.bed_mesh_overlay();
             if (!result->ok) {
@@ -20023,6 +20476,8 @@ void Plater::fetch_bed_mesh()
                 canvas->set_as_dirty();
                 canvas->request_extra_frame();
             }
+            if (done)
+                done(result->ok, result->ok ? std::string() : "could not read the bed mesh from " + host_name + ": " + result->error);
         });
 }
 
@@ -20102,6 +20557,11 @@ void Plater::reslice()
         BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << ": required plugins missing; slicing blocked.";
         return;
     }
+
+    // With a service mode selected in the Slice dropdown, the plate is sliced by the
+    // service, not here (and a service slice on the worker must not be stopped by the line below).
+    if (p->divert_reslice_to_service())
+        return;
 
     // Stop the running (and queued) UI jobs and only proceed if they actually
     // get stopped.
@@ -20340,93 +20800,571 @@ void Plater::reslice_SLA_until_step(SLAPrintObjectStep step, const ModelObject &
     this->p->restart_background_process(state | priv::UPDATE_BACKGROUND_PROCESS_FORCE_RESTART);
 }
 // ---------------------------------------------------------------------------------------------
-// Nonplanar slicing by an external service
+// Slicing by an external service (SLICE_SERVICE_PROTOCOL.md)
 //
-// The plate goes out as a .3mf, G-code comes back and opens in the preview. The protocol, the
-// address setting and the reasoning are in NONPLANAR_SLICE_SERVICE.md; nothing here knows which
-// service is configured. Local slicing takes no part: this does not touch the background
-// process, so a plate can be sliced nonplanar without disturbing whatever it last produced.
+// The current plate goes out as a .3mf holding that plate's objects only, G-code comes back, and
+// the G-code becomes the PLATE'S SLICE RESULT, in the place a local slice leaves its own: the
+// plate's output G-code file, its Print's "G-code exported" step, its valid flag. Everything that
+// works on a sliced plate then works on it unchanged:
+//  - Preview: the background process "processes the previous file" (process_fff's finished
+//    branch, the path a sliced 3MF takes), filling the plate's GCodeProcessorResult;
+//  - Prepare -> Preview with nothing changed: the result is still valid and is shown again;
+//  - Export G-code / Print / send: the background process exports or uploads that file;
+//  - invalidation: Print::apply drops the "G-code exported" step on every edit that would
+//    invalidate a local slice (objects, settings, plate contents), and the plate goes invalid.
+// No project is closed, set aside or renamed; other plates keep their own results.
 //
-// The export has to happen HERE rather than inside the job: it walks the model and the plate
-// list and renders nothing thread-safe, so it belongs on the GUI thread. Everything after it is
-// network work and runs on the UI job worker.
+// The Slice dropdown's selection decides what runs when a plate needs slicing. Every trigger --
+// the Slice button, the Preview tab, the auto-slice after a change, a plate picked in Preview --
+// goes through reslice(), and divert_reslice_to_service() there starts this job instead of a
+// local slice while a service mode is selected (and drops a service result while a local mode is
+// selected), so a plate shows what the selected mode makes. Being a cloud run, it starts only on
+// the person's own request (note_user_slice_request); the automatic triggers and web apps leave
+// the plate waiting for one.
+//
+// The protocol, the address setting and the reasoning are in SLICE_SERVICE_PROTOCOL.md; nothing
+// here knows which service is configured. The export runs on the GUI thread (it walks the model
+// and the plate list), the network work on the UI job worker, and the result comes back through
+// accept_slice_service_result() to be taken by its plate on the GUI thread.
 // ---------------------------------------------------------------------------------------------
+
+namespace {
+
+// 64-bit FNV-1a over 8-byte words: a plate's meshes can run to many megabytes, and this runs on
+// every reslice while a service mode is selected.
+struct PlateHash
+{
+    uint64_t h = 1469598103934665603ull;
+    void     mix(uint64_t v)
+    {
+        h ^= v;
+        h *= 1099511628211ull;
+    }
+    void bytes(const void* data, size_t n)
+    {
+        const unsigned char* c = static_cast<const unsigned char*>(data);
+        size_t               i = 0;
+        for (; i + 8 <= n; i += 8) {
+            uint64_t w;
+            std::memcpy(&w, c + i, 8);
+            mix(w);
+        }
+        uint64_t tail = 0;
+        if (i < n)
+            std::memcpy(&tail, c + i, n - i);
+        mix(tail);
+        mix(n);
+    }
+    void str(const std::string& s) { bytes(s.data(), s.size()); }
+    void matrix(const Transform3d& m) { bytes(m.data(), sizeof(double) * 16); }
+    void config(const DynamicPrintConfig& cfg)
+    {
+        for (const std::string& key : cfg.keys()) {
+            str(key);
+            str(cfg.opt_serialize(key));
+        }
+    }
+};
+
+} // namespace
 
 bool Plater::can_slice_nonplanar() const
 {
     if (! NonplanarSliceClient::is_configured())
         return false;
     // Nothing to send, or we are already looking at a G-code file rather than a model.
-    return ! p->model.objects.empty() && ! m_only_gcode && ! m_exported_file;
+    if (p->model.objects.empty() || m_only_gcode || m_exported_file)
+        return false;
+    PartPlate* plate = p->partplate_list.get_curr_plate();
+    return plate != nullptr && plate->has_printable_instances();
 }
 
-void Plater::slice_nonplanar()
+uint64_t Plater::slice_service_fingerprint(bool geometry_only)
 {
+    PlateHash    f;
+    PartPlate*   plate = p->partplate_list.get_curr_plate();
+    const int    plate_index = p->partplate_list.get_curr_plate_index();
+    const Model& model = p->model;
+    f.mix(uint64_t(plate_index));
+    for (size_t o = 0; o < model.objects.size(); ++o) {
+        const ModelObject* object = model.objects[o];
+        size_t             placed = 0;
+        for (size_t i = 0; i < object->instances.size(); ++i) {
+            const ModelInstance* instance = object->instances[i];
+            if (plate == nullptr || ! plate->contain_instance(int(o), int(i)) || ! instance->printable)
+                continue;
+            f.matrix(instance->get_matrix());
+            ++placed;
+        }
+        if (placed == 0)
+            continue;
+        f.mix(placed);
+        for (const ModelVolume* volume : object->volumes) {
+            f.mix(uint64_t(volume->type()));
+            f.matrix(volume->get_matrix());
+            const indexed_triangle_set& its = volume->mesh().its;
+            f.bytes(its.vertices.data(), its.vertices.size() * sizeof(stl_vertex));
+            f.bytes(its.indices.data(), its.indices.size() * sizeof(stl_triangle_vertex_indices));
+            if (! geometry_only) {
+                f.config(volume->config.get());
+                // Painting: the timestamp changes with every edit of the data.
+                f.mix(volume->supported_facets.timestamp());
+                f.mix(volume->seam_facets.timestamp());
+                f.mix(volume->mmu_segmentation_facets.timestamp());
+                f.mix(volume->fuzzy_skin_facets.timestamp());
+            }
+        }
+        if (! geometry_only) {
+            f.config(object->config.get());
+            for (const auto& range : object->layer_config_ranges) {
+                f.bytes(&range.first.first, sizeof(range.first.first));
+                f.bytes(&range.first.second, sizeof(range.first.second));
+                f.config(range.second.get());
+            }
+            const std::vector<coordf_t>& profile = object->layer_height_profile.get();
+            f.bytes(profile.data(), profile.size() * sizeof(coordf_t));
+        }
+    }
+    if (! geometry_only) {
+        // Every resolved setting, unsaved edits included, then the plate's own (bed type, print
+        // sequence, filament maps, ...) and its pauses and colour changes.
+        f.config(wxGetApp().preset_bundle->full_config());
+        if (plate != nullptr)
+            f.config(*plate->config());
+        if (auto it = model.plates_custom_gcodes.find(plate_index); it != model.plates_custom_gcodes.end())
+            for (const CustomGCode::Item& item : it->second.gcodes) {
+                f.bytes(&item.print_z, sizeof(item.print_z));
+                f.mix(uint64_t(item.type));
+                f.mix(uint64_t(item.extruder));
+                f.str(item.color);
+                f.str(item.extra);
+            }
+    }
+    return f.h;
+}
+
+void Plater::slice_nonplanar(bool quiet)
+{
+    auto fail = [this, quiet](const wxString& message) {
+        BOOST_LOG_TRIVIAL(warning) << "Plater::slice_nonplanar: " << into_u8(message);
+        if (quiet)
+            get_notification_manager()->push_notification(NotificationType::CustomNotification,
+                                                          NotificationManager::NotificationLevel::ErrorNotificationLevel,
+                                                          into_u8(message));
+        else
+            show_error(this, message);
+    };
+
     const std::string url = NonplanarSliceClient::configured_url();
     const std::string problem = NonplanarSliceClient::url_problem(url);
     if (! problem.empty()) {
-        show_error(this, _L("The nonplanar slicing service cannot be used") + ": " + from_u8(problem));
+        fail(_L("The slicing service cannot be used") + ": " + from_u8(problem));
         return;
     }
-    if (p->model.objects.empty()) {
-        show_error(this, _L("There is nothing on the plate to slice."));
+    if (! can_slice_nonplanar()) {
+        fail(_L("There is nothing on the plate to slice."));
         return;
     }
-    if (! get_ui_job_worker().is_idle()) {
-        show_error(this, _L("Another background task is still running; try again in a moment."));
+    // Another job on the worker (arranging, say) is the user's to finish. A service slice there is
+    // replaced: it was slicing an older state of a plate, and its service is told to stop.
+    if (! get_ui_job_worker().is_idle() && s_service_job.serial == 0) {
+        fail(_L("Another background task is still running; try again in a moment."));
         return;
+    }
+
+    SliceServiceHandoff handoff;
+    wxString            error;
+    if (! export_slice_service_handoff(handoff, error)) {
+        fail(error);
+        return;
+    }
+
+    // The plate is being sliced again: what it shows now (a local slice, or another mode's) is not
+    // what this slice makes.
+    if (p->partplate_list.get_curr_plate()->is_slice_result_valid())
+        p->drop_current_plate_result();
+
+    s_service_job = {++s_service_job_serial, handoff.plate_index, slice_service_fingerprint(), slice_service_options_key()};
+
+    BOOST_LOG_TRIVIAL(info) << boost::format("Plater::slice_nonplanar: plate %1%, %2% -> %3% (printer %4%, options %5%)")
+                                   % (handoff.plate_index + 1) % handoff.plate_3mf.filename().string() % url
+                                   % handoff.printer % handoff.options;
+
+    auto job = std::make_unique<NonplanarSliceJob>(url, handoff.plate_3mf, fs::path(), true, handoff.options,
+                                                   handoff.printer, handoff.process, handoff.filament,
+                                                   handoff.work_dir,
+                                                   wxGetApp().auto_updater() != nullptr
+                                                       ? &wxGetApp().auto_updater()->account()
+                                                       : nullptr);
+    job->set_target(s_service_job.serial, s_service_job.plate, s_service_job.fingerprint, s_service_job.options_key);
+    job->set_service_fields(handoff.mode, handoff.machine_axes);
+    replace_job(get_ui_job_worker(), std::move(job));
+    p->main_frame->update_slice_print_status(MainFrame::eEventSliceUpdate, true);
+}
+
+bool Plater::export_slice_service_handoff(SliceServiceHandoff &out, wxString &error)
+{
+    PartPlate* plate       = p->partplate_list.get_curr_plate();
+    const int  plate_index = p->partplate_list.get_curr_plate_index();
+    if (plate == nullptr) {
+        error = _L("There is nothing on the plate to slice.");
+        return false;
     }
 
     const fs::path work_dir = into_path(from_u8(data_dir())) / "cache" / "nonplanar";
     boost::system::error_code ec;
     fs::create_directories(work_dir, ec);
     if (ec) {
-        show_error(this, _L("A working folder for nonplanar slicing could not be created") + ":\n" +
-                   from_u8(ec.message()));
-        return;
+        error = _L("A working folder for the slicing service could not be created") + ":\n" + from_u8(ec.message());
+        return false;
     }
 
-    // A fresh name per run: the export is transient and two runs must never collide.
-    const fs::path stem       = work_dir / fs::unique_path("plate-%%%%-%%%%-%%%%-%%%%");
-    const fs::path plate_3mf  = fs::path(stem).replace_extension(".3mf");
-    const fs::path settings_json = fs::path(stem).replace_extension(".settings.json");
+    // Named after the project and the plate (the service names its result after the file it was
+    // sent), with a random tail: the export is transient and two runs must never collide.
+    std::string project = into_u8(get_project_name());
+    for (char &c : project)
+        if (!(std::isalnum(static_cast<unsigned char>(c)) || c == '-' || c == '_'))
+            c = '_';
+    if (project.empty())
+        project = "plate";
+    if (p->partplate_list.get_plate_count() > 1)
+        project += "-plate" + std::to_string(plate_index + 1);
+    const fs::path plate_3mf = work_dir / fs::unique_path(project + "-%%%%%%%%.3mf");
 
-    // Silence: no "project saved" side effects -- this is a courier file, not the user's project.
-    if (export_3mf(plate_3mf, SaveStrategy::Silence | SaveStrategy::SplitModel) < 0) {
-        show_error(this, _L("The plate could not be exported for nonplanar slicing."));
+    // The courier model: a copy holding only this plate's printable instances -- every part of
+    // every object on it, all sliced together as one job -- moved by the plate's origin, so the
+    // file reads as a one-plate project with the plate at the origin. The G-code comes back in
+    // that frame, which is the plate's own: the preview adds the plate's origin back, as it does
+    // for a local slice of this plate. Other plates' objects never leave.
+    Model courier(p->model);
+    const Vec3d origin = plate->get_origin();
+    const Vec3d shift(origin.x(), origin.y(), 0.);
+    for (int o = int(courier.objects.size()) - 1; o >= 0; --o) {
+        ModelObject* object = courier.objects[o];
+        for (int i = int(object->instances.size()) - 1; i >= 0; --i)
+            if (! plate->contain_instance(o, i) || ! object->instances[i]->printable)
+                object->delete_instance(size_t(i));
+        if (object->instances.empty())
+            courier.delete_object(size_t(o));
+    }
+    std::vector<std::pair<int, int>> placed;
+    for (size_t o = 0; o < courier.objects.size(); ++o)
+        for (size_t i = 0; i < courier.objects[o]->instances.size(); ++i) {
+            ModelInstance* instance = courier.objects[o]->instances[i];
+            instance->set_offset(instance->get_offset() - shift);
+            placed.emplace_back(int(o), int(i));
+        }
+    if (placed.empty()) {
+        error = _L("There is nothing on the plate to slice.");
+        return false;
+    }
+    // This plate's pauses and colour changes become plate 1's.
+    courier.plates_custom_gcodes.clear();
+    if (auto it = p->model.plates_custom_gcodes.find(plate_index); it != p->model.plates_custom_gcodes.end())
+        courier.plates_custom_gcodes[0] = it->second;
+    courier.curr_plate_index = 0;
+
+    // The plate's entry, as plate 1 holding the courier's instances, without thumbnails (none are
+    // rendered for a courier file).
+    PlateDataPtrs plate_data_list;
+    p->partplate_list.store_to_3mf_structure(plate_data_list, false, plate_index);
+    PlateData* mine = nullptr;
+    for (size_t i = 0; i < plate_data_list.size(); ++i) {
+        if (int(i) == plate_index)
+            mine = plate_data_list[i];
+        else
+            delete plate_data_list[i];
+    }
+    plate_data_list.clear();
+    if (mine != nullptr) {
+        mine->plate_index           = 0;
+        mine->objects_and_instances = placed;
+        mine->thumbnail_file.clear();
+        mine->no_light_thumbnail_file.clear();
+        mine->top_file.clear();
+        mine->pick_file.clear();
+        mine->pattern_bbox_file.clear();
+        mine->gcode_file.clear();
+        plate_data_list.push_back(mine);
+    }
+
+    // The RESOLVED settings, not preset names, in Metadata/project_settings.config -- unsaved edits
+    // included -- overlaid with the plate's own settings exactly as the background process overlays
+    // them for a local slice of this plate; per-plate lists keep only this plate's entry. The
+    // per-object overrides and each part's filament travel with the objects. settings_from_mesh
+    // tells the service to slice with exactly those. A service usually cannot see the user's preset
+    // library (a hosted one certainly cannot), so names would be unresolvable there; they still go
+    // along as labels.
+    PresetBundle&      bundle = *wxGetApp().preset_bundle;
+    DynamicPrintConfig cfg    = bundle.full_config_secure();
+    cfg.apply(*plate->config());
+    for (const char* key : {"wipe_tower_x", "wipe_tower_y"})
+        if (auto* opt = cfg.option<ConfigOptionFloats>(key); opt != nullptr && plate_index < int(opt->values.size()))
+            opt->values = {opt->values[plate_index]};
+
+    // One self-contained 3MF (no split-out object files), like any saved project. Silence: no
+    // "project saved" side effects -- this is a courier file, not the user's project.
+    publish(courier, SaveStrategy::Silence);
+    std::vector<Preset*> project_presets = bundle.get_current_project_embedded_presets();
+    StoreParams          store_params;
+    store_params.path            = into_u8(from_path(plate_3mf));
+    store_params.model           = &courier;
+    store_params.plate_data_list = plate_data_list;
+    store_params.project_presets = project_presets;
+    store_params.config          = &cfg;
+    store_params.project         = &p->project;
+    store_params.strategy        = SaveStrategy::Silence | SaveStrategy::Zip64;
+    const bool stored            = Slic3r::store_bbs_3mf(store_params);
+    for (Preset* preset : project_presets)
+        delete preset;
+    release_PlateData_list(plate_data_list);
+    if (! stored) {
+        error = _L("The plate could not be exported for the slicing service.");
         fs::remove(plate_3mf, ec);
-        return;
+        return false;
     }
 
-    // The RESOLVED settings, not preset names. A service usually cannot see the user's preset
-    // library -- a hosted one certainly cannot -- so names would be unresolvable there and the
-    // two programs would have to agree on a profile catalogue. Sending the values removes that
-    // whole class of failure. This is the same serialization, from the same config, that goes
-    // into a project's Metadata/project_settings.config, so a service already reading those
-    // needs nothing new. Names still go along as labels.
-    PresetBundle &bundle = *wxGetApp().preset_bundle;
-    const std::string printer  = bundle.printers.get_selected_preset_name();
-    const std::string process  = bundle.prints.get_selected_preset_name();
-    const std::string filament = bundle.filament_presets.empty() ? std::string()
-                                                                 : bundle.filament_presets.front();
-    try {
-        const DynamicPrintConfig cfg = bundle.full_config_secure();
-        cfg.save_to_json(settings_json.string(), std::string("nonplanar_slice"),
-                         std::string("project"), std::string(SLIC3R_VERSION));
-    } catch (const std::exception &ex) {
-        show_error(this, _L("The print settings could not be prepared for nonplanar slicing") +
-                   ":\n" + from_u8(ex.what()));
-        fs::remove(plate_3mf, ec);
-        fs::remove(settings_json, ec);
-        return;
+    out.plate_3mf   = plate_3mf;
+    out.work_dir    = work_dir;
+    out.plate_index = plate_index;
+    out.printer     = bundle.printers.get_selected_preset_name();
+    out.process     = bundle.prints.get_selected_preset_name();
+    out.filament    = bundle.filament_presets.empty() ? std::string() : bundle.filament_presets.front();
+    // The choices made in the service's own options dialog for this printer (Slice dropdown).
+    out.options      = SliceService::request_options();
+    out.mode         = SliceService::current_mode();
+    out.machine_axes = SliceService::machine_axes();
+    return true;
+}
+
+void Plater::accept_slice_service_result(int job_serial, int plate_index, uint64_t fingerprint,
+                                         const std::string &options_key, const fs::path &gcode)
+{
+    if (job_serial == s_service_job.serial)
+        s_service_job = {};
+    // One waiting result per plate: the newest.
+    boost::system::error_code ec;
+    for (auto it = s_parked_service_results.begin(); it != s_parked_service_results.end();) {
+        if (it->plate == plate_index) {
+            fs::remove(it->gcode, ec);
+            it = s_parked_service_results.erase(it);
+        } else
+            ++it;
+    }
+    s_parked_service_results.push_back({plate_index, fingerprint, options_key, gcode});
+    BOOST_LOG_TRIVIAL(info) << "Plater::accept_slice_service_result: plate " << plate_index + 1 << ", " << gcode.string();
+
+    // After the job has left the worker: the background process does not start while it is busy.
+    wxGetApp().CallAfter([this, plate_index]() {
+        // Another plate is current, or a local mode was picked meanwhile: it waits for its plate
+        // (and its mode) to come back, see divert_reslice_to_service.
+        if (p->partplate_list.get_curr_plate_index() != plate_index || ! slice_service_selected())
+            return;
+        if (is_preview_shown())
+            reslice(); // takes it and processes it into the preview
+        else if (p->install_parked_service_result())
+            p->main_frame->update_slice_print_status(MainFrame::eEventSliceUpdate, false);
+    });
+}
+
+void Plater::note_user_slice_request()
+{
+    s_user_slice_requested    = true;
+    s_user_slice_requested_at = std::chrono::steady_clock::now();
+    // A service mode automation preselected starts preparing only now, on the person's request (D7).
+    if (p->main_frame != nullptr)
+        p->main_frame->activate_deferred_slice_prepare();
+}
+
+Plater::ServiceSliceBlock::ServiceSliceBlock() { ++s_service_slice_blocks; }
+Plater::ServiceSliceBlock::~ServiceSliceBlock() { --s_service_slice_blocks; }
+
+void Plater::slice_service_job_ended(int job_serial)
+{
+    if (job_serial == s_service_job.serial)
+        s_service_job = {};
+}
+
+bool Plater::current_plate_has_service_result(bool with_current_options)
+{
+    if (! with_current_options)
+        return is_service_result(p->partplate_list.get_curr_plate());
+    const std::string options_key = slice_service_options_key();
+    return is_service_result(p->partplate_list.get_curr_plate(), &options_key);
+}
+
+Plater::SliceServicePlateState Plater::slice_service_plate_state(int plate_index)
+{
+    SliceServicePlateState state;
+    PartPlate* plate = p->partplate_list.get_plate(plate_index);
+    if (plate == nullptr)
+        return state;
+    const std::string options_key = slice_service_options_key();
+    state.service_result  = is_service_result(plate);
+    state.matches_options = state.service_result && is_service_result(plate, &options_key);
+    state.result_waiting  = std::any_of(s_parked_service_results.begin(), s_parked_service_results.end(),
+                                        [plate_index](const ParkedServiceResult& r) { return r.plate == plate_index; });
+    state.job_running     = s_service_job.serial != 0 && s_service_job.plate == plate_index && ! p->m_worker.is_idle();
+    if (state.job_running) {
+        int         serial = 0;
+        std::string text;
+        NonplanarSliceJob::last_status(serial, state.progress, text);
+        if (serial == s_service_job.serial)
+            state.stage = text;
+        else
+            state.progress = -1;
+    }
+    state.waiting_for_person = slice_service_selected() && NonplanarSliceClient::is_configured() && plate->has_printable_instances() &&
+                               ! m_only_gcode && ! m_exported_file && ! state.matches_options && ! state.result_waiting &&
+                               ! state.job_running;
+    return state;
+}
+
+void Plater::cancel_slicing(bool& local_stopped, bool& service_cancelled)
+{
+    // A Slice all chain ends here, as the person cancelling would want: no next plate starts.
+    p->m_slice_all                = false;
+    p->m_slice_all_only_has_gcode = false;
+    local_stopped = ! p->background_process.idle();
+    if (local_stopped)
+        p->background_process.stop(); // what the slicing notification's Cancel does
+    service_cancelled = s_service_job.serial != 0 && ! p->m_worker.is_idle();
+    if (service_cancelled)
+        p->m_worker.cancel_all(); // the job tells the service to stop (NonplanarSliceJob)
+}
+
+bool Plater::priv::install_parked_service_result()
+{
+    const int  plate_index = partplate_list.get_curr_plate_index();
+    PartPlate* plate       = partplate_list.get_curr_plate();
+    auto       it          = std::find_if(s_parked_service_results.begin(), s_parked_service_results.end(),
+                                          [plate_index](const ParkedServiceResult& r) { return r.plate == plate_index; });
+    if (it == s_parked_service_results.end() || plate == nullptr || ! slice_service_selected())
+        return false;
+    const ParkedServiceResult parked = *it;
+    s_parked_service_results.erase(it);
+
+    boost::system::error_code ec;
+    if (parked.options_key != slice_service_options_key() || parked.fingerprint != q->slice_service_fingerprint() ||
+        background_process.get_current_plate() != plate) {
+        // Edited (or other options picked) while the service was slicing: like a local slice of
+        // an older state, it is not this plate's result.
+        BOOST_LOG_TRIVIAL(info) << "Plater: the service result for plate " << plate_index + 1
+                                << " no longer matches the plate; dropped";
+        fs::remove(parked.gcode, ec);
+        return false;
     }
 
-    BOOST_LOG_TRIVIAL(info) << boost::format("Plater::slice_nonplanar: %1% -> %2% (printer %3%)")
-                                   % plate_3mf.filename().string() % url % printer;
+    if (background_process.running())
+        background_process.stop();
+    // The plate's Print takes the model and the settings as they are now -- twice, as
+    // PartPlate::load_gcode_from_file does: the first apply gives a fresh Print its objects, which
+    // changes how the second normalizes the config -- so the next apply finds nothing changed, and
+    // any later edit invalidates the result exactly as it would invalidate a local slice.
+    update_print_volume_state();
+    apply_current_print();
+    apply_current_print();
 
-    replace_job(get_ui_job_worker(),
-                std::make_unique<NonplanarSliceJob>(url, plate_3mf, settings_json,
-                                                    printer, process, filament, work_dir));
+    // A file of its own beside the plate's usual one, never the file the G-code viewer may still
+    // have mapped from the previous result.
+    const fs::path previous = into_path(from_u8(plate->get_tmp_gcode_path()));
+    static int     installs = 0;
+    const fs::path target   = previous.parent_path() /
+                            (boost::format(".%1%.service%2%.gcode") % get_current_pid() % ++installs).str();
+    fs::copy_file(parked.gcode, target, fs::copy_options::overwrite_existing, ec);
+    if (ec) {
+        BOOST_LOG_TRIVIAL(error) << "Plater: could not take the service result " << parked.gcode.string() << ": " << ec.message();
+        notification_manager->push_notification(NotificationType::CustomNotification,
+                                                NotificationManager::NotificationLevel::ErrorNotificationLevel,
+                                                _u8L("Slicing service") + ": " + ec.message());
+        fs::remove(parked.gcode, ec);
+        return false;
+    }
+    fs::remove(parked.gcode, ec);
+
+    reset_gcode_toolpaths();
+    background_process.get_current_gcode_result()->reset();
+    forget_service_result(plate);
+    plate->set_tmp_gcode_path(into_u8(from_path(target)));
+    background_process.fff_print()->set_gcode_file_ready();
+    plate->update_slice_result_valid_state(true);
+    if (process_completed_with_error == plate_index)
+        process_completed_with_error = -1;
+
+    ServiceResultStamp stamp;
+    stamp.options_key = parked.options_key;
+    file_stamp(plate->get_tmp_gcode_path(), stamp.size, stamp.mtime);
+    s_service_results[plate->get_tmp_gcode_path()] = stamp;
+    if (previous != target)
+        fs::remove(previous, ec); // best effort: the viewer may still hold it
+    BOOST_LOG_TRIVIAL(info) << "Plater: plate " << plate_index + 1 << " took the service result " << target.string();
+    return true;
+}
+
+void Plater::priv::drop_current_plate_result()
+{
+    PartPlate* plate = partplate_list.get_curr_plate();
+    if (plate == nullptr)
+        return;
+    if (background_process.running())
+        background_process.stop();
+    forget_service_result(plate);
+    background_process.fff_print()->set_gcode_file_invalidated();
+    plate->update_slice_result_valid_state(false);
+    background_process.get_current_gcode_result()->reset();
+    reset_gcode_toolpaths();
+}
+
+bool Plater::priv::divert_reslice_to_service()
+{
+    if (m_slice_all || q->only_gcode_mode() || q->using_exported_file())
+        return false;
+    PartPlate* plate = partplate_list.get_curr_plate();
+    if (plate == nullptr)
+        return false;
+
+    if (! slice_service_selected()) {
+        // A local mode: a service result is not what it makes, so the plate is sliced here.
+        if (is_service_result(plate))
+            drop_current_plate_result();
+        return false;
+    }
+
+    // An empty plate has nothing to send; the usual path clears its preview.
+    if (! plate->has_printable_instances())
+        return false;
+
+    // The person's request, if one is pending, is consumed here whatever comes of it.
+    const bool requested = s_user_slice_requested &&
+                           std::chrono::steady_clock::now() - s_user_slice_requested_at < USER_SLICE_REQUEST_TTL;
+    s_user_slice_requested = false;
+
+    // Settle what the latest edits did to the plate's result first: they reach the Print on a short
+    // timer (schedule_background_process), and a click on the Preview tab can come sooner. A result
+    // they invalidate must be sliced again here, not by the local slicer further down reslice().
+    update_background_process(false);
+    install_parked_service_result();
+    const std::string options_key = slice_service_options_key();
+    if (is_service_result(plate, &options_key))
+        return false; // this mode's result: the usual path shows it (processing the file first if needed)
+
+    // A service slice of exactly this is already on its way.
+    if (s_service_job.serial != 0 && ! m_worker.is_idle() && s_service_job.plate == partplate_list.get_curr_plate_index() &&
+        s_service_job.options_key == options_key && s_service_job.fingerprint == q->slice_service_fingerprint())
+        return true;
+
+    // A service run is a cloud job: only the person starts one (note_user_slice_request), never an
+    // automatic re-slice, an arriving result or a web app (ServiceSliceBlock). The plate stays
+    // unsliced -- and nothing is sliced locally either -- until they press Slice or open Preview.
+    if (! requested || s_service_slice_blocks > 0) {
+        BOOST_LOG_TRIVIAL(info) << "Plater: plate " << partplate_list.get_curr_plate_index() + 1
+                                << " needs a slicing-service run; waiting for the person to ask for it"
+                                << (s_service_slice_blocks > 0 ? " (web app call)" : "");
+        return true;
+    }
+
+    q->slice_nonplanar(true);
+    return true;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -20455,9 +21393,28 @@ static fs::path loaded_gcode_path(const wxString& last_loaded)
     return fs::is_regular_file(path, ec) ? path : fs::path{};
 }
 
+// UNLAYERED_MOD: the same short path for a loaded SLICED 3MF that has no objects behind it -- a
+// sliced .gcode.3mf handed back without its model. Its plate G-code is the
+// whole artifact, like a loaded .gcode, but export_gcode() bails on the empty model, so Export
+// G-code silently did nothing. The background process keeps that plate's G-code
+// at the plate's tmp path (the 3MF's Metadata/plate_N.gcode).
+static fs::path objectless_sliced_gcode_path(bool exported_file, const Model& model, PartPlateList& plates)
+{
+    if (! exported_file || ! model.objects.empty())
+        return {};
+    PartPlate* plate = plates.get_curr_plate();
+    if (plate == nullptr)
+        return {};
+    const fs::path path = into_path(from_u8(plate->get_tmp_gcode_path()));
+    boost::system::error_code ec;
+    return fs::is_regular_file(path, ec) ? path : fs::path{};
+}
+
 bool Plater::can_export_loaded_gcode() const
 {
-    return m_only_gcode && ! loaded_gcode_path(m_last_loaded_gcode).empty();
+    if (m_only_gcode)
+        return ! loaded_gcode_path(m_last_loaded_gcode).empty();
+    return ! objectless_sliced_gcode_path(m_exported_file, p->model, p->partplate_list).empty();
 }
 
 bool Plater::can_send_loaded_gcode() const
@@ -20472,7 +21429,8 @@ bool Plater::can_send_loaded_gcode() const
 
 bool Plater::export_loaded_gcode()
 {
-    const fs::path source = loaded_gcode_path(m_last_loaded_gcode);
+    const fs::path source = m_only_gcode ? loaded_gcode_path(m_last_loaded_gcode)
+                                         : objectless_sliced_gcode_path(m_exported_file, p->model, p->partplate_list);
     if (source.empty()) {
         show_error(this, _L("The G-code file being previewed is no longer on disk."));
         return false;
@@ -20480,8 +21438,15 @@ bool Plater::export_loaded_gcode()
 
     AppConfig& appconfig = *wxGetApp().app_config;
     const std::string start_dir = appconfig.get_last_output_dir(source.parent_path().string(), false);
+    // A sliced 3MF's plate G-code is "plate_1.gcode" on disk: offer the project's name instead.
+    fs::path default_name = source.filename();
+    if (! m_only_gcode) {
+        const wxString project = get_project_name();
+        if (! project.empty())
+            default_name = into_path(project + ".gcode").filename();
+    }
 
-    wxFileDialog dlg(this, _L("Save G-code file as:"), start_dir, from_path(source.filename()),
+    wxFileDialog dlg(this, _L("Save G-code file as:"), start_dir, from_path(default_name),
                      GUI::file_wildcards(FT_GCODE, source.extension().string()),
                      wxFD_SAVE | wxFD_OVERWRITE_PROMPT);
     if (dlg.ShowModal() != wxID_OK)
@@ -20582,6 +21547,8 @@ void Plater::send_gcode_legacy(int plate_idx, Export3mfProgressFn proFn)
     PrintHostJob upload_job(physical_printer_config);
     if (upload_job.empty())
         return;
+    // A page's upload options (slicer.print), for this upload only.
+    const nlohmann::json automation = std::exchange(p->next_print_dialog_options, nlohmann::json::object()).value("upload", nlohmann::json::object());
 
     UsageTelemetry::record("export", {{"kind", "send"}, {"host_type", physical_printer_config->opt_serialize("host_type")}});
     usage_remember_print("send");
@@ -20734,6 +21701,9 @@ void Plater::send_gcode_legacy(int plate_idx, Export3mfProgressFn proFn)
                                                          storage_paths, storage_names, config->get_bool("open_device_tab_post_upload"));
         }
 
+        if (!automation.empty())
+            pDlg->set_automation_preset(automation.value("action", std::string()), automation.value("path", std::string()),
+                                        automation.value("group", std::string()), automation.value("storage", std::string()));
         pDlg->init();
         if (pDlg->ShowModal() != wxID_OK) {
             return;
@@ -20849,6 +21819,7 @@ void Plater::print_job_finished(wxCommandEvent &evt)
 {
     //start print failed
     if (p) {
+        ++p->print_sends_started; // the job reached the printer (PrintJob posts this on success)
 #ifdef __APPLE__
         p->hide_select_machine_dlg();
 #else
@@ -20879,6 +21850,7 @@ void Plater::send_job_finished(wxCommandEvent& evt)
     //dev->set_selected_machine(evt.GetString().ToStdString());
 
     send_gcode_finish(evt.GetString());
+    ++p->send_jobs_finished; // WEB_APP_BRIDGE.md 4.6: the send to storage finished
     p->hide_send_to_printer_dlg();
     //p->main_frame->request_select_tab(TAB_ID_MONITOR);
     ////jump to monitor and select device status panel
@@ -21655,6 +22627,15 @@ bool Plater::is_export_gcode_scheduled() const
     return p->background_process.is_export_scheduled();
 }
 
+unsigned    Plater::gcode_exports_started() const { return p->gcode_exports_started; }
+unsigned    Plater::print_sends_started() const { return p->print_sends_started; }
+unsigned    Plater::send_jobs_finished() const { return p->send_jobs_finished; }
+void        Plater::set_next_print_dialog_options(const nlohmann::json& options)
+{
+    p->next_print_dialog_options = options.is_object() ? options : nlohmann::json::object();
+}
+std::string Plater::last_gcode_export_path() const { return p->last_gcode_export_path; }
+
 const Selection &Plater::get_selection() const
 {
     return p->get_selection();
@@ -21882,6 +22863,7 @@ void Plater::center_selection()             { p->center_selection(); }
 void Plater::drop_selection()               { p->drop_selection(); }
 void Plater::mirror(Axis axis)              { p->mirror(axis); }
 void Plater::split_object(bool auto_drop)   { p->split_object(auto_drop); }
+void Plater::split_object(int obj_idx, bool auto_drop) { p->split_object(obj_idx, auto_drop); }
 void Plater::split_volume()                 { p->split_volume(); }
 void Plater::optimize_rotation()
 {
@@ -22147,6 +23129,9 @@ int Plater::select_plate(int plate_index, bool need_slice)
     int ret;
     BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(" %1%: plate %2%, need_slice %3% ")%__LINE__ %plate_index  %need_slice;
     take_snapshot("select partplate!");
+    // need_slice: a plate picked in Preview by the person (web apps pass false).
+    if (need_slice)
+        note_user_slice_request();
     ret = p->partplate_list.select_plate(plate_index);
     if (!ret) {
         if (is_view3D_shown())
@@ -22964,13 +23949,7 @@ int Plater::select_plate_by_hover_id(int hover_id, bool right_click, bool isModi
     } else if ((action == 7) && (!right_click)) {
         // move plate to the front
         take_snapshot("move plate to the front");
-        ret = p->partplate_list.move_plate_to_index(plate_index,0);
-        p->partplate_list.update_slice_context_to_current_plate(p->background_process);
-        p->preview->update_gcode_result(p->partplate_list.get_current_slice_result());
-        p->sidebar->obj_list()->reload_all_plates();
-        p->partplate_list.update_plates();
-        update();
-        p->partplate_list.select_plate(0);
+        ret = move_plate_to_index(plate_index, 0);
     }
 
     else
@@ -22980,6 +23959,18 @@ int Plater::select_plate_by_hover_id(int hover_id, bool right_click, bool isModi
     }
 
     BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(" %1%: return %2%")%__LINE__ % ret;
+    return ret;
+}
+
+int Plater::move_plate_to_index(int old_index, int new_index)
+{
+    const int ret = p->partplate_list.move_plate_to_index(old_index, new_index);
+    p->partplate_list.update_slice_context_to_current_plate(p->background_process);
+    p->preview->update_gcode_result(p->partplate_list.get_current_slice_result());
+    p->sidebar->obj_list()->reload_all_plates();
+    p->partplate_list.update_plates();
+    update();
+    p->partplate_list.select_plate(new_index);
     return ret;
 }
 
