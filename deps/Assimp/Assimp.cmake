@@ -17,7 +17,7 @@ else()
     set(_assimp_build_zlib "-DASSIMP_BUILD_ZLIB=ON")
 endif()
 
-unlayered_add_cmake_project(Assimp
+orcaslicer_add_cmake_project(Assimp
     URL ${_assimp_url}
     URL_HASH ${_assimp_hash}
     CMAKE_ARGS

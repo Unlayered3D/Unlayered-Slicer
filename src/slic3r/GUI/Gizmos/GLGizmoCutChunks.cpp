@@ -1,12 +1,13 @@
 #include "GLGizmoCutChunks.hpp"
 #include "slic3r/GUI/GLCanvas3D.hpp"
 
-#include <GL/glew.h>
+#include <glad/gl.h>
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
 
 #include "slic3r/GUI/GUI_App.hpp"
+#include "slic3r/GUI/ImGuiWrapper.hpp"
 #include "slic3r/GUI/GUI_ObjectList.hpp"
 #include "slic3r/GUI/Plater.hpp"
 #include "slic3r/GUI/Gizmos/GizmoObjectManipulation.hpp"
@@ -57,10 +58,9 @@ void GLGizmoCutChunks3D::perform_cut(const Selection& selection, bool surpress_d
     m_keep_lower         = true;
     m_connectors_editing = false;
 
-    //disables auto drop
+    //disables auto drop (an object's, shared by its instances; the chunks inherit it)
     ModelObject* src_obj = m_c->selection_info()->model_object();
-    for (ModelInstance* inst : src_obj->instances)
-        inst->auto_drop = false;
+    src_obj->auto_drop = false;
 
     // Remember where the source object sat and what it was called, so afterwards
     // we can keep the trunk in that slot / under that name and send only the new

@@ -34,7 +34,7 @@ inline void drop_to_bed_unless_sunk(ModelObject& mo, const std::vector<double>& 
     mo.invalidate_bounding_box();
     for (size_t i = 0; i < mo.instances.size() && i < min_z_before.size(); ++i) {
         // auto_drop off (the object list's Auto Drop): the person keeps this one where it is.
-        if (!mo.instances[i]->auto_drop || min_z_before[i] < SINKING_Z_THRESHOLD || (i < keep.size() && keep[i]))
+        if (!mo.auto_drop || min_z_before[i] < SINKING_Z_THRESHOLD || (i < keep.size() && keep[i]))
             continue;
         const double z = mo.get_instance_min_z(i);
         if (z != 0.0)

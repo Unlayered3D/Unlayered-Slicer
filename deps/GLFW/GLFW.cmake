@@ -11,7 +11,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     set(_glfw_platform_args -DGLFW_BUILD_WAYLAND=ON -DGLFW_BUILD_X11=ON)
 endif()
 
-unlayered_add_cmake_project(GLFW
+orcaslicer_add_cmake_project(GLFW
     URL https://github.com/glfw/glfw/archive/refs/tags/3.4.zip
     URL_HASH SHA256=a133ddc3d3c66143eba9035621db8e0bcf34dba1ee9514a9e23e96afd39fd57a
     CMAKE_ARGS

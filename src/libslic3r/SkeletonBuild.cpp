@@ -3,6 +3,7 @@
 #include "TriangleMeshSlicer.hpp"
 
 #include <algorithm>
+#include <boost/log/trivial.hpp>
 #include <cctype>
 #include <chrono>
 #include <cmath>
@@ -465,12 +466,17 @@ SkeletonResult build_skeleton(const indexed_triangle_set& its_local,
 
     r.genus = mesh_genus(Vs, Fs);
 
-    if (p.method == 0)
+    // MCF needs a closed, valid surface (CGAL crashes on others: a reported macOS crash in the mean curvature
+    // flow); mesh_genus() checks exactly that and gives -1 otherwise. Such a mesh takes the voxel skeleton.
+    const bool mcf = p.method == 0 && r.genus >= 0;
+    if (p.method == 0 && !mcf)
+        BOOST_LOG_TRIVIAL(warning) << "skeleton: the mesh is not a closed surface; using the voxel skeleton";
+    if (mcf)
         r.graph = skeletonize_mesh(Vs, Fs, (double) p.quality_speed, (double) p.min_edge_factor,
                                    (double) p.medial_centering);
     else
         r.graph = skeletonize_mesh_voxel(Vs, Fs, p.voxel_resolution);
-    lap(p.method == 0 ? "skeletonize (MCF)" : "skeletonize (voxel)", 55);
+    lap(mcf ? "skeletonize (MCF)" : "skeletonize (voxel)", 55);
     if (canceled()) { r.note = "canceled"; return r; }
 
     r.cycles_raw = skeleton_cycle_count(r.graph);

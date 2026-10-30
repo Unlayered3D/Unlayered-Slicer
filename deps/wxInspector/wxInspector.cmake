@@ -21,7 +21,7 @@ if (MSVC)
         "-DwxWidgets_LIB_DIR=${DESTDIR}/lib/${_wx_compiler_prefix}${_wx_arch_suffix}_lib")
 endif ()
 
-unlayered_add_cmake_project(
+orcaslicer_add_cmake_project(
     wxInspector
     URL https://github.com/Noisyfox/wxInspector/archive/refs/tags/v1.0.0.zip
     URL_HASH SHA256=0ba163956f2d468b19a91b96c5aba66ee9610843ea41dda628ea44cdafde7db7

@@ -68,7 +68,7 @@ if (MSVC AND CMAKE_C_COMPILER_ID STREQUAL "Clang")
   set(_curl_probe_overrides -DHAVE_IOCTLSOCKET_CAMEL=0 -DHAVE_IOCTLSOCKET_CAMEL_FIONBIO=0)
 endif ()
 
-unlayered_add_cmake_project(CURL
+orcaslicer_add_cmake_project(CURL
   # GIT_REPOSITORY      https://github.com/curl/curl.git
   # GIT_TAG             curl-7_75_0
   URL                 https://github.com/curl/curl/archive/refs/tags/curl-7_75_0.zip

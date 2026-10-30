@@ -5,6 +5,9 @@
 	"from": "system",
 	"setting_id": "n4zaXcUUzTqAxq5f",
 	"instantiation": "true",
+	"filament_extruder_variant": [
+		"Direct Drive Standard"
+	],
 	"compatible_printers": [
 		"IdeaFormer IR3 V2 0.4 nozzle"
 	],
@@ -17,20 +20,11 @@
 	"filament_settings_id": [
 		"Generic PETG @IdeaFormer IR3 V2"
 	],
-	"filament_diameter": [
-		"1.75"
-	],
-	"filament_density": [
-		"1.27"
-	],
 	"filament_flow_ratio": [
 		"0.95"
 	],
 	"filament_cost": [
 		"25"
-	],
-	"filament_max_volumetric_speed": [
-		"10"
 	],
 	"nozzle_temperature": [
 		"240"
@@ -38,31 +32,10 @@
 	"nozzle_temperature_initial_layer": [
 		"245"
 	],
-	"nozzle_temperature_range_low": [
-		"220"
-	],
-	"nozzle_temperature_range_high": [
-		"260"
-	],
-	"temperature_vitrification": [
-		"70"
-	],
-	"hot_plate_temp": [
-		"80"
-	],
-	"hot_plate_temp_initial_layer": [
-		"80"
-	],
 	"cool_plate_temp": [
 		"80"
 	],
 	"cool_plate_temp_initial_layer": [
-		"80"
-	],
-	"textured_plate_temp": [
-		"80"
-	],
-	"textured_plate_temp_initial_layer": [
 		"80"
 	],
 	"fan_min_speed": [
@@ -77,9 +50,6 @@
 	"overhang_fan_speed": [
 		"80"
 	],
-	"close_fan_the_first_x_layers": [
-		"3"
-	],
 	"full_fan_speed_layer": [
 		"8"
 	],
@@ -92,9 +62,6 @@
 	"fan_cooling_layer_time": [
 		"100"
 	],
-	"reduce_fan_stop_start_freq": [
-		"1"
-	],
 	"filament_retraction_length": [
 		"2"
 	],
@@ -103,9 +70,6 @@
 	],
 	"filament_deretraction_speed": [
 		"40"
-	],
-	"filament_z_hop": [
-		"0.4"
 	],
 	"filament_start_gcode": [
 		"; Generic PETG @IdeaFormer IR3 V2 — belt PETG, bed 80C"

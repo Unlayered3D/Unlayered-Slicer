@@ -8,9 +8,9 @@
 <link rel="stylesheet" type="text/css" href="../css/common.css" />
 <link rel="stylesheet" type="text/css" href="11.css" />
 <link rel="stylesheet" type="text/css" href="../css/dark.css" />
-<script type="text/javascript" src="../js/jquery-3.6.0.min.js"></script>
+<script type="text/javascript" src="../../include/jquery-3.6.0.min.js"></script>
 <script type="text/javascript" src="../js/json2.js"></script>
-<script type="text/javascript" src="../../data/text.js"></script>
+<script type="text/javascript" src="../../include/i18n.js"></script>
 <script type="text/javascript" src="../js/globalapi.js"></script>
 <script type="text/javascript" src="../js/common.js"></script>
 <script type="text/javascript" src="11.js"></script>
@@ -21,14 +21,14 @@
      the place's printer-profile region becomes the wizard's region. -->
 <body onLoad="OnInit()">
 <div id="Title">
-	<div id="RegionTitle">Where do you live?</div>
+	<div id="RegionTitle" data-i18n="where_do_you_live">Where do you live?</div>
 </div>
 <div id="Content">
-	<div id="RegionHelp" class="TextS2">Choose where you live so we can apply the right privacy settings. It also sets the region for printer profiles. You can change it later in Preferences.</div>
+	<div id="RegionHelp" class="TextS2" data-i18n="where_do_you_live_help">Choose where you live so we can apply the right privacy settings. It also sets the region for printer profiles. You can change it later in Preferences.</div>
 	<div id="RegionList" role="radiogroup" aria-labelledby="RegionTitle"></div>
 </div>
 <div id="AcceptArea">
-	<button type="button" class="ButtonStyleConfirm ButtonTypeChoice trans" id="AcceptBtn" tid="t9" onclick="GotoPolicyPage()" disabled>Next</button>
+	<button type="button" class="ButtonStyleConfirm ButtonTypeChoice" id="AcceptBtn" onclick="GotoPolicyPage()" data-i18n="next" disabled>Next</button>
 </div>
 </body>
 </html>

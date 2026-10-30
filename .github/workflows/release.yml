@@ -9,34 +9,47 @@ name: Release
 # Tag convention (enforced below): v0.0.4 for a release, v0.0.4-beta1 / -rc1 / -alpha1 for a
 # prerelease. A single alphanumeric prerelease identifier, no dots. version.inc must already say the
 # same version, minus the leading "v".
+#
+# Three modes. A tag push is always `release`; a run by hand picks one:
+#   dry-run  build the installer and keep it as an artifact; publish nothing.
+#   staging  the whole release flow, landing where nobody downloads it: the site's staging channel
+#            (admins only on /admin/software, never /software or the update check) and a DRAFT
+#            GitHub Release, which only maintainers see. Any branch or tag. Delete the draft after.
+#   release  the real thing, from a tag.
+#
+# The same file goes into every repository that builds the slicer (see .github/publish/README.md).
+# Releases are built and published only where the repository variable PUBLISH_RELEASES is true.
+# Anywhere else a tag push builds nothing and a run by hand can't be `release`. Staging runs
+# anywhere the UNLAYERED_SOFTWARE_STAGING_TOKEN secret is set.
 
 # Manual only (Actions > Run workflow): automatic runs on push, pull request or a schedule
 # cost money on the private repository, so none start on their own.
 on:
   workflow_dispatch:
     inputs:
-      dry_run:
-        description: 'Build and produce latest.json, but do not create a GitHub Release'
-        type: boolean
-        default: true
+      mode:
+        description: 'dry-run: build only. staging: publish to staging + a draft GitHub Release. release: publish for real (run it on the tag).'
+        type: choice
+        options: [dry-run, staging, release]
+        default: dry-run
 
 permissions:
-  contents: write
-
-# Where a tagged release is published. This repository is private, so a release published here is
-# invisible to users. To publish to the public repository instead, set the repository variable
-# UNLAYERED_RELEASE_REPO (e.g. Unlayered3D/Unlayered-Slicer) and the secret UNLAYERED_RELEASE_TOKEN,
-# a fine-grained token with contents: write on that repository. The job token cannot write there.
-env:
-  RELEASE_REPO: ${{ vars.UNLAYERED_RELEASE_REPO || github.repository }}
+  contents: write # the GitHub Release
+  actions: write # delete this run's artifacts once the installer is on the site
 
 concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
 
+env:
+  MODE: ${{ github.event_name == 'push' && 'release' || inputs.mode }}
+
 jobs:
   windows:
     name: Release Windows
+    # Tag pushes build only where the repository variable PUBLISH_RELEASES is true; by-hand runs
+    # are checked by the guards below.
+    if: vars.PUBLISH_RELEASES == 'true' || github.event_name == 'workflow_dispatch'
     runs-on: windows-latest
     # A cold dependency cache means building the whole vendored dep tree.
     timeout-minutes: 360
@@ -48,17 +61,17 @@ jobs:
           echo "::error::This workflow publishes releases from the private development repository only."
           exit 1
 
-      - name: Check the release target is writable
-        if: github.ref_type == 'tag' && !inputs.dry_run && env.RELEASE_REPO != github.repository
-        shell: bash
-        env:
-          HAS_TOKEN: ${{ secrets.UNLAYERED_RELEASE_TOKEN != '' }}
+      - name: Guard against releasing from a repository that doesn't publish releases
+        if: env.MODE == 'release' && vars.PUBLISH_RELEASES != 'true'
         run: |
-          if [ "$HAS_TOKEN" != "true" ]; then
-            echo "::error::UNLAYERED_RELEASE_REPO is $RELEASE_REPO but the UNLAYERED_RELEASE_TOKEN secret is not set."
-            exit 1
-          fi
-          echo "Publishing this release to $RELEASE_REPO"
+          echo "::error::This repository doesn't publish releases (PUBLISH_RELEASES isn't true). Run this as dry-run or staging."
+          exit 1
+
+      - name: Guard against a release that isn't from a tag
+        if: env.MODE == 'release' && github.ref_type != 'tag'
+        run: |
+          echo "::error::A release is published from its tag: pick the tag under Use workflow from, or push it. To try a branch, use staging."
+          exit 1
 
       - name: Checkout
         uses: actions/checkout@v6
@@ -206,74 +219,31 @@ jobs:
         shell: cmd
         run: '"C:/Program Files/7-Zip/7z.exe" a -m0=lzma2 -mx9 Unlayered_Slicer_PDB_V${{ steps.version.outputs.ver_pure }}_for_developers_only.7z *.pdb'
 
-      - name: Collect assets and build the update manifest
-        id: manifest
+      # The installer goes to unlayered3d.com, which also builds /slicer/latest.json -- the in-app
+      # update check -- from it; nothing here makes a manifest any more.
+      - name: Collect assets
         working-directory: ${{ github.workspace }}
         shell: pwsh
         run: |
           $ver = "${{ steps.version.outputs.ver_pure }}"
-          $tag = "${{ steps.version.outputs.tag }}"
 
           # The exact name CPack produces, from CPACK_PACKAGE_FILE_NAME. Asserted rather than
           # globbed: a glob that matches nothing turns a broken build into a silently empty release.
           # The release job builds x64 only; CMakeLists.txt appends the arch (_x64 / _arm64).
           $installer = "build/Unlayered_Slicer_Windows_Installer_V${ver}_x64.exe"
           if (-not (Test-Path $installer)) {
-              Write-Output "::error::CPack did not produce $installer. If CPACK_PACKAGE_FILE_NAME changed in CMakeLists.txt, update this step and select_platform_asset() in src/slic3r/Utils/AppUpdater.cpp together."
+              Write-Output "::error::CPack did not produce $installer. If CPACK_PACKAGE_FILE_NAME changed in CMakeLists.txt, update this step and the Publish step below together."
               exit 1
           }
 
           New-Item -ItemType Directory -Force release-assets | Out-Null
-          $files = @(
-            $installer,
-            "build/Unlayered_Slicer_Windows_V${ver}_portable.zip",
-            "build/src/Release/Unlayered_Slicer_PDB_V${ver}_for_developers_only.7z"
-          )
-          foreach ($f in $files) {
+          foreach ($f in @($installer, "build/Unlayered_Slicer_Windows_V${ver}_portable.zip")) {
               if (Test-Path $f) { Copy-Item $f release-assets/ } else { Write-Output "::warning::missing $f" }
           }
-
-          $installerLeaf = Split-Path $installer -Leaf
           $hash = (Get-FileHash -Algorithm SHA256 $installer).Hash.ToLower()
-          $size = (Get-Item $installer).Length
-          Write-Output "installer: $installerLeaf  $size bytes  sha256=$hash"
+          Write-Output "installer: $(Split-Path $installer -Leaf)  $((Get-Item $installer).Length) bytes  sha256=$hash"
 
-          # The manifest advertises release assets only when the UNLAYERED_PUBLIC_DOWNLOADS repository
-          # variable is 'true'. Without it the manifest lists none and the in-app update dialog offers
-          # to open the download page instead; setting it switches in-app installation on with no code
-          # change.
-          $public = "${{ vars.UNLAYERED_PUBLIC_DOWNLOADS }}" -eq 'true'
-          $assets = @()
-          if ($public) {
-              $assets += [ordered]@{
-                  name                 = $installerLeaf
-                  browser_download_url = "https://github.com/$env:RELEASE_REPO/releases/download/$tag/$installerLeaf"
-                  size                 = $size
-                  sha256               = $hash
-              }
-          }
-
-          $notesPath = "release-notes.md"
-          $notes = if (Test-Path $notesPath) { Get-Content $notesPath -Raw } else { "Unlayered Slicer $ver" }
-
-          # Shaped like a single GitHub releases entry - see VERSION_CHECK_URL in AppConfig.cpp.
-          $manifest = [ordered]@{
-              tag_name   = $tag
-              prerelease = [System.Convert]::ToBoolean("${{ steps.version.outputs.prerelease }}")
-              html_url   = "https://unlayered3d.com/slicer/download"
-              body       = $notes
-              assets     = $assets
-          }
-          $manifest | ConvertTo-Json -Depth 5 | Out-File -FilePath release-assets/latest.json -Encoding utf8
-          Get-Content release-assets/latest.json
-
-      - name: Upload the update manifest
-        uses: actions/upload-artifact@v7
-        with:
-          name: latest-json
-          path: release-assets/latest.json
-          if-no-files-found: error
-
+      # Deleted once the release is on the site (below); a dry run keeps it for inspection.
       - name: Upload release assets
         uses: actions/upload-artifact@v7
         with:
@@ -281,26 +251,75 @@ jobs:
           path: release-assets/
           if-no-files-found: error
 
+      # Debug symbols for crash reports. Not the software, so kept after a release, until the
+      # repository's artifact retention runs out.
+      - name: Upload debug symbols
+        uses: actions/upload-artifact@v7
+        with:
+          name: Unlayered_Slicer_PDB_V${{ steps.version.outputs.ver_pure }}
+          path: build/src/Release/Unlayered_Slicer_PDB_V${{ steps.version.outputs.ver_pure }}_for_developers_only.7z
+          if-no-files-found: warn
+
+      # A release is the site's stable build: /software's Windows download, and -- because the site
+      # builds /slicer/latest.json from it -- the update every installed copy is offered. Staging
+      # publishes the same way to the staging channel. The token decides the channel; the secret
+      # holding it depends on the mode, and --expect-channel fails the run, before uploading, if that
+      # secret holds the wrong one. See .github/publish/README.md.
+      - name: Publish to unlayered3d.com
+        if: env.MODE != 'dry-run'
+        working-directory: ${{ github.workspace }}
+        shell: bash
+        env:
+          UNLAYERED_SITE: ${{ vars.UNLAYERED_SITE || 'https://unlayered3d.com' }}
+          UNLAYERED_SOFTWARE_PUBLISH_TOKEN: ${{ env.MODE == 'staging' && secrets.UNLAYERED_SOFTWARE_STAGING_TOKEN || secrets.UNLAYERED_SOFTWARE_PUBLISH_TOKEN }}
+          SECRET_NAME: ${{ env.MODE == 'staging' && 'UNLAYERED_SOFTWARE_STAGING_TOKEN' || 'UNLAYERED_SOFTWARE_PUBLISH_TOKEN' }}
+          CHANNEL: ${{ env.MODE == 'staging' && 'staging' || 'stable' }}
+          VERSION: ${{ steps.version.outputs.ver_pure }}
+          PRERELEASE: ${{ steps.version.outputs.prerelease }}
+        run: |
+          if [ -z "$UNLAYERED_SOFTWARE_PUBLISH_TOKEN" ]; then
+            echo "::error::The $SECRET_NAME secret is not set, so this can't go to unlayered3d.com (and no GitHub Release is made). See .github/publish/README.md."
+            exit 1
+          fi
+          npm install --prefix .github/publish --no-audit --no-fund --no-package-lock
+          args=(--expect-channel "$CHANNEL" --platform windows --arch x64 --version "$VERSION" --commit "$GITHUB_SHA"
+                --build-url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID")
+          [ -f release-notes.md ] && args+=(--notes-file release-notes.md)
+          [ "$PRERELEASE" = true ] && args+=(--prerelease)
+          node .github/publish/publish-software.mjs publish "${args[@]}" "build/Unlayered_Slicer_Windows_Installer_V$VERSION.exe"
+          node .github/publish/publish-software.mjs list --expect-channel "$CHANNEL"
+
+      # Downloads come from unlayered3d.com only, so the GitHub Release carries the tag and the
+      # changelog but no files -- just a link to the site. It's created after the site publish, so
+      # it never points at a download that isn't there. Staging makes a draft under its own tag name,
+      # so it can never be mistaken for, or collide with, the real release; publishing a draft by
+      # mistake would create that staging-* tag, nothing more.
       - name: Publish the GitHub Release
-        if: github.ref_type == 'tag' && !inputs.dry_run
+        if: env.MODE != 'dry-run'
         uses: softprops/action-gh-release@v2
         with:
-          repository: ${{ env.RELEASE_REPO }}
-          token: ${{ env.RELEASE_REPO != github.repository && secrets.UNLAYERED_RELEASE_TOKEN || github.token }}
-          # Another repository does not have this commit, so its tag goes on that repository's
-          # default branch instead. Here it stays on the built commit.
-          target_commitish: ${{ env.RELEASE_REPO == github.repository && github.sha || '' }}
-          tag_name: ${{ steps.version.outputs.tag }}
+          tag_name: ${{ env.MODE == 'staging' && format('staging-{0}-run{1}', steps.version.outputs.tag, github.run_number) || steps.version.outputs.tag }}
+          name: ${{ env.MODE == 'staging' && format('STAGING {0} (run {1})', steps.version.outputs.tag, github.run_number) || steps.version.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          draft: ${{ env.MODE == 'staging' }}
           prerelease: ${{ steps.version.outputs.prerelease == 'true' }}
           generate_release_notes: true
-          files: release-assets/*
+          body: |
+            ${{ env.MODE == 'staging' && format('**Staging run, not a release.** Delete this draft once you have checked it. The build is in staging on unlayered3d.com/admin/software. [CI run]({0}/{1}/actions/runs/{2})', github.server_url, github.repository, github.run_id) || '**Download Unlayered Slicer from [unlayered3d.com/software](https://unlayered3d.com/software).** Installed copies are offered this update automatically.' }}
 
-      # TODO(unlayered): publish release-assets/latest.json to
-      # https://unlayered3d.com/slicer/latest.json automatically. Until then it is downloaded from
-      # the latest-json artifact and uploaded by hand - the app will not see a new version until
-      # that file is live. Serve it with Cache-Control: max-age=300; a stale CDN copy is the most
-      # likely reason for "the updater says there is nothing new".
-      - name: Remind about the manual manifest publish
-        if: github.ref_type == 'tag' && !inputs.dry_run
+      # The installer is on the site now; the run's copies would be a second, public download.
+      # A dry run keeps them, since that's how a dry run's build is inspected. The debug symbols stay.
+      # Staging deletes them too, as a release would.
+      - name: Delete the run's artifacts
+        if: env.MODE != 'dry-run'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          echo "::notice::Download the latest-json artifact and publish it to https://unlayered3d.com/slicer/latest.json - clients will not see ${{ steps.version.outputs.tag }} until then."
+          gh api --paginate "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts?per_page=100" \
+            -q '.artifacts[] | "\(.id) \(.name)"' \
+            | { grep -v ' Unlayered_Slicer_PDB_' || true; } \
+            | while read -r id name; do
+                echo "Deleting $name"
+                gh api -X DELETE "repos/$GITHUB_REPOSITORY/actions/artifacts/$id"
+              done

@@ -28,7 +28,7 @@
 
   /* --- web-only semantics: LIGHT --- */
   --row-hover: #f7f9fb;
-  --row-selected: #eaf2ff;
+  --row-selected: #d8d8d8; /* Accent::Tint25, the native selection band */
   --plugin-status-danger: #b42318;
   --plugin-status-ok: #137333;
   --plugin-status-warn: #a15c00;
@@ -55,8 +55,13 @@
   /* Speed dial icon tile treatment */
   --speed-tile-bg: #efefef;
   --speed-tile-border: #d8d8d8;
-  --speed-tile-text-s: 74%;
-  --speed-tile-text-l: 34%;
+
+  /* Transparency and control markers are UI surfaces, never color data. */
+  --checker-light: #eeeeee;
+  --checker-dark: #aaaaaa;
+  --color-marker-outline: #ffffff;
+  --color-marker-shadow: rgba(0, 0, 0, 0.7);
+  --control-invalid: var(--plugin-status-danger);
 }
 
 :root[data-orca-theme="dark"] {
@@ -67,8 +72,8 @@
   --border-soft: #4a4a51;
   --col-sep: #4a4a51;
   --row-hover: #2b3340;
-  --row-selected: #244945;
-  --plugin-link-text: #5eead4;
+  --row-selected: #4f4f53; /* Accent::Tint25Dark */
+  --plugin-link-text: #a8a8a8; /* Accent::HoverDark: the accent lifted to read as text on the dark panel */
   --plugin-status-danger: #ff7b72;
   --plugin-status-ok: #37c871;
   --plugin-status-warn: #f0b45a;
@@ -95,8 +100,8 @@
   /* Speed dial icon tile treatment */
   --speed-tile-bg: #34343b;
   --speed-tile-border: #50505a;
-  --speed-tile-text-s: 82%;
-  --speed-tile-text-l: 84%;
+  --checker-light: #68686f;
+  --checker-dark: #414148;
 }
 
 /* Re-theme the shared common.css chrome through variables (replaces dark.css's

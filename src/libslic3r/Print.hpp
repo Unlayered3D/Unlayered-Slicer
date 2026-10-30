@@ -1,10 +1,19 @@
 #ifndef slic3r_Print_hpp_
 #define slic3r_Print_hpp_
 
+#include "Config.hpp"
+#include "Model.hpp"
+#include "Polygon.hpp"
+#include "Fill/FillBase.hpp"
+#include "Polyline.hpp"
+#include "ExtrusionEntity.hpp"
+#include "Geometry.hpp"
+#include "CommonDefs.hpp"
 #include "PrintBase.hpp"
 #include "Fill/FillAdaptive.hpp"
 #include "Fill/FillLightning.hpp"
 #include "PreSliceInfillStructures.hpp"
+#include "Fill/AdaptiveInfillField.hpp"
 
 #include "BoundingBox.hpp"
 #include "CutPlaneSegmentation.hpp"
@@ -13,7 +22,9 @@
 #include "ExtrusionEntityCollection.hpp"
 #include "Flow.hpp"
 #include "Point.hpp"
+#include "PrintConfig.hpp"
 #include "Slicing.hpp"
+#include "TriangleMesh.hpp"
 #include "TriangleMeshSlicer.hpp"
 #include "GCode/ToolOrdering.hpp"
 #include "GCode/WipeTower.hpp"
@@ -22,18 +33,31 @@
 #include "GCode/GCodeProcessor.hpp"
 #include "MultiMaterialSegmentation.hpp"
 #include "ObjectID.hpp"
+#include "TriangleSelector.hpp"
 #include "libslic3r.h"
 
 #include <Eigen/Geometry>
 
+#include <cstddef>
+#include <cmath>
+#include <algorithm>
 #include <functional>
 #include <optional>
+#include <memory>
+#include <map>
+#include <math.h>
 #include <set>
+#include <string>
+#include <tuple>
 #include <unordered_map>
+#include <vector>
+#include <utility>
 
 #include "calib.hpp"
 
 namespace Slic3r {
+
+class SlicingErrors;
 
 class GCode;
 class Layer;
@@ -227,9 +251,9 @@ struct PrintInstance
     // SoftFever
     // 
     // instance id
-    size_t               id;
+    size_t               id{0};
     // Orca: unique id used by marlin/rrf cancel object feature
-    size_t               unique_id;
+    size_t               unique_id{0};
 
     //BBS: instance_shift is too large because of multi-plate, apply without plate offset.
     Point shift_without_plate_offset() const;
@@ -477,6 +501,8 @@ public:
 
 
     const PrintInstances&        instances() const      { return m_instances; }
+    // Orca: Bounding box of each connected body, indexed by Layer::lslices_separated_component_ids.
+    const std::vector<BoundingBox>& separated_body_bboxes() const { return m_separated_body_bboxes; }
     PrintInstances &instances() { return m_instances; }
 
     // Whoever will get a non-const pointer to PrintObject will be able to modify its layers.
@@ -501,6 +527,7 @@ public:
     double                      max_z() const         { return m_max_z; }
     // Centering offset of the sliced mesh from the scaled and rotated mesh of the model.
     const Point& 			     center_offset() const  { return m_center_offset; }
+    const AdaptiveInfillField*       adaptive_infill_field(AdaptiveInfillMode mode) const { return m_pre_slice_infill_structures.adaptive_infill_fields[size_t(mode)].get(); }
 
     // BBS
     void generate_support_preview();
@@ -578,9 +605,12 @@ public:
     std::vector<std::reference_wrapper<const PrintRegion>> all_regions() const;
     const PrintObjectRegions*   shared_regions() const throw() { return m_shared_regions; }
 
-    bool                        has_support()           const { return m_config.enable_support || m_config.enforce_support_layers > 0; }
-    bool                        has_raft()              const { return m_config.raft_layers > 0; }
-    bool                        has_support_material()  const { return this->has_support() || this->has_raft(); }
+    static bool                 has_support(const PrintObjectConfig &config)          { return config.enable_support || config.enforce_support_layers > 0; }
+    static bool                 has_raft(const PrintObjectConfig &config)             { return config.raft_layers > 0; }
+    static bool                 has_support_material(const PrintObjectConfig &config) { return has_support(config) || has_raft(config); }
+    bool                        has_support()           const { return has_support(m_config); }
+    bool                        has_raft()              const { return has_raft(m_config); }
+    bool                        has_support_material()  const { return has_support_material(m_config); }
     // Checks if the model object is painted using the multi-material painting gizmo.
     bool                        is_mm_painted()         const { return this->model_object()->is_mm_painted(); }
     // Checks if the model object is painted using the fuzzy skin painting gizmo.
@@ -588,6 +618,7 @@ public:
 
     // returns 0-based indices of extruders used to print the object (without brim, support and other helper extrusions)
     std::vector<unsigned int>   object_extruders() const;
+    std::vector<unsigned int>   printing_extruders() const;
 
     // Called by make_perimeters()
     void slice();
@@ -596,6 +627,8 @@ public:
     std::vector<Polygons>       slice_support_volumes(const ModelVolumeType model_volume_type) const;
     std::vector<Polygons>       slice_support_blockers() const { return this->slice_support_volumes(ModelVolumeType::SUPPORT_BLOCKER); }
     std::vector<Polygons>       slice_support_enforcers() const { return this->slice_support_volumes(ModelVolumeType::SUPPORT_ENFORCER); }
+    // Preserve each connected region and its holes for perimeter clipping.
+    std::vector<ExPolygons>     slice_single_volume_regions(const ModelVolume* volume) const;
 
     // Helpers to project custom facets on slices
     void project_and_append_custom_facets(bool seam, EnforcerBlockerType type, std::vector<Polygons>& expolys, std::vector<std::pair<Vec3f,Vec3f>>* vertical_points=nullptr) const;
@@ -706,13 +739,14 @@ private:
     void tag_wave_overhang_perimeters();
     void combine_infill();
     void _generate_support_material();
-    std::pair<FillAdaptive::OctreePtr, FillAdaptive::OctreePtr> prepare_adaptive_infill_data(
-        const std::vector<std::pair<const Surface*, float>>& surfaces_w_bottom_z) const;
+    FillAdaptive::RegionOctrees prepare_adaptive_infill_data(
+        const std::vector<std::pair<const Surface*, const Layer*>>& surfaces_w_layer) const;
     FillLightning::GeneratorPtr prepare_lightning_infill_data();
     // Writes m_pre_slice_infill_structures.mesh_infill; skips regeneration
     // when the mesh-relevant inputs are unchanged since the last slice
     // (m_mesh_infill_cache_key).
     void prepare_mesh_infill_data();
+    AdaptiveInfillFields prepare_adaptive_infill_fields() const;
 
     // XYZ in scaled coordinates
     Vec3crd									m_size;
@@ -770,6 +804,7 @@ private:
     PreSliceInfillStructures m_pre_slice_infill_structures;
     // Session cache key for mesh_infill (see prepare_mesh_infill_data).
     std::string              m_mesh_infill_cache_key;
+    std::vector<BoundingBox> m_separated_body_bboxes;
 
     std::vector < VolumeSlices >            firstLayerObjSliceByVolume;
     std::vector<groupedVolumeSlices>        firstLayerObjSliceByGroups;
@@ -783,7 +818,7 @@ private:
     // SoftFever
     // 
     // object id
-    size_t               m_id;
+    size_t               m_id{0};
     void apply_conical_overhang();
 
  public:
@@ -1008,6 +1043,9 @@ struct PrintStatistics
     double                          total_wipe_tower_cost;
     double                          total_wipe_tower_filament;
     unsigned int                    initial_tool;
+    unsigned int                    initial_no_support_tool;
+    // Orca: underscore-separated list of the filament types really extruded on the plate.
+    std::string                     printing_filament_types;
     std::map<size_t, double>        filament_stats;
 
     // Config with the filled in print statistics.
@@ -1026,6 +1064,8 @@ struct PrintStatistics
         total_wipe_tower_cost  = 0.;
         total_wipe_tower_filament = 0.;
         initial_tool           = 0;
+        initial_no_support_tool = 0;
+        printing_filament_types.clear();
         filament_stats.clear();
     }
     static const std::string FilamentUsedG;
@@ -1147,6 +1187,8 @@ public:
 
     // Returns an empty string if valid, otherwise returns an error message.
     StringObjectException validate(std::vector<StringObjectException> *warnings = nullptr, Polygons* collison_polygons = nullptr, std::vector<std::pair<Polygon, float>>* height_polygons = nullptr) const override;
+    // The per-object messages of a SlicingErrors, each prefixed with its object's name.
+    std::string slicing_errors_message(const SlicingErrors &errors) const;
     double              skirt_first_layer_height() const;
     Flow                brim_flow() const;
     Flow                skirt_flow() const;
@@ -1190,6 +1232,8 @@ public:
         struct Brim {
             ExtrusionEntityCollection brim;
             std::vector<ObjectInstanceID> instances;
+            // Zero-based logical filament selected when the brim was planned.
+            unsigned int filament_id { unsigned(-1) };
         };
 
         ExtrusionEntityCollection skirt;
@@ -1251,9 +1295,9 @@ public:
 
     // Logical (extruder, nozzle) grouping result produced by ToolOrdering during reorder.
     // Consumed by GCode via get_layered_nozzle_group_result()->get_nozzle_id(filament, layer) etc.
-    void set_nozzle_group_result(std::shared_ptr<MultiNozzleUtils::NozzleGroupResultBase> result) { m_nozzle_group_result = result; }
+    void set_nozzle_group_result(std::shared_ptr<MultiNozzleUtils::NozzleGroupResultBase> result);
     std::shared_ptr<MultiNozzleUtils::NozzleGroupResultBase> get_nozzle_group_result() const { return m_nozzle_group_result; }
-    std::shared_ptr<MultiNozzleUtils::LayeredNozzleGroupResult> get_layered_nozzle_group_result() const;
+    std::shared_ptr<MultiNozzleUtils::LayeredNozzleGroupResult> get_layered_nozzle_group_result() const { return m_layered_nozzle_group_result; }
 
     // True only when the project opts into the per-layer filament selector
     // (enable_filament_dynamic_map) in auto-for-flush mode on a multi-extruder machine. Gates the
@@ -1328,10 +1372,27 @@ public:
     //BBS: plate's origin related functions
     void set_plate_origin(Vec3d origin) { m_origin = origin; }
     const Vec3d get_plate_origin() const { return m_origin; }
+    // IMEX firmware-managed zones: additional XY shift applied at gcode emission so the
+    // primary zone's contents land at bed origin (0,0). Non-zero only when
+    // `imex_firmware_managed_zones` is on AND the active mode is non-primary; Vec2d::Zero()
+    // in every other case → byte-identical gcode output for everyone else.
+    //
+    // Derived, never pushed in: update_imex_slice_offset() recomputes it from the applied
+    // config, so a headless slice gets the same shift a GUI slice does. It is a pure
+    // function of the config + printable_area, so calling it twice is a no-op; process()
+    // and export_gcode() both call it, which is what settles it ahead of every consumer
+    // (the writer offset in export_gcode(), and translate_to_print_space()).
+    void update_imex_slice_offset();
+    Vec2d get_imex_slice_offset() const { return m_imex_slice_offset; }
     //BBS: export gcode from previous gcode file from 3mf
     void set_gcode_file_ready();
     void set_gcode_file_invalidated();
     void export_gcode_from_previous_file(const std::string& file, GCodeProcessorResult* result, ThumbnailsGeneratorCallback thumbnail_cb = nullptr);
+    // Re-reads the moves and line offsets of `result` from its G-code file after the file was rewritten in
+    // place (post-processing scripts or plugins), so the preview and its G-code window follow the file on
+    // disk. Everything else in `result` was computed while slicing and is kept. If the file cannot be
+    // re-read, the moves are kept and the line offsets are cleared, which hides the G-code window.
+    void reload_gcode_moves(GCodeProcessorResult* result) const;
     //BBS: add modify_count logic
     int get_modified_count() const {return m_modified_count;}
     //BBS: add status for whether support used
@@ -1349,7 +1410,11 @@ public:
     }
 
     //BBS
-    static StringObjectException sequential_print_clearance_valid(const Print &print, Polygons *polygons = nullptr, std::vector<std::pair<Polygon, float>>* height_polygons = nullptr);
+    // warning, if given, names the instances printed later than their place in the object list to avoid a collision.
+    static StringObjectException sequential_print_clearance_valid(const Print &print, Polygons *polygons = nullptr, std::vector<std::pair<Polygon, float>>* height_polygons = nullptr,
+                                                                  StringObjectException *warning = nullptr);
+    // Orca: pre-slice clearance check for a prime tower compacted by "No sparse layers".
+    static StringObjectException compacted_wipe_tower_clearance_valid(const Print &print, Polygons *polygons = nullptr, std::vector<std::pair<Polygon, float>>* height_polygons = nullptr);
     ConflictResultOpt            get_conflict_result() const { return m_conflict_result; }
 
     // Return 4 wipe tower corners in the world coordinates (shifted and rotated), including the wipe tower brim.
@@ -1364,6 +1429,8 @@ public:
     void set_calib_params(const Calib_Params& params);
     const Calib_Params& calib_params() const { return m_calib_params; }
     Vec2d translate_to_print_space(const Vec2d &point) const;
+    // Orca: precise counterpart of compacted_wipe_tower_clearance_valid(), run once the tower exists.
+    void                validate_compacted_wipe_tower_clearance() const;
     float               get_wipe_tower_depth() const { return m_wipe_tower_data.depth; }
     BoundingBoxf        get_wipe_tower_bbx() const { return m_wipe_tower_data.bbx; }
     Vec2f               get_rib_offset() const { return m_wipe_tower_data.rib_offset; }
@@ -1398,14 +1465,20 @@ public:
 
     // Post-slicing config-slot resolvers: map a (filament, layer) pair to the index of its
     // per-(extruder x volume type) column in the expanded variant arrays, cached by grouping context.
-    int get_filament_config_indx(int filament_id, int layer_id);
+    // Orca: without use_cache, the filament resolver leaves the cache alone, for the G-code export
+    // pipeline's cooling stage, which runs concurrently with the generator stage filling it.
+    int get_filament_config_indx(int filament_id, int layer_id, bool use_cache = true);
     int get_nozzle_config_index(int filament_id, int layer_id);
+    // Changes with the grouping result and the filament maps, so a caller may reuse a resolved slot
+    // until it changes.
+    size_t config_index_generation() const { return m_config_index_generation; }
 
     // Orca: Implement prusa's filament shrink compensation approach
+    // Both are decided by apply() from the filaments the model uses, before the PrintObject transformations are built.
     // Returns if all used filaments have same shrinkage compensations.
-     bool has_same_shrinkage_compensations() const;
+    bool has_same_shrinkage_compensations() const { return m_same_shrinkage_compensations; }
     // Returns scaling for each axis representing shrinkage compensations in each axis.
-     Vec3d shrinkage_compensation() const;
+    Vec3d shrinkage_compensation() const { return m_shrinkage_compensation; }
 
     std::tuple<float, float> object_skirt_offset(double margin_height = 0) const;
 
@@ -1458,7 +1531,7 @@ protected:
     };
     using FilamentIndexMap = std::unordered_map<FilamentIndexKey, int, FilamentIndexKeyHash>;
     using PrintIndexMap = std::unordered_map<PrintIndexKey, int, PrintIndexKeyHash>;
-    int get_config_index(int filament_id, int layer_id, const std::vector<std::string> &variant_list, const std::vector<int>& self_index_list, FilamentIndexMap &index_map);
+    int get_config_index(int filament_id, int layer_id, const std::vector<std::string> &variant_list, const std::vector<int>& self_index_list, FilamentIndexMap *index_map);
     int get_config_index(int filament_id, int layer_id, const std::vector<std::string> &variant_list, const std::vector<int>& self_index_list, PrintIndexMap &index_map);
 
     // Invalidates the step, and its depending steps in Print.
@@ -1517,11 +1590,19 @@ private:
             s_slicing_pipeline_hook_fn(*this, object, step);
     }
 
+    static void append_model_object_extruders(const ModelObject &mo, std::vector<unsigned int> &extruders);
+    static bool append_support_extruders(const PrintObjectConfig &config, unsigned int num_extruders, std::vector<unsigned int> &extruders);
+    void        append_tool_change_extruders(std::vector<unsigned int> &extruders) const;
+    void        append_wipe_tower_extruder(std::vector<unsigned int> &extruders) const;
+    void        update_shrinkage_compensation(size_t num_extruders, std::vector<int> &variant_index);
+
     PrintConfig                             m_config;
     PrintObjectConfig                       m_default_object_config;
     PrintRegionConfig                       m_default_region_config;
     PrintObjectPtrs                         m_objects;
     PrintRegionPtrs                         m_print_regions;
+    bool                                    m_same_shrinkage_compensations { false };
+    Vec3d                                   m_shrinkage_compensation { Vec3d::Ones() };
     
     //SoftFever
     bool m_isBBLPrinter = false;
@@ -1532,6 +1613,8 @@ private:
     bool                                    m_has_shared_per_object_skirt { false };
     // Orca: Object-keyed brim paths kept for existing code.
     std::map<ObjectID, ExtrusionEntityCollection>         m_brimMap;
+    // Zero-based logical filament selected for each object's brim.
+    std::map<ObjectID, unsigned int>                       m_brimFilamentMap;
     // Orca: Actual brim paths keyed by object instance.
     std::map<ObjectInstanceID, ExtrusionEntityCollection> m_brimMapByInstance;
     // Orca: Translated brim areas keyed by instance, used to find touching brims.
@@ -1548,6 +1631,9 @@ private:
 
     // Logical (extruder, nozzle) grouping result, set by ToolOrdering during reorder.
     std::shared_ptr<MultiNozzleUtils::NozzleGroupResultBase> m_nozzle_group_result;
+    // m_nozzle_group_result narrowed to the layer-aware type; only set_nozzle_group_result() assigns
+    // either.
+    std::shared_ptr<MultiNozzleUtils::LayeredNozzleGroupResult> m_layered_nozzle_group_result;
 
     // Sequential (by-object) selector plans, keyed by object; see sequential_dynamic_orderings().
     // Rebuilt (or cleared) on every process().
@@ -1557,6 +1643,7 @@ private:
     FilamentIndexMap m_filament_index_map;
     // Used to cache printer and process parameter information
     PrintIndexMap m_nozzle_index_map;
+    size_t        m_config_index_generation{0};
     // Orca: filament ids already reported as missing a nozzle-group entry this slice. get_config_index()
     // falls back per-filament/per-layer in the g-code hot path, so this dedupes its log to once per
     // filament instead of flooding thousands of identical error lines. Cleared with the caches each slice.
@@ -1580,6 +1667,9 @@ private:
 
     //BBS: plate's origin
     Vec3d   m_origin {0, 0, 0};
+    // IMEX firmware-managed slice offset (plate-local primary-zone center, or zero).
+    // Cache of update_imex_slice_offset(); nothing outside that function writes it.
+    Vec2d   m_imex_slice_offset { Vec2d::Zero() };
     //BBS: modified_count
     int     m_modified_count {0};
     //BBS
@@ -1607,6 +1697,89 @@ public:
     //static float min_skirt_length;
 };
 
+
+// ---------------------------------------------------------------------------------------------
+// Clearance rule for a prime tower compacted by wipe_tower_no_sparse_layers. Shared by the precise
+// check that runs on the real extrusions, the pre-slice estimate that feeds the plater with collision
+// polygons, and the plater's own live preview while the user drags the tower or an object around.
+// Keeping the rule in one place is what stops those three from drifting apart and reporting different
+// things for the same plate.
+// ---------------------------------------------------------------------------------------------
+
+// Half of a clearance distance, the share each of the two outlines carries. Sequential printing splits
+// extruder_clearance_radius between the two object hulls this way; the tower checks split their
+// clearances between the tower ring and the instance hull for the same reason, so that the two
+// outlines the plater draws touch precisely when the check trips. The 0.2 mm comes off first: it is
+// the rounding slack the sequential check applies, 0.1 mm per side.
+inline double compacted_tower_half_clearance(double clearance) { return 0.5 * (clearance - 0.2); }
+
+// Keep-out geometry a compacted tower projects onto the plate, derived from its bare footprint.
+struct CompactedTowerZone
+{
+    // Footprint the checks work on: the raw outline grown by the spiral Z-hop envelope.
+    Polygon     hull;
+    // hull grown by half the toolhead radius; an object whose own half-grown hull reaches into it is
+    // hit by the head body. This is also the ring the plater draws.
+    Polygons    grown_body;
+    // hull grown by half the bare nozzle cone radius, the innermost tier.
+    Polygons    grown_nozzle;
+    // hull bounding box, the Y band the rod sweeps.
+    BoundingBox bbox_rod;
+    // Full body clearance, of which grown_body carries half. Which of the two tiers applies is decided
+    // per object rather than here; see compacted_wipe_tower_clearance().
+    double      body_radius { 0. };
+
+    bool empty() const { return hull.points.empty(); }
+};
+
+// Per-side padding a bare wipe tower outline needs before the clearance checks may treat it as the
+// tower's footprint. Callers whose outline already carries the first-layer brim pass zero for it.
+// Shared by the pre-slice estimate and the plater's live preview: both start from an outline that
+// falls short of the printed tower in the same two ways, and padding them by different amounts is
+// exactly how the preview and the validation behind it would end up disagreeing.
+double compacted_tower_footprint_padding(const PrintConfig &config, double brim_width);
+
+// Grow a bare tower footprint (bed frame, scaled) into its keep-out zone.
+CompactedTowerZone compacted_wipe_tower_zone(const PrintConfig &config, const Polygon &tower_footprint);
+
+// How far an object may rise above the compacted tower base before the toolhead hits it.
+struct CompactedTowerClearance
+{
+    // Height the object may reach above the tower base. Zero means it may not rise at all.
+    double allowed_rise;
+    // Clearance that applies once the object stands clear of the toolhead in XY, i.e. rod or lid.
+    double far_clearance;
+    // The object sits within the toolhead radius, so the head body limits it rather than the rod.
+    bool   near_body;
+    // Horizontal clearance this particular object has to keep from the tower: the full toolhead
+    // radius once it rises past the nozzle cone, the bare cone while it stays below. It is what the
+    // error message quotes and what the plater grows the object outline by.
+    double body_clearance;
+};
+
+// object_rise is the height above the tower base that the caller is going to compare against
+// allowed_rise. It also selects the horizontal tier, so the two cannot disagree.
+CompactedTowerClearance compacted_wipe_tower_clearance(const PrintConfig &config, const CompactedTowerZone &zone,
+                                                      const Polygon &inst_hull, double object_rise);
+
+// This object was judged on a tier reaching past the bare nozzle cone, so the wide ring is the one its
+// outline has to be drawn against.
+inline bool compacted_tower_body_tier(const CompactedTowerClearance &clearance)
+{
+    return clearance.body_clearance > double(MAX_OUTER_NOZZLE_DIAMETER);
+}
+
+// Keep-out rings to draw around the tower. The nozzle one always applies; the wide body one is drawn
+// only when some object on the plate is actually measured against it, otherwise it would show a
+// keep-out zone no object can violate.
+Polygons compacted_wipe_tower_rings(const CompactedTowerZone &zone, bool any_body_tier);
+
+// Outline to hand the plater for an offending object: the instance hull grown by the same half
+// clearance the check grew it by, which is CompactedTowerClearance::body_clearance for that object.
+// Sequential printing reports its hulls the same way, and it doubles as the fix for the bare hull
+// being unusable on screen, where drawn flat it hides under the object and drawn at the height limit
+// it ends up buried inside the mesh.
+Polygon compacted_wipe_tower_offender_outline(const Polygon &inst_hull, double body_clearance);
 
 } /* slic3r_Print_hpp_ */
 

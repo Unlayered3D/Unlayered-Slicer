@@ -360,7 +360,7 @@ TEST_CASE("Virtual 5-axis cut planes slice on a round bed centred on the origin 
             cp.normal = Vec3d(std::sin(15. * deg), 0., std::cos(15. * deg)).normalized();
             stack.planes.push_back(cp);
             object->cut_planes  = stack;
-            instance->auto_drop = true;
+            object->auto_drop   = true;
             object->ensure_on_bed();
 
             DynamicPrintConfig config = DynamicPrintConfig::full_print_config();

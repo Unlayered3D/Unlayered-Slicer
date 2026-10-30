@@ -7,7 +7,7 @@ set(SLIC3R_APP_KEY "Unlayered Slicer")
 if(NOT DEFINED BBL_INTERNAL_TESTING)
 set(BBL_INTERNAL_TESTING "0")
 endif()
-set(UNLAYERED_VERSION "0.1.8")
+set(UNLAYERED_VERSION "0.1.9")
 string(REGEX MATCH "^([0-9]+)\\.([0-9]+)\\.([0-9]+)"
        UNLAYERED_VERSION_MATCH ${UNLAYERED_VERSION})
 set(ORCA_VERSION_MAJOR ${CMAKE_MATCH_1})
@@ -15,6 +15,11 @@ set(ORCA_VERSION_MINOR ${CMAKE_MATCH_2})
 set(ORCA_VERSION_PATCH ${CMAKE_MATCH_3})
 
 set(SLIC3R_VERSION "02.08.01.55")
+
+# The OrcaSlicer version this tree is based on: upstream's SoftFever_VERSION, copied at each upstream merge.
+# 3MF files record it where OrcaSlicer records its own version, so OrcaSlicer and this fork judge them on
+# OrcaSlicer's version line; UNLAYERED_VERSION is this fork's own release.
+set(ORCA_BASE_VERSION "2.5.0-dev")
 
 # Windows FileVersion/ProductVersion and the macOS CFBundleVersion are built from this. It was never
 # set, so every shipped binary reported a blank version in its file properties.

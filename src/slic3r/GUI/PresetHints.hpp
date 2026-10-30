@@ -3,7 +3,10 @@
 
 #include <string>
 
-#include "libslic3r/PresetBundle.hpp"
+namespace Slic3r { class Preset; }
+namespace Slic3r { class PresetBundle; }
+namespace Slic3r { class DynamicPrintConfig; }
+
 
 namespace Slic3r {
 

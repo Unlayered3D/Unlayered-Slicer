@@ -2,13 +2,19 @@
 ///|/
 ///|/ PrusaSlicer is released under the terms of the AGPLv3 or higher
 ///|/
+#include <Eigen/Geometry>
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <cstring>
 #include <iterator>
 #include <limits>
 #include <cassert>
 #include <cinttypes>
+#include "libslic3r/Point.hpp"
+#include <string>
+#include "libslic3r/GCode/GCodeProcessor.hpp"
+#include <vector>
 
 #include "libslic3r/libslic3r.h"
 #include "LibVGCodeWrapper.hpp"
@@ -27,6 +33,10 @@
 #include "../../src/libvgcode/include/GCodeInputData.hpp"
 #include "../../src/libvgcode/include/PathVertex.hpp"
 #include "libvgcode/include/Types.hpp"
+#include "libslic3r/Config.hpp"
+#include "libslic3r/Model.hpp"
+#include "libslic3r/Slicing.hpp"
+#include "libslic3r/SurfaceCollection.hpp"
 
 namespace libvgcode {
 class Viewer;
@@ -63,10 +73,28 @@ Color convert(const Slic3r::ColorRGBA& c)
     return { safe_val(c.r()), safe_val(c.g()), safe_val(c.b()) };
 }
 
-Color convert(const std::string& color_str)
+Slic3r::ColorRGBA convert(const ColorWithAlpha& c)
 {
-    Slic3r::ColorRGBA color_rgba;
-    return decode_color(color_str, color_rgba) ? convert(color_rgba) : DUMMY_COLOR;
+    static const float inv_255 = 1.0f / 255.0f;
+    return { c[0] * inv_255, c[1] * inv_255, c[2] * inv_255, c[3] * inv_255 };
+}
+
+PaletteWithAlpha convert_filament_colors(const std::vector<std::string>& colors_str)
+{
+    PaletteWithAlpha ret;
+    ret.reserve(colors_str.size());
+    for (const std::string& color_str : colors_str) {
+        Slic3r::ColorRGBA color_rgba;
+        if (!decode_color(color_str, color_rgba)) {
+            ret.push_back({ DUMMY_COLOR[0], DUMMY_COLOR[1], DUMMY_COLOR[2], 255 });
+            continue;
+        }
+        // as the 3D view draws it: a clear color kept at the least opacity, black lifted
+        color_rgba = adjust_color_for_rendering(color_rgba);
+        const Color color = convert(color_rgba);
+        ret.push_back({ color[0], color[1], color[2], static_cast<uint8_t>(std::lround(255.0f * color_rgba.a())) });
+    }
+    return ret;
 }
 
 Slic3r::ExtrusionRole convert(EGCodeExtrusionRole role)
@@ -190,6 +218,26 @@ Slic3r::PrintEstimatedStatistics::ETimeMode convert(const ETimeMode& mode)
     }
 }
 
+// libvgcode finds where a path starts from a phantom vertex placed at the previous move's
+// position. Every move that is not an option marker (extrusions, travels, wipes, and Noop or
+// unmapped moves) starts a path when it is the first move, or when it differs from the previous
+// move in type, role or a value the preview colors by. convert() sizes its vertex array by
+// counting these, so the count and the fill must both use this test.
+static bool starts_path(const Slic3r::GCodeProcessorResult::MoveVertex& prev,
+                        const Slic3r::GCodeProcessorResult::MoveVertex& curr, bool first_move)
+{
+    const EOptionType option_type = move_type_to_option(convert(curr.type));
+    if (option_type != EOptionType::COUNT && option_type != EOptionType::Travels && option_type != EOptionType::Wipes)
+        return false;
+    return first_move || prev.type != curr.type || prev.extrusion_role != curr.extrusion_role
+        // ORCA: Split the path when a preview value changes.
+        || prev.mm3_per_mm != curr.mm3_per_mm || prev.acceleration != curr.acceleration || prev.jerk != curr.jerk
+        // Declarative cut planes: a section boundary must start a new path too, or the first move of
+        // a section renders as one line continuing out of the previous section -- one colour
+        // spanning the cut plane.
+        || prev.cut_segment_id != curr.cut_segment_id;
+}
+
 GCodeInputData convert(const Slic3r::GCodeProcessorResult& result, const std::vector<std::string>& str_tool_colors,
     const std::vector<std::string>& str_color_print_colors, const Viewer& viewer,
     const Slic3r::Transform3d* display_transform)
@@ -201,18 +249,8 @@ GCodeInputData convert(const Slic3r::GCodeProcessorResult& result, const std::ve
         return display_transform == nullptr ? convert(v) : convert(Slic3r::Vec3f((*display_transform * v.cast<double>()).cast<float>()));
     };
 
-    // collect tool colors
-    ret.tools_colors.reserve(str_tool_colors.size());
-    for (const std::string& color : str_tool_colors) {
-        ret.tools_colors.emplace_back(convert(color));
-    }
-
-    // collect color print colors
-    const std::vector<std::string>& str_colors = str_color_print_colors.empty() ? str_tool_colors : str_color_print_colors;
-    ret.color_print_colors.reserve(str_colors.size());
-    for (const std::string& color : str_colors) {
-        ret.color_print_colors.emplace_back(convert(color));
-    }
+    ret.tools_colors = convert_filament_colors(str_tool_colors);
+    ret.color_print_colors = convert_filament_colors(str_color_print_colors.empty() ? str_tool_colors : str_color_print_colors);
 
     // UNLAYERED_MOD: tool-axis palette (see PathVertex::tool_axis_id). Index 0 is always +Z.
     ret.tool_axes.reserve(result.tool_axes.size());
@@ -253,46 +291,44 @@ GCodeInputData convert(const Slic3r::GCodeProcessorResult& result, const std::ve
     }
 
     const std::vector<Slic3r::GCodeProcessorResult::MoveVertex>& moves = result.moves;
-    ret.vertices.reserve(2 * moves.size());
+    // One vertex per move after the first, plus a phantom in front of every path start. Reserving
+    // the exact count leaves nothing to shrink afterwards, and shrinking would copy the whole array
+    // while both copies are alive.
+    size_t vertices_count = moves.empty() ? 0 : moves.size() - 1;
+    for (size_t i = 1; i < moves.size(); ++i)
+        if (starts_path(moves[i - 1], moves[i], i == 1))
+            ++vertices_count;
+    ret.vertices.reserve(vertices_count);
     for (size_t i = 1; i < moves.size(); ++i) {
         const Slic3r::GCodeProcessorResult::MoveVertex& curr = moves[i];
         const Slic3r::GCodeProcessorResult::MoveVertex& prev = moves[i - 1];
         const EMoveType curr_type = convert(curr.type);
-        const EOptionType option_type = move_type_to_option(curr_type);
-        if (option_type == EOptionType::COUNT || option_type == EOptionType::Travels || option_type == EOptionType::Wipes) {
-            if (ret.vertices.empty() || prev.type != curr.type || prev.extrusion_role != curr.extrusion_role
-                // ORCA: Split the path when a preview value changes.
-                || prev.mm3_per_mm != curr.mm3_per_mm || prev.acceleration != curr.acceleration || prev.jerk != curr.jerk
-                // Declarative cut planes: a section boundary must start a new path too, or the
-                // first move of a section renders as one line continuing out of the previous
-                // section -- one colour spanning the cut plane.
-                || prev.cut_segment_id != curr.cut_segment_id) {
-                // to allow libvgcode to properly detect the start/end of a path we need to add a 'phantom' vertex
-                // equal to the current one with the exception of the position, which should match the previous move position,
-                // and the times, which are set to zero
+        if (starts_path(prev, curr, i == 1)) {
+            // to allow libvgcode to properly detect the start/end of a path we need to add a 'phantom' vertex
+            // equal to the current one with the exception of the position, which should match the previous move position,
+            // and the times, which are set to zero
 #if VGCODE_ENABLE_COG_AND_TOOL_MARKERS
-                const libvgcode::PathVertex vertex = { position(prev.position), curr.height, curr.width, curr.feedrate, prev.actual_feedrate,
-                    curr.mm3_per_mm, curr.fan_speed, curr.temperature, 0.0f, convert(curr.extrusion_role), curr_type,
-                    static_cast<uint32_t>(curr.gcode_id), static_cast<uint32_t>(curr.layer_id),
-                    static_cast<uint8_t>(curr.extruder_id), static_cast<uint8_t>(curr.cp_color_id), { 0.0f, 0.0f },
-                    /* ORCA: Add Pressure Advance visualization support */ 0.0f, curr.pressure_advance,
-                    /* ORCA: Add Acceleration visualization support */ curr.acceleration,
-                    /* ORCA: Add Jerk visualization support */ curr.jerk,
-                    /* UNLAYERED_MOD: tilted-layer tool axis */ curr.tool_axis_id,
-                    /* cut planes: section id */ to_section_id(curr.cut_segment_id) };
+            const libvgcode::PathVertex vertex = { position(prev.position), curr.height, curr.width, curr.feedrate, prev.actual_feedrate,
+                curr.mm3_per_mm, curr.fan_speed, curr.temperature, 0.0f, convert(curr.extrusion_role), curr_type,
+                static_cast<uint32_t>(curr.gcode_id), static_cast<uint32_t>(curr.layer_id),
+                static_cast<uint8_t>(curr.extruder_id), static_cast<uint8_t>(curr.cp_color_id), { 0.0f, 0.0f },
+                /* ORCA: Add Pressure Advance visualization support */ 0.0f, curr.pressure_advance,
+                /* ORCA: Add Acceleration visualization support */ curr.acceleration,
+                /* ORCA: Add Jerk visualization support */ curr.jerk,
+                /* UNLAYERED_MOD: tilted-layer tool axis */ curr.tool_axis_id,
+                /* cut planes: section id */ to_section_id(curr.cut_segment_id) };
 #else
-              const libvgcode::PathVertex vertex = { position(prev.position), curr.height, curr.width, curr.feedrate, prev.actual_feedrate,
-                    curr.mm3_per_mm, curr.fan_speed, curr.temperature, convert(curr.extrusion_role), curr_type,
-                    static_cast<uint32_t>(curr.gcode_id), static_cast<uint32_t>(curr.layer_id),
-                    static_cast<uint8_t>(curr.extruder_id), static_cast<uint8_t>(curr.cp_color_id), { 0.0f, 0.0f },
-                    /* ORCA: Add Pressure Advance visualization support */ 0.0f, curr.pressure_advance,
-                    /* ORCA: Add Acceleration visualization support */ curr.acceleration,
-                    /* ORCA: Add Jerk visualization support */ curr.jerk,
-                    /* UNLAYERED_MOD: tilted-layer tool axis */ curr.tool_axis_id,
-                    /* cut planes: section id */ to_section_id(curr.cut_segment_id) };
+            const libvgcode::PathVertex vertex = { position(prev.position), curr.height, curr.width, curr.feedrate, prev.actual_feedrate,
+                curr.mm3_per_mm, curr.fan_speed, curr.temperature, convert(curr.extrusion_role), curr_type,
+                static_cast<uint32_t>(curr.gcode_id), static_cast<uint32_t>(curr.layer_id),
+                static_cast<uint8_t>(curr.extruder_id), static_cast<uint8_t>(curr.cp_color_id), { 0.0f, 0.0f },
+                /* ORCA: Add Pressure Advance visualization support */ 0.0f, curr.pressure_advance,
+                /* ORCA: Add Acceleration visualization support */ curr.acceleration,
+                /* ORCA: Add Jerk visualization support */ curr.jerk,
+                /* UNLAYERED_MOD: tilted-layer tool axis */ curr.tool_axis_id,
+                /* cut planes: section id */ to_section_id(curr.cut_segment_id) };
 #endif // VGCODE_ENABLE_COG_AND_TOOL_MARKERS
-                ret.vertices.emplace_back(vertex);
-            }
+            ret.vertices.emplace_back(vertex);
         }
 
 #if VGCODE_ENABLE_COG_AND_TOOL_MARKERS
@@ -319,6 +355,8 @@ GCodeInputData convert(const Slic3r::GCodeProcessorResult& result, const std::ve
 #endif // VGCODE_ENABLE_COG_AND_TOOL_MARKERS
         ret.vertices.emplace_back(vertex);
     }
+    assert(ret.vertices.size() == vertices_count);
+    // A no-op when the count above is exact; restores the exact fit if the count ever drifts.
     ret.vertices.shrink_to_fit();
 
     ret.spiral_vase_mode = result.spiral_vase_mode;
@@ -871,18 +909,8 @@ GCodeInputData convert(const Slic3r::Print& print, const std::vector<std::string
     }
 
 
-    // collect tool colors
-    ret.tools_colors.reserve(str_tool_colors.size());
-    for (const std::string& color : str_tool_colors) {
-        ret.tools_colors.emplace_back(convert(color));
-    }
-
-    // collect color print colors
-    const std::vector<std::string>& str_colors = str_color_print_colors.empty() ? str_tool_colors : str_color_print_colors;
-    ret.color_print_colors.reserve(str_colors.size());
-    for (const std::string& color : str_colors) {
-        ret.color_print_colors.emplace_back(convert(color));
-    }
+    ret.tools_colors = convert_filament_colors(str_tool_colors);
+    ret.color_print_colors = convert_filament_colors(str_color_print_colors.empty() ? str_tool_colors : str_color_print_colors);
 
     return ret;
 }

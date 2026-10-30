@@ -36,7 +36,7 @@ protected:
     bool on_init() override
     {
         bool r = GLGizmoCut3D::on_init();
-        m_shortcut_key = NO_SHORTCUT_KEY_VALUE;
+        m_shortcut.reset();   // no shortcut: only reached from its own toolbar entry
         return r;
     }
 

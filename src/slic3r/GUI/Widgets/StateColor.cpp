@@ -1,5 +1,10 @@
 #include "StateColor.hpp"
+#include <algorithm>
 #include <cmath>
+#include <wx/colour.h>
+#include <map>
+#include <tuple>
+#include <wx/string.h>
 
 static bool gDarkMode = false;
 
@@ -51,7 +56,7 @@ static std::map<wxColour, wxColour> gDarkColors{
     {"#9E9E9E", "#53545A"}, // rgb(158, 158, 158)  ???
     {"#2B3436", "#808080"}, // rgb(43, 52, 54)     Also spelled wxColour(43, 52, 54) in CameraPopup/Search/Tab
     {"#D9D9D9", "#27272A"}, // rgb(217, 217, 217)  Sidebar > Toggle button track color
-    {"#FFFEFE", "#D9D9D9"}, // rgb(255, 254, 254)  Sidebar > Toggle button thumb color
+    {"#FFFEFE", "#D8D9D9"}, // rgb(255, 254, 254)  Sidebar > Toggle button thumb color
     //{"#F0F0F0", "#4C4C54"},
     // Unlayered accent tints -- Accent::Tint25 / Accent::Tint10 in GUI/AccentColor.hpp.
     // Unlike the interaction ramp these DO follow the theme: a background band has to.

@@ -1,11 +1,23 @@
+#include "Config.hpp"
 #include "Exception.hpp"
 #include "PrintBase.hpp"
 
 #include <boost/filesystem.hpp>
+#include <boost/filesystem/operations.hpp>
 #include <boost/lexical_cast.hpp>
 #include <boost/log/trivial.hpp>
+#include <cstddef>
+#include <string>
+#include <vector>
+#include <stdexcept>
+#include <mutex>
+#include <functional>
 
 #include "I18N.hpp"
+#include "Model.hpp"
+#include "libslic3r.h"
+#include "libslic3r_version.h"
+#include "PlaceholderParser.hpp"
 
 //! macro used to mark string used at localization,
 //! return same string
@@ -22,6 +34,7 @@ void PrintTryCancel::operator()()
 size_t PrintStateBase::g_last_timestamp = 0;
 
 // Update "scale", "input_filename", "input_filename_base", "first_object_name" placeholders from the current m_objects.
+// "input_filename" and "input_filename_base" are always set, even when no instance is printable.
 void PrintBase::update_object_placeholders(DynamicConfig &config, const std::string &default_ext) const
 {
     // get the first input file name
@@ -55,6 +68,22 @@ void PrintBase::update_object_placeholders(DynamicConfig &config, const std::str
 
     config.set_key_value("scale", new ConfigOptionStrings(v_scale));
     config.set_key_value("first_object_name", new ConfigOptionString(first_object_name));
+    if (input_file.empty()) {
+        // No printable instance (for example every object lies outside the bed after a printer
+        // change). The file name must still resolve, so that a filename_format using
+        // {input_filename_base} names the file instead of failing to parse; whether there is anything
+        // to print is reported separately. Fall back to the project (model) name, then the first
+        // object's name or source file, then a fixed name.
+        if (m_model.model_info != nullptr)
+            input_file = m_model.model_info->model_name;
+        for (const ModelObject *model_object : m_model.objects) {
+            if (! input_file.empty())
+                break;
+            input_file = model_object->name.empty() ? model_object->input_file : model_object->name;
+        }
+        if (input_file.empty())
+            input_file = "plate";
+    }
     if (! input_file.empty()) {
         // get basename with and without suffix
         const std::string input_filename = boost::filesystem::path(input_file).filename().string();

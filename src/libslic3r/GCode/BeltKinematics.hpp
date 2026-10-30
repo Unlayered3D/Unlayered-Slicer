@@ -18,11 +18,14 @@ class GCodeWriter;
 // rotation is undone per move by GCodeWriter's segment trafo (PrintObject::post_trafo_inverse),
 // so Orca's BeltBackTransform stage has no counterpart here. What remains is the machine's own
 // mapping: the conventional belt axis swap (gcode_remap_*) followed by the shear/scale that
-// turns bed coordinates into the tilted-gantry machine axes.
+// turns bed coordinates into the tilted-gantry machine axes. That is exactly Orca's
+// world_coordinates mode, so every writer here runs in it (D-006).
 class BeltKinematics : public CartesianKinematics
 {
 public:
-    explicit BeltKinematics(const PrintConfig &config);
+    // world_coordinates is Orca's signature; this fork never back-transforms (see above), so both
+    // values give the same map.
+    explicit BeltKinematics(const PrintConfig &config, bool world_coordinates = true);
 
     Vec3d to_machine(const Vec3d &p) const override;
     Vec3d to_logical(const Vec3d &machine) const override;
@@ -48,7 +51,7 @@ private:
 
 // Install a belt machine frame on any GCodeWriter. Any axis remap and build volume already
 // configured on the writer are carried over, so this may be called before or after those setters.
-void install_belt_kinematics(GCodeWriter &writer, const PrintConfig &config);
+void install_belt_kinematics(GCodeWriter &writer, const PrintConfig &config, bool world_coordinates = true);
 
 } // namespace Slic3r
 

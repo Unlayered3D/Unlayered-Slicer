@@ -132,7 +132,8 @@ InvokeResult run_export(InvokeContext& ctx)
         // Save dialog picks the file.
         std::vector<std::string>                    keys;
         std::vector<Slic3r::PublishedMaterialEntry> materials;
-        plater->get_pending_published(keys, materials);
+        bool                                        legacy_process = false;
+        plater->get_pending_published(keys, materials, legacy_process);
         if (plater->export_published_3mf(keys, materials) != wxID_YES)
             return InvokeResult::error(WAB_USER_CANCELLED, "the export was cancelled or failed");
         return InvokeResult::ok({{"kind", kind_id}, {"publishedKeys", keys.size()}});

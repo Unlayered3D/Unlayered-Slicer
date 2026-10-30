@@ -8,9 +8,9 @@
 <link rel="stylesheet" type="text/css" href="../css/common.css" />
 <link rel="stylesheet" type="text/css" href="../css/dark.css" />
 <link rel="stylesheet" type="text/css" href="5import.css" />
-<script type="text/javascript" src="../js/jquery-2.1.1.min.js"></script>
+<script type="text/javascript" src="../../include/jquery-3.6.0.min.js"></script>
 <script type="text/javascript" src="../js/json2.js"></script>
-<script type="text/javascript" src="../../data/text.js"></script>
+<script type="text/javascript" src="../../include/i18n.js"></script>
 <script type="text/javascript" src="../js/globalapi.js"></script>
 <script type="text/javascript" src="../js/common.js"></script>
 <script type="text/javascript" src="5import.js"></script>
@@ -35,10 +35,10 @@
 	<div id="Summary" hidden></div>
 </div>
 <div id="AcceptArea">
-	<div class="ButtonStyleRegular ButtonTypeChoice trans" tid="t8" id="PreBtn" onclick="GoBack()">Back</div>
-	<div class="ButtonStyleRegular ButtonTypeChoice trans" tid="t52" id="SkipBtn" onclick="GoNext()">Skip</div>
+	<div class="ButtonStyleRegular ButtonTypeChoice" id="PreBtn" onclick="GoBack()" data-i18n="back">Back</div>
+	<div class="ButtonStyleRegular ButtonTypeChoice" id="SkipBtn" onclick="GoNext()" data-i18n="skip">Skip</div>
 	<div class="ButtonStyleConfirm ButtonTypeChoice" id="ImportBtn" onclick="DoImport()">Import</div>
-	<div class="ButtonStyleConfirm ButtonTypeChoice trans" tid="t9" id="NextBtn" onclick="GoNext()" hidden>Next</div>
+	<div class="ButtonStyleConfirm ButtonTypeChoice" id="NextBtn" onclick="GoNext()" data-i18n="next" hidden>Next</div>
 </div>
 </body>
 </html>

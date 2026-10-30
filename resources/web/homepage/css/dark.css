@@ -1,3 +1,5 @@
+/* ORCA disable dark.css. makes css file unusable. tempopary fix until disabling all dark.css usage*/
+@media (invalid-condition) { 
 body
 {
 	background-color:#242428;
@@ -150,7 +152,8 @@ body
 	--account-menu-shadow  : 0 10px 28px rgba(0, 0, 0, 0.45);
 }
 
-/* Recent list: slicer filter chips and source tags (global.css only goes dark with the OS). */
+/* Recent list: slicer filter chips and source tags. Inside the disabled block like the rest of this
+   file: the chips take global.css's theme variables (home.css), which is how the page goes dark now. */
 .SourceChip, .FileSourceBadge
 {
 	color: #B3B3B5;
@@ -167,3 +170,4 @@ body
 	background-color: #4F4F53;
 	border-color: #B2B3B5;
 }
+} /* @media (invalid-condition) */

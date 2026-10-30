@@ -623,6 +623,35 @@ No parameters.
 ```
 
 `objects` is capped at 100 (`objectsTruncated`). `plate: -1` means the object sits on no plate.
+
+**What would be printed.** Every instance is tested fresh on each call the way slicing tests it:
+against the real bed shape (round, convex, custom) of the plate it sits on, the printable height,
+the bed exclude areas, and the object's / instance's printable flags. The same verdict decides the
+`nothing_printable` refusals of `slicer.slice`, `slicer.exportGcode` and `slicer.print`. Fields:
+
+| Where | Field | Meaning |
+|---|---|---|
+| top | `hasPrintableInstances` | the current plate has at least one printable instance |
+| top | `instanceCount`, `printableCount` | all instances / printable ones, all plates |
+| top | `outsideCount` | instances refused for their placement (outside the bed, in an exclude area, or on no plate) |
+| top | `offPlateCount` | instances on no plate (including any entirely below the bed surface) |
+| top | `nothingPrintable` | only when the current plate has nothing printable: `{ reason, message }`, `reason` as `data.cause` below |
+| `plates[i]` | `hasPrintableInstances` | `printableCount > 0` |
+| `plates[i]` | `printableCount`, `outsideCount`, `excludeAreaCount`, `notPrintableCount` | per plate; `outsideCount` includes `excludeAreaCount` |
+| `plates[i]` | `plateListHasPrintable` | the plate list's own cached flag (rectangular plate bounds, refreshed on moves and bed changes); diagnostics only |
+| `objects[j]` | `instanceStates` | first 200 instances: `{ index, plate, placement, volumeState, outside, printable }` (`instanceStatesTruncated`) |
+| `objects[j]` | `outsideCount`, `anyPrintable` | over all its instances |
+
+`placement` is `printable`, `offPlate`, `outsideBed` (partly or fully outside the bed shape or above
+the printable height), `excludeArea` (inside the bed shape but overlapping an exclude area) or
+`notPrintable` (object or instance set not printable). `volumeState` is the bed-shape test alone:
+`inside`, `partlyOutside` or `fullyOutside`. `outside` is true for every placement but `printable`
+and `notPrintable`.
+
+**Refusal when nothing is printable** (`slicer.slice`, `slicer.exportGcode`, `slicer.print`): `1008`,
+message `"the plate has no printable object: <why>"` (`<why>` in the UI language), `data: { reason:
+"nothing_printable", cause }` with `cause` one of `empty_plate`, `outside_bed`, `exclude_area`,
+`not_printable`, or `nothing_printable` when several apply.
 An object with multiplanar cut planes also carries `cutPlanes` -- the body `setCutPlanes` returns
 (below), world frame.
 
@@ -836,8 +865,8 @@ A job: the reply comes when it has finished. Reply:
 `plate` (optional) selects that plate first. Refused with `1014` (`data: { reason:
 "service_mode_selected", selected }`) while a slicing-service mode is selected in the Slice
 dropdown -- before anything changes, the plate switch included: see "No service run from a page"
-below. Refused with `1008` when the plate has nothing printable or a G-code file is open in
-preview mode, `1007` while a slice is running. Then it does what the Slice button does — which may decline for reasons the slicer shows as a notification —
+below. Refused with `1008` when the plate has nothing printable (`data.reason: "nothing_printable"`,
+`data.cause`; see `slicer.getPlate`) or a G-code file is open in preview mode, `1007` while a slice is running. Then it does what the Slice button does — which may decline for reasons the slicer shows as a notification —
 and answers immediately:
 
 ```json
@@ -1230,7 +1259,7 @@ only when its settings opt-in is on (§4.1); the rest are not settings-gated.
 | `slicer.projectChanged` | `{ reason: "new" \| "open", source: "user" \| "bridge", generation, slot? }` | the window switched to another project (features `projectChanged` and `event.projectChanged`, 0.2.0), once, after it succeeded (a cancelled or failed one sends nothing). See below. Not settings-gated. |
 | `slicer.openProjectFromUrl.progress` | `{ received, total }` | download progress of an `openProjectFromUrl` (§4), with its `id`. |
 | `slicer.projectOpened` | `{ ok, path?, error?, code?, projectAside?, printer? }` | the outcome of `openProject` / `openProjectFromUrl`, with its `id` ("Completion is two-stage"). |
-| `slicer.exportFinished` | `{ ok, cancelled?, path?, error? }` | the outcome of `slicer.exportGcode` (§4.6), with its `id`. |
+| `slicer.exportFinished` | `{ ok, cancelled?, path?, error?, reason?, cause?, message? }` | the outcome of `slicer.exportGcode` (§4.6), with its `id`. |
 | `slicer.printSent` | `{ printer, ok, cancelled?, error? }` | the outcome of `slicer.print` (§4.6), with its `id`. |
 | `slicer.printerControlDone` | `{ printer, action, ok, cancelled?, command?, error? }` | the outcome of `slicer.printerControl` (§4.6), with its `id`. |
 | `slicer.actionFinished` | `{ jobId, id, ok, result \| error, effects, undo, turn }` | a long-running `slicer.invokeAction` finished (§4.7). Settings-gated. |
@@ -1337,7 +1366,11 @@ the slicer's usual file name and folder:
   `plate: "all"` of every plate (*Export all sliced file*; every printable plate must be sliced,
   else `1002` with `data.unsliced`). `plate: "all"` exists only as a 3MF (`1002` otherwise).
 - Answers `{ accepted: true }`. The outcome is the event `slicer.exportFinished`:
-  `{ ok, format, plate, cancelled?, path? }`.
+  `{ ok, format, plate, cancelled?, path? }`; an export the slicer refused because nothing on the
+  plate(s) is printable reports `{ ok: false, reason: "nothing_printable", cause, message }` instead
+  of `cancelled`.
+- `1008` (`data.reason: "nothing_printable"`, `data.cause`) when the plate, or with `plate: "all"`
+  every plate, has nothing printable (see `slicer.getPlate`).
 - `1002` when there is no valid slice on the current plate (slice first), or for any other value
   of `plate` / `format` (`data.path`).
 - The file is written by the slicer's normal export, post-processing scripts included.
@@ -1345,6 +1378,8 @@ the slicer's usual file name and folder:
 ### `slicer.print`
 `{ printer, plate?: "current" | "all", options?, upload? }` → opens the slicer's own print dialog for that
 printer, with everything that dialog offers (AMS mapping, the printer list, ...).
+- `1008` (`data.reason: "nothing_printable"`, `data.cause`) when the plate, or with `plate: "all"` every plate,
+  has nothing printable (see `slicer.getPlate`).
 - `plate: "all"` is the Print all button: every plate must have a slice ready to print, a Bambu printer must
   support printing all plates, and of the print hosts only SimplyPrint takes it (`1009` otherwise).
 - `options` (Bambu) presets the dialog: `timelapse`, `bedLeveling`, `flowCalibration`, `nozzleOffsetCalibration`,

@@ -2,6 +2,47 @@
 
 All notable changes to Unlayered Slicer are listed here, newest first.
 
+## 0.1.9 — 2026-10-30
+
+### Changed
+
+- **Up to date with OrcaSlicer.** This release is built on current OrcaSlicer (2.5.0-dev as of
+  2026-10-30), with every Unlayered feature and fix on top. New from OrcaSlicer: translucent filaments
+  drawn translucent in Preview, multiple and 3D bed exclusion volumes, regrouped object and part
+  context menus, configurable tab shortcuts, explanations on hidden and disabled settings, Order By in
+  the plate menu, undoable plate renames, a size prompt for added primitives, a Sparse infill only arc
+  fitting mode, experimental high precision G-code, Moonraker over https, and many seam, cut tool,
+  prime tower, Arachne and crash fixes.
+- **Nonplanar layers (experimental)** reach more tops: tops under or over other parts, tall tops
+  printed in height bands, and thin tops such as a rim, so a Benchy's roof, deck and rim can curve.
+  Curved paths never step, and options left off still slice exactly as before. New option *Print
+  features on curved tops afterwards*: a feature standing on a curved top (a chimney on a roof) prints
+  flat on top of the curved layers, so the curved top runs under it. New option *Raise curved top
+  surface and ironing on slopes* (off by default) lifts the top surface lines and the ironing by how
+  far the nozzle's flat tip reaches uphill; set *Nozzle tip diameter* if your nozzle's tip differs from
+  2.5 × the nozzle size.
+- **Nonplanar layers with Z contouring:** the flat layers under a curved top are Z-contoured down onto
+  the curved layers' underside, like a top surface, so they meet it instead of ending in a staircase.
+- **Home page:** every recent project shows its Show in folder and remove buttons.
+
+### Fixed
+
+- **Auto orient** with nothing selected orients the current plate, not every plate; a plate's orient
+  no longer drops an object whose last copy sits on another plate.
+- **Plate printability:** changing the bed outline re-checks every object against the new bed and
+  drops results sliced for the old one; Print, Export and the plate counters agree on what is
+  printable; file names never fail when nothing is printable.
+- **Start G-code temperatures:** a start G-code that hard-codes a nozzle or bed temperature far from
+  the filament's (for example `M109 S205` for a 260 °C filament) now gets a slicing warning.
+- **Unlayered Agent:** the slice summary includes the slicer's warnings.
+- **Setup wizard:** some Prusa (CORE One, MK4 MMU3) and UltiMaker 2+ printers no longer leave that
+  brand's filament and process lists incomplete.
+- **Crashes:** changing the theme or language from the top bar's Preferences, closing the main window,
+  and skeleton infill on a mesh that is not a closed surface (macOS) no longer crash the app.
+- **Nonplanar layers:** a part partly sunk into the bed no longer fails to slice with "very low z".
+- **After updating,** the home page and setup wizard never show a page left over from the previous
+  version.
+
 ## 0.1.8 — 2026-10-28
 
 ### Added

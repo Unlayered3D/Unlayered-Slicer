@@ -1,16 +1,20 @@
 #include <cassert>
 
-#include "libslic3r/Flow.hpp"
-#include "libslic3r/Slicing.hpp"
-#include "libslic3r/libslic3r.h"
 
 #include "PresetHints.hpp"
 
+#include <string>
+#include "libslic3r/Config.hpp"
+#include "libslic3r/PrintConfig.hpp"   // UNLAYERED_MOD: virtual_tilt_limit_explanation()
 #include <wx/intl.h> 
 
 #include "GUI.hpp"
 #include "format.hpp"
 #include "I18N.hpp"
+
+namespace Slic3r { class Preset; }
+namespace Slic3r { class PresetBundle; }
+
 
 namespace Slic3r {
 

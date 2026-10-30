@@ -39,6 +39,7 @@
 #include "../MainFrame.hpp"
 #include "../Plater.hpp"
 #include "../Tab.hpp"
+#include "../UnsavedChangesDialog.hpp"
 #include "../WebAppBridge.hpp"
 #include "../WebAppPresetShare.hpp"
 #include "../WebAppSettings.hpp"
@@ -218,8 +219,8 @@ void refresh_after_preset_change(const TypeCtx& t)
         if (t.type == Preset::TYPE_PRINTER)
             plater->sidebar().update_presets(Preset::TYPE_FILAMENT);
     }
-    if (wxGetApp().mainframe != nullptr)
-        wxGetApp().mainframe->diff_dialog.update_presets(t.type);
+    if (DiffPresetDialog* diff_dialog = DiffPresetDialog::if_built())
+        diff_dialog->update_presets(t.type);
 }
 
 bool key_visible(const std::string& key) { return WebAppSettings::key_readable(key, false); }
@@ -2159,12 +2160,13 @@ InvokeResult run_create_printer(InvokeContext& ctx)
         return err;
 
     // Filaments, processes, then the printer, in the dialog's order.
+    const std::function<std::string(std::string)> new_filament_id = filament_id_creator();
     auto clone = [&](TypeCtx& tc, const std::vector<Preset>& tmpls, json& made) -> std::vector<std::string> {
         std::vector<const Preset*> ptrs;
         for (const Preset& pr : tmpls)
             ptrs.push_back(&pr);
         std::vector<std::string> failures;
-        if (!ptrs.empty() && tc.collection->clone_presets_for_printer(ptrs, failures, name, create_filament_id, overwrite))
+        if (!ptrs.empty() && tc.collection->clone_presets_for_printer(ptrs, failures, name, new_filament_id, overwrite))
             for (const Preset& pr : tmpls) {
                 std::string prefix = pr.name.substr(0, pr.name.find(" @"));
                 std::replace(prefix.begin(), prefix.end(), '/', '-');

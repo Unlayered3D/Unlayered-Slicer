@@ -5,12 +5,19 @@
 #include "GUI.hpp"
 #include "GUI_Utils.hpp"
 
+#include <wx/chartype.h>
+#include <functional>
+#include <tuple>
 #include <wx/dialog.h>
+#include <wx/string.h>
+#include <wx/gdicmn.h>
+#include <wx/sizer.h>
 #include <wx/timer.h>
 #include <string>
 #include <vector>
 #include <list>
 #include <map>
+#include <wx/toplevel.h>
 #include "Widgets/ComboBox.hpp"
 #include "Widgets/CheckBox.hpp"
 #include "Widgets/TextInput.hpp"
@@ -24,14 +31,23 @@ namespace Slic3r { namespace GUI {
 #define DESIGN_GRAY900_COLOR wxColour("#363636") // Label color
 #define DESIGN_GRAY600_COLOR wxColour("#ACACAC") // Dimmed text color
 
-// Design sizes follow the user's font scale as well as the DPI.
-#define DESIGN_FONT_SCALED(px) FromDIP(int((px) * Label::getFontScale()))
-#define DESIGN_WINDOW_SIZE wxSize(DESIGN_FONT_SCALED(640), DESIGN_FONT_SCALED(640))
-#define DESIGN_TITLE_SIZE wxSize(DESIGN_FONT_SCALED(280), -1)
-#define DESIGN_COMBOBOX_SIZE wxSize(DESIGN_FONT_SCALED(120), -1)
+#define DESIGN_WINDOW_SIZE wxSize(FromDIP(640), FromDIP(640))
+#define DESIGN_TITLE_SIZE wxSize(FromDIP(280), -1)
+#define DESIGN_COMBOBOX_SIZE wxSize(FromDIP(120), -1)
 #define DESIGN_LARGE_COMBOBOX_SIZE wxSize(FromDIP(120), -1)
-#define DESIGN_INPUT_SIZE wxSize(DESIGN_FONT_SCALED(120), -1)
+#define DESIGN_INPUT_SIZE wxSize(FromDIP(120), -1)
 #define DESIGN_LEFT_MARGIN 25
+
+// Unlayered: the Preferences dialog's sizes follow the user's font scale as well as the DPI. Its own
+// names, because other dialogs define the DESIGN_ sizes above with the plain DPI values.
+#define PREFERENCES_FONT_SCALED(px) FromDIP(int((px) * Label::getFontScale()))
+#define PREFERENCES_WINDOW_SIZE wxSize(PREFERENCES_FONT_SCALED(640), PREFERENCES_FONT_SCALED(640))
+#define PREFERENCES_TITLE_SIZE wxSize(PREFERENCES_FONT_SCALED(280), -1)
+#define PREFERENCES_COMBOBOX_SIZE wxSize(PREFERENCES_FONT_SCALED(120), -1)
+#define PREFERENCES_INPUT_SIZE wxSize(PREFERENCES_FONT_SCALED(120), -1)
+
+// The tabs other dialogs open Preferences on.
+enum class PreferencesTab { General, Appearance, Control, Graphics, Online };   // Appearance: Unlayered
 
 class PreferencesDialog : public DPIDialog
 {
@@ -42,6 +58,7 @@ protected:
     wxBoxSizer *  m_sizer_body;
     wxScrolledWindow* m_parent;
     TabCtrl* m_pref_tabs;
+    std::map<PreferencesTab, int> m_tab_index;   // position of each tab in m_pref_tabs
 
     // bool								m_settings_layout_changed {false};
     bool m_seq_top_layer_only_changed{false};
@@ -65,6 +82,8 @@ public:
 
     ~PreferencesDialog();
 
+    void select_tab(PreferencesTab tab, const std::string& option = {});   // and scrolls a combobox option's row into view, focused
+
     wxString m_backup_interval_time;
     wxTimer m_filament_height_timer;
 
@@ -82,6 +101,7 @@ public:
     void          on_improvement_program_toggled(bool on);
     void          update_privacy_controls();
     ::CheckBox * m_bambu_cloud_checkbox      = {nullptr};
+    ::CheckBox * m_skip_identical_frames_checkbox = {nullptr};
     ::TextInput *m_backup_interval_textinput = {nullptr};
     ::SpinInput *m_dim_previous_layers_brightness_input = {nullptr};
     ::ComboBox * m_network_version_combo     = {nullptr};

@@ -28,18 +28,18 @@ AppUpdateAsset asset(const std::string &name)
 }
 
 #if defined(_WIN32)
-const char *THIS = "windows";
-const char *OTHER = "mac";
+const char *THIS_PLATFORM = "windows";
+const char *OTHER_PLATFORM = "mac";
 const char *THIS_FILE = "UnlayeredSlicer_Windows_Installer_v0.1.5.exe";
 const char *OTHER_FILE = "UnlayeredSlicer_Mac_universal_v0.1.5.dmg";
 #elif defined(__APPLE__)
-const char *THIS = "mac";
-const char *OTHER = "windows";
+const char *THIS_PLATFORM = "mac";
+const char *OTHER_PLATFORM = "windows";
 const char *THIS_FILE = "UnlayeredSlicer_Mac_universal_v0.1.5.dmg";
 const char *OTHER_FILE = "UnlayeredSlicer_Windows_Installer_v0.1.5.exe";
 #else
-const char *THIS = "linux";
-const char *OTHER = "windows";
+const char *THIS_PLATFORM = "linux";
+const char *OTHER_PLATFORM = "windows";
 const char *THIS_FILE = "UnlayeredSlicer_Linux_v0.1.5.AppImage";
 const char *OTHER_FILE = "UnlayeredSlicer_Windows_Installer_v0.1.5.exe";
 #endif
@@ -48,16 +48,16 @@ const char *OTHER_FILE = "UnlayeredSlicer_Windows_Installer_v0.1.5.exe";
 
 TEST_CASE("release_targets_platform: other platforms only is not an update here", "[AppUpdater]")
 {
-    REQUIRE(std::string(updater_platform()) == THIS);
+    REQUIRE(std::string(updater_platform()) == THIS_PLATFORM);
     // Published for another platform only, by account download or by asset.
-    CHECK_FALSE(release_targets_platform({}, {download(OTHER)}));
+    CHECK_FALSE(release_targets_platform({}, {download(OTHER_PLATFORM)}));
     CHECK_FALSE(release_targets_platform({asset(OTHER_FILE)}, {}));
-    CHECK_FALSE(release_targets_platform({asset(OTHER_FILE)}, {download(OTHER), download("linux")}));
+    CHECK_FALSE(release_targets_platform({asset(OTHER_FILE)}, {download(OTHER_PLATFORM), download("linux")}));
     // Published for this platform, either way; any architecture counts here.
-    CHECK(release_targets_platform({}, {download(OTHER), download(THIS, "arm64")}));
+    CHECK(release_targets_platform({}, {download(OTHER_PLATFORM), download(THIS_PLATFORM, "arm64")}));
     CHECK(release_targets_platform({asset(OTHER_FILE), asset(THIS_FILE)}, {}));
     // The platform name is not case sensitive in the manifest.
-    std::string upper(THIS);
+    std::string upper(THIS_PLATFORM);
     for (auto &c : upper)
         c = char(std::toupper(c));
     CHECK(release_targets_platform({}, {download(upper)}));
@@ -72,9 +72,9 @@ TEST_CASE("release_targets_platform: a page-only release is still an update", "[
 TEST_CASE("release_targets_platform: side files are not installers", "[AppUpdater]")
 {
 #if defined(__APPLE__)
-    CHECK_FALSE(release_targets_platform({asset("UnlayeredSlicer_profile_validator_Mac_v0.1.5.dmg")}, {download(OTHER)}));
+    CHECK_FALSE(release_targets_platform({asset("UnlayeredSlicer_profile_validator_Mac_v0.1.5.dmg")}, {download(OTHER_PLATFORM)}));
 #elif defined(_WIN32)
-    CHECK_FALSE(release_targets_platform({asset("UnlayeredSlicer_profile_validator_v0.1.5.exe")}, {download(OTHER)}));
+    CHECK_FALSE(release_targets_platform({asset("UnlayeredSlicer_profile_validator_v0.1.5.exe")}, {download(OTHER_PLATFORM)}));
 #endif
-    CHECK_FALSE(release_targets_platform({asset("UnlayeredSlicer_v0.1.5_pdb.zip")}, {download(OTHER)}));
+    CHECK_FALSE(release_targets_platform({asset("UnlayeredSlicer_v0.1.5_pdb.zip")}, {download(OTHER_PLATFORM)}));
 }

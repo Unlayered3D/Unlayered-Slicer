@@ -664,8 +664,7 @@ InvokeResult run_set_auto_drop(InvokeContext& ctx)
     ctx.snapshot("Auto Drop");
     for (int o : ctx.targets.objects) {
         ModelObject* mo = ctx.model().objects[o];
-        for (ModelInstance* mi : mo->instances)
-            mi->auto_drop = enabled;
+        mo->auto_drop = enabled;
         if (enabled)
             mo->ensure_on_bed();
     }
@@ -923,14 +922,14 @@ InvokeResult run_split_to_objects(InvokeContext& ctx)
     }
     // Default: keep Z when the object does not auto-drop (it was placed deliberately), drop
     // every piece onto the bed when it does -- the dialog's two answers.
-    const bool   was_auto_drop = mo->instances.front()->auto_drop;
+    const bool   was_auto_drop = mo->auto_drop;
     const bool   keep_z        = has(ctx.params, "keepZ") ? ctx.params["keepZ"].get<bool>() : !was_auto_drop;
     const size_t before        = model.objects.size();
     ctx.snapshot("Split to Objects");
     quietly(p, [&] {
         // With auto-drop off on the source no question is asked, and the pieces' auto-drop is the
         // argument. The source object is replaced by its pieces, so this changes nothing that stays.
-        mo->instances.front()->auto_drop = false;
+        mo->auto_drop = false;
         p->split_object(o, !keep_z);
     });
     // split_object removed the source (indices shift down by one) and appended the pieces.
@@ -1163,7 +1162,7 @@ InvokeResult run_set_transform(InvokeContext& ctx)
     json inst = json::array();
     for (size_t i : which)
         inst.push_back(instance_state(*mo, i));
-    return InvokeResult::ok({{"object", object_ref_json(model, o)}, {"instances", inst}, {"autoDrop", mo->instances.front()->auto_drop}});
+    return InvokeResult::ok({{"object", object_ref_json(model, o)}, {"instances", inst}, {"autoDrop", mo->auto_drop}});
 }
 
 // Flatten ("Place on face"): turn the object so a face lies on the bed.

@@ -6,7 +6,6 @@
 	"setting_id": "JGfGtqX6CWjCt437",
 	"instantiation": "true",
 	"layer_height": "0.2",
-	"belt_slice_rotation_angle": "45",
 	"initial_layer_print_height": "0.2",
 	"initial_layer_line_width": "0.42",
 	"wall_loops": "2",

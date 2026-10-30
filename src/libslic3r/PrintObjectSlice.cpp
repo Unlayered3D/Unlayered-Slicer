@@ -1,23 +1,52 @@
 #include "NonplanarTop.hpp"
 #include "NonplanarTopSlice.hpp"
 #include <limits>
+#include <algorithm>
 #include <boost/log/trivial.hpp>
 #include <Eigen/Dense>
 
+#include <cstddef>
+#include <functional>
+#include <cassert>
+#include <cstdlib>
+#include <memory>
+#include <math.h>
+#include <cmath>
+#include <iterator>
 #include <tbb/parallel_for.h>
+#include <vector>
+#include <utility>
 
+#include "BoundingBox.hpp"
 #include "ClipperUtils.hpp"
 #include "ElephantFootCompensation.hpp"
+#include "ExPolygon.hpp"
 #include "Exception.hpp"
+#include "format.hpp"
 #include "Geometry.hpp"
+#include "Flow.hpp"
 #include "I18N.hpp"
 #include "Layer.hpp"
+#include "Model.hpp"
 #include "MultiMaterialSegmentation.hpp"
+#include "ObjectID.hpp"
+#include "Point.hpp"
+#include "Polygon.hpp"
 #include "Print.hpp"
 //BBS
+#include "PrintConfig.hpp"
+#include "PrintBase.hpp"
 #include "ShortestPath.hpp"
 #include "Support/SegmentSupportBounds.hpp"
+#include "libslic3r.h"
+#include "TriangleMeshSlicer.hpp"
+#include "TriangleMesh.hpp"
+#include "Slicing.hpp"
+#include "Surface.hpp"
+#include "Utils.hpp"
 #include "libslic3r/Feature/Interlocking/InterlockingGenerator.hpp"
+#include "Config.hpp"
+#include "SurfaceCollection.hpp"
 
 //! macro used to mark string used at localization, return same string
 #define L(s) Slic3r::I18N::translate(s)
@@ -591,7 +620,11 @@ static std::vector<std::vector<ExPolygons>> slices_to_regions(
 }
 
 //BBS: justify whether a volume is connected to another one
-bool doesVolumeIntersect(VolumeSlices& vs1, VolumeSlices& vs2)
+// bboxes1 and bboxes2 hold the extents of each layer's slices. Slices whose boxes are disjoint cannot overlap, so
+// the Clipper test runs only for slices that are close. The layers are scanned serially because this is called
+// for every pair of volumes: a parallel_for per call costs far more in thread wake-ups than the scan itself.
+static bool doesVolumeIntersect(const VolumeSlices& vs1, const std::vector<BoundingBox>& bboxes1,
+                                const VolumeSlices& vs2, const std::vector<BoundingBox>& bboxes2)
 {
     if (vs1.volume_id == vs2.volume_id) return true;
     // two volumes in the same object should have same number of layers, otherwise the slicing is incorrect.
@@ -599,28 +632,17 @@ bool doesVolumeIntersect(VolumeSlices& vs1, VolumeSlices& vs2)
 
     auto& vs1s = vs1.slices;
     auto& vs2s = vs2.slices;
-    bool is_intersect = false;
+    auto layers_overlap = [&](size_t i, size_t j) {
+        return bboxes1[i].defined && bboxes2[j].defined && bboxes1[i].overlap(bboxes2[j]) && overlaps(vs1s[i], vs2s[j]);
+    };
 
-    tbb::parallel_for(tbb::blocked_range<int>(0, vs1s.size()),
-        [&vs1s, &vs2s, &is_intersect](const tbb::blocked_range<int>& range) {
-            for (auto i = range.begin(); i != range.end(); ++i) {
-                if (vs1s[i].empty()) continue;
-
-                if (overlaps(vs1s[i], vs2s[i])) {
-                    is_intersect = true;
-                    break;
-                }
-                if (i + 1 != vs2s.size() && overlaps(vs1s[i], vs2s[i + 1])) {
-                    is_intersect = true;
-                    break;
-                }
-                if (i - 1 >= 0 && overlaps(vs1s[i], vs2s[i - 1])) {
-                    is_intersect = true;
-                    break;
-                }
-            }
-        });
-    return is_intersect;
+    for (size_t i = 0; i < vs1s.size(); ++i) {
+        if (layers_overlap(i, i) ||
+            (i + 1 < vs2s.size() && layers_overlap(i, i + 1)) ||
+            (i > 0 && layers_overlap(i, i - 1)))
+            return true;
+    }
+    return false;
 }
 
 //BBS: grouping the volumes of an object according to their connection relationship
@@ -630,7 +652,10 @@ bool groupingVolumes(std::vector<VolumeSlices> objSliceByVolume, std::vector<gro
     double offsetValue = 0.05 / SCALING_FACTOR;
 
     std::vector<std::vector<int>> osvIndex;
+    // Extents of each volume's offset slices per layer, for the prefilter in doesVolumeIntersect().
+    std::vector<std::vector<BoundingBox>> bboxes(objSliceByVolume.size());
     for (int i = 0; i != objSliceByVolume.size(); ++i) {
+        bboxes[i].resize(objSliceByVolume[i].slices.size());
         for (int j = 0; j != objSliceByVolume[i].slices.size(); ++j) {
             osvIndex.push_back({ i,j });
         }
@@ -645,9 +670,10 @@ bool groupingVolumes(std::vector<VolumeSlices> objSliceByVolume, std::vector<gro
         });
 
     tbb::parallel_for(tbb::blocked_range<int>(0, osvIndex.size()),
-        [&osvIndex, &objSliceByVolume,&offsetValue](const tbb::blocked_range<int>& range) {
+        [&osvIndex, &objSliceByVolume,&offsetValue, &bboxes](const tbb::blocked_range<int>& range) {
             for (auto k = range.begin(); k != range.end(); ++k) {
                 objSliceByVolume[osvIndex[k][0]].slices[osvIndex[k][1]] = offset_ex(objSliceByVolume[osvIndex[k][0]].slices[osvIndex[k][1]], offsetValue);
+                bboxes[osvIndex[k][0]][osvIndex[k][1]] = get_extents(objSliceByVolume[osvIndex[k][0]].slices[osvIndex[k][1]]);
             }
         });
 
@@ -656,7 +682,7 @@ bool groupingVolumes(std::vector<VolumeSlices> objSliceByVolume, std::vector<gro
             groupIndex[i] = i;
         }
         for (int j = i + 1; j != objSliceByVolume.size(); ++j) {
-            if (doesVolumeIntersect(objSliceByVolume[i], objSliceByVolume[j])) {
+            if (doesVolumeIntersect(objSliceByVolume[i], bboxes[i], objSliceByVolume[j], bboxes[j])) {
                 if (groupIndex[j] < 0) groupIndex[j] = groupIndex[i];
                 if (groupIndex[j] != groupIndex[i]) {
                     int retain = std::min(groupIndex[i], groupIndex[j]);
@@ -1256,7 +1282,7 @@ void PrintObject::slice()
     // printable layer. It contributes no toolpaths; keep it as an empty segment so the remaining
     // partition can finish normally. Ordinary empty objects still indicate broken input.
     if (m_layers.empty() && ! this->is_segment())
-        throw Slic3r::SlicingError(L("No layers were detected. You might want to repair your STL file(s) or check their size or thickness and retry.\n"));
+        throw Slic3r::SlicingError(L("No layers were detected. You might want to repair the model or check its size or thickness and retry.\n"));
     
     this->set_done(posSlice);
     //m_model_object->rotate(-0.1, Y);
@@ -2030,7 +2056,7 @@ void PrintObject::slice_volumes()
                         if (min_growth < 0.f || elfoot > 0.f) {
                             // Apply the negative XY compensation. (the ones that is <0)
                             ExPolygons trimming;
-                            static const float eps = float(scale_(m_config.slice_closing_radius.value) * 1.5);
+                            const float eps = float(scale_(m_config.slice_closing_radius.value) * 1.5);
                             if (elfoot > 0.f) {
                                 ExPolygons expolygons_to_compensate = offset_ex(layer->merged(eps), -eps);
                                 lslices_elfoot_uncompensated[layer_id] = expolygons_to_compensate;
@@ -2312,6 +2338,19 @@ std::vector<Polygons> PrintObject::slice_support_volumes(const ModelVolumeType m
             }
     }
     return slices;
+}
+
+std::vector<ExPolygons> PrintObject::slice_single_volume_regions(const ModelVolume* volume) const
+{
+    if (volume == nullptr)
+        return {};
+    // Match the existing slicing heights and the frame the layers were sliced in (a belt's tilt,
+    // a multi-planar segment's rotation) without flattening holes.
+    const std::vector<float> zs = zs_from_layers(this->layers());
+    MeshSlicingParamsEx params;
+    params.trafo = this->object_to_slice();
+    const Print *print = this->print();
+    return slice_volume(*volume, zs, params, [print]() { print->throw_if_canceled(); });
 }
 
 } // namespace Slic3r

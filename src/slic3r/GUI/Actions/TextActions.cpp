@@ -209,7 +209,7 @@ ModelVolume* add_emboss_volume(Model& model, int obj_idx, TriangleMesh&& mesh, M
 InvokeResult finish_emboss_volume(Model& model, int obj_idx, ModelVolume* v, const parts::SurfacePlacement& placement)
 {
     ModelObject& object = *model.objects[obj_idx];
-    if (v->is_model_part() && object.instances.front()->auto_drop)
+    if (v->is_model_part() && object.auto_drop)
         object.ensure_on_bed();
     parts::refresh_object_after_volume_change(obj_idx, v);
     json r = {{"volume", parts::volume_result_json(model, obj_idx, parts::volume_index_in(object, v))},

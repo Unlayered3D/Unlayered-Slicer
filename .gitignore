@@ -62,6 +62,7 @@ __pycache__/
 *.opc
 /.test/
 docs/superpowers/
+ctest_results.xml
 
 # UNLAYERED_MOD: fork-local scratch dropped inside the real sandboxes/ source dir
 /sandboxes/profile_share/

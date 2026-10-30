@@ -12,9 +12,11 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <cstddef>
 #include <map>
 #include <mutex>
 #include <regex>
+#include <string>
 #include <tuple>
 
 namespace Slic3r {
@@ -204,7 +206,7 @@ SvgInfillTile FillSvg::tile_from_svg_text(const std::string &svg_text_in)
                 if (pl.points.size() >= 3)
                     polygons.emplace_back(pl.points);
             append(fills, union_ex(polygons,
-                shape->fillRule == NSVG_FILLRULE_EVENODD ? ClipperLib::pftEvenOdd : ClipperLib::pftNonZero));
+                shape->fillRule == NSVG_FILLRULE_EVENODD ? pftEvenOdd : pftNonZero));
         } else {
             // Stroke only: the path itself is the line.
             for (Polygon &poly : path.polygons)

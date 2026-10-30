@@ -1,8 +1,11 @@
 #ifndef slic3r_PhysicalPrinterDialog_hpp_
 #define slic3r_PhysicalPrinterDialog_hpp_
 
+#include "libslic3r/PrintConfig.hpp"
+#include <string>
 #include <vector>
 
+#include <wx/event.h>
 #include <wx/gdicmn.h>
 
 #include "libslic3r/Preset.hpp"
@@ -35,6 +38,7 @@ class PhysicalPrinterDialog : public DPIDialog
     Button*     m_printhost_firmware_btn            {nullptr};
     // Duet/RepRapFirmware only; writes config.g and the macros to the printer's SD card.
     Button*     m_printhost_sysfiles_btn            {nullptr};
+    Button*     m_printhost_generate_creds_btn      {nullptr};
     Button*     m_printhost_logout_btn              {nullptr};
     Button*     m_printhost_cafile_browse_btn       {nullptr};
     Button*     m_printhost_port_browse_btn         {nullptr};

@@ -5,6 +5,7 @@
 #include "Polyline.hpp"
 #include "Fill/FillAdaptive.hpp"
 #include "Fill/FillLightning.hpp"
+#include "Fill/AdaptiveInfillField.hpp"
 #include "Fill/MeshGenerator.hpp"
 #include "PrintConfig.hpp"
 #include "TriangleMesh.hpp"
@@ -68,9 +69,11 @@ struct MeshInfillSlices
 // Each pattern reads only the slot it cares about; no virtual dispatch.
 struct PreSliceInfillStructures
 {
-    FillAdaptive::OctreePtr     adaptive_cubic_octree;
-    FillAdaptive::OctreePtr     support_cubic_octree;
+    // Adaptive and support cubic octrees of each region's line spacing (Orca).
+    FillAdaptive::RegionOctrees adaptive_fill_octrees;
     FillLightning::GeneratorPtr lightning_generator;
+    // Density fields of the adaptive infill modes in use (Orca).
+    AdaptiveInfillFields        adaptive_infill_fields;
     std::unique_ptr<MeshInfillSlices> mesh_infill;
 };
 

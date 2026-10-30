@@ -1,12 +1,23 @@
 #include "PresetUpdater.hpp"
 
 #include <algorithm>
+#include <boost/algorithm/string/case_conv.hpp>
+#include <boost/algorithm/string/predicate.hpp>
+#include <boost/algorithm/string/trim.hpp>
 #include <boost/filesystem/directory.hpp>
+#include <boost/filesystem/file_status.hpp>
 #include <boost/filesystem/operations.hpp>
 #include <boost/filesystem/path.hpp>
 #include <boost/nowide/fstream.hpp>
+#include <exception>
 #include <functional>
 #include <atomic>
+#include "libslic3r/Exception.hpp"
+#include <map>
+#include <ios>
+#include "libslic3r/AppConfig.hpp"
+#include "libslic3r/Preset.hpp"
+#include "libslic3r/Config.hpp"
 #include <set>
 #include <string>
 #include <thread>
@@ -24,9 +35,10 @@
 
 #include <vector>
 #include <wx/app.h>
+#include <wx/event.h>
 #include <wx/msgdlg.h>
 
-#include "libslic3r/libslic3r.h"
+#include <nlohmann/json.hpp>
 #include "libslic3r/format.hpp"
 #include "libslic3r/Utils.hpp"
 #include "libslic3r/PresetBundle.hpp"
@@ -36,23 +48,23 @@
 #include "slic3r/GUI/GUI_App.hpp"
 #include "slic3r/GUI/I18N.hpp"
 #include "slic3r/GUI/UpdateDialogs.hpp"
-#include "slic3r/GUI/ConfigWizard.hpp"
-#include "slic3r/GUI/GUI_App.hpp"
 #include "slic3r/GUI/Plater.hpp"
 #include "slic3r/GUI/format.hpp"
 #include "slic3r/GUI/NotificationManager.hpp"
 #include "slic3r/Utils/Http.hpp"
+#include "slic3r/Utils/bambu_networking.hpp"
 #include "slic3r/Config/Version.hpp"
-#include "slic3r/Config/Snapshot.hpp"
 #include "slic3r/GUI/MarkdownTip.hpp"
 #include "libslic3r/miniz_extension.hpp"
-#include "slic3r/GUI/GUI_Utils.hpp"
+
+using json = nlohmann::json;
+
+namespace Slic3r::GUI::Config { class Snapshot; }
+namespace Slic3r::GUI::Config { class SnapshotDB; }
 
 namespace fs = boost::filesystem;
 using Slic3r::GUI::Config::Index;
 using Slic3r::GUI::Config::Version;
-using Slic3r::GUI::Config::Snapshot;
-using Slic3r::GUI::Config::SnapshotDB;
 
 
 // FIXME: Incompat bundle resolution doesn't deal with inherited user presets
@@ -316,42 +328,34 @@ void PresetUpdater::priv::check_installed_vendor_profiles() const
     const auto enabled_vendors = app_config->vendors();
 
     std::set<std::string> bundles;
-    // Orca: always install filament library
-    bundles.insert(PresetBundle::ORCA_FILAMENT_LIBRARY);
     // A vendor is named by its profile or, where the build ships preset caches
     // instead of the raw profile JSONs, by its cache alone.
     for (const std::string &vendor_name : vendor_names_in(rsrc_path)) {
-        if (bundles.find(vendor_name) != bundles.end())continue;
-
-        const auto is_vendor_enabled = (vendor_name == PresetBundle::ORCA_DEFAULT_BUNDLE) // always update configs from resource to vendor for ORCA_DEFAULT_BUNDLE
+        // enabled_vendors lists the vendors whose printer models the user picked, and
+        // neither of these two is ever in it.
+        const auto is_vendor_enabled = (vendor_name == PresetBundle::ORCA_DEFAULT_BUNDLE)
+                                       || (vendor_name == PresetBundle::ORCA_FILAMENT_LIBRARY)
                                        || (enabled_vendors.find(vendor_name) != enabled_vendors.end());
-        if (enabled_config_update) {
-            if (is_vendor_installed(vendor_name)) {
-                if (is_vendor_enabled) {
-                    // Orca: whichever form of the vendor resources ships at the newer
-                    // version is the one installing lays down, and the one to judge
-                    // what is installed against.
-                    Semver resource_ver = resource_vendor_version(vendor_name);
-                    // Orca: a vendor installed as a preset cache has no profile
-                    // beside it; the version it was installed at is in the cache.
-                    Semver vendor_ver = installed_vendor_version(vendor_name);
+        if (is_vendor_installed(vendor_name)) {
+            if (is_vendor_enabled) {
+                // Orca: whichever form of the vendor resources ships at the newer
+                // version is the one installing lays down, and the one to judge
+                // what is installed against.
+                Semver resource_ver = resource_vendor_version(vendor_name);
+                // Orca: a vendor installed as a preset cache has no profile
+                // beside it; the version it was installed at is in the cache.
+                Semver vendor_ver = installed_vendor_version(vendor_name);
 
-                    if (vendor_ver < resource_ver) {
-                        BOOST_LOG_TRIVIAL(info) << "[Orca Updater]:found vendor " << vendor_name << " newer version "
-                                                << resource_ver.to_string() << " from resource, old version " << vendor_ver.to_string();
-                        bundles.insert(vendor_name);
-                    }
+                if (vendor_ver < resource_ver) {
+                    BOOST_LOG_TRIVIAL(info) << "[Orca Updater]:found vendor " << vendor_name << " newer version "
+                                            << resource_ver.to_string() << " from resource, old version " << vendor_ver.to_string();
+                    bundles.insert(vendor_name);
                 }
-                else {
-                    //need to be removed because not installed
-                    remove_installed_vendor(vendor_name);
-                }
+            } else {
+                // need to be removed because not installed
+                remove_installed_vendor(vendor_name);
             }
-            else if (is_vendor_enabled) {
-                bundles.insert(vendor_name);
-            }
-        }
-        else if (is_vendor_enabled) {
+        } else if (is_vendor_enabled) {
             bundles.insert(vendor_name);
         }
     }
@@ -678,7 +682,7 @@ PresetUpdater::UpdateResult PresetUpdater::config_update(const Semver& old_slic3
                 ->get_notification_manager()
                 ->push_notification(GUI::NotificationType::PresetUpdateFinished,
                                     GUI::NotificationManager::NotificationLevel::ImportantNotificationLevel,
-                                    _u8L("Configuration package: ") + b + _u8L(" updated to ") + cur_ver.to_string());
+                                    Slic3r::format(_u8L("Configuration package: %1% updated to %2%"), b, cur_ver.to_string()));
             }
             return R_UPDATE_INSTALLED;
         }

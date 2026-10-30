@@ -1,21 +1,48 @@
+#include "Flow.hpp"
+#include "Config.hpp"
+#include "ExPolygon.hpp"
+#include "ExtrusionEntity.hpp"
+#include "Exception.hpp"
 #include "Layer.hpp"
 #include "BridgeDetector.hpp"
 #include "ClipperUtils.hpp"
 #include "Geometry.hpp"
+#include "Line.hpp"
 #include "PerimeterGenerator.hpp"
 #include "Point.hpp"
+#include "Polygon.hpp"
+#include "Polyline.hpp"
 #include "Print.hpp"
+#include "PrintConfig.hpp"
 #include "Surface.hpp"
 #include "BoundingBox.hpp"
 #include "SVG.hpp"
 #include "Algorithm/RegionExpansion.hpp"
 #include "Support/SegmentSupportBounds.hpp"   // BELT_MOD
+#include "libslic3r.h"
+#include "Utils.hpp"
 
+#include <cmath>
+#include <array>
+#include <cstddef>
+#include <initializer_list>
+#include <algorithm>
+#include <cstdint>
+#include <optional>
+#include <iterator>
+#include <stdexcept>
+#include <math.h>
+#include <cassert>
 #include <string>
 #include <map>
 
 #include <boost/log/trivial.hpp>
 #include <boost/algorithm/clamp.hpp>
+#include <utility>
+#include <vector>
+#include "ExtrusionEntityCollection.hpp"
+#include "MultiMaterialSegmentation.hpp"
+#include "SurfaceCollection.hpp"
 
 namespace Slic3r {
 
@@ -36,7 +63,7 @@ Flow LayerRegion::bridging_flow(FlowRole role, bool thick_bridge) const
     const PrintObject       &print_object   = *this->layer()->object();
     Flow bridge_flow;
     // Here this->extruder(role) - 1 may underflow to MAX_INT, but then the get_at() will fall back to zero'th element, so everything is all right.
-    auto nozzle_diameter = float(print_object.print()->config().nozzle_diameter.get_at(region.extruder(role) - 1));
+    auto nozzle_diameter = float(nozzle_diameter_for_filament(print_object.print()->config(), region.extruder(role), print_object.print()->is_BBL_printer()));
     const ConfigOptionFloatOrPercent& bridge_width_opt = region_config.bridge_line_width;
     const double                      bridge_width      = bridge_width_opt.get_abs_value(nozzle_diameter);
     const bool                        has_bridge_width  = bridge_width > 0.;
@@ -73,10 +100,11 @@ void LayerRegion::slices_to_fill_surfaces_clipped()
         by_surface[size_t(surface.surface_type)].emplace_back(&surface);
     // Trim surfaces by the fill_boundaries.
     this->fill_surfaces.surfaces.clear();
+    const Polygons fill_boundaries = to_polygons(this->fill_expolygons);
     for (size_t surface_type = 0; surface_type < size_t(stCount); ++ surface_type) {
         const SurfacesPtr &this_surfaces = by_surface[surface_type];
         if (! this_surfaces.empty())
-            this->fill_surfaces.append(intersection_ex(this_surfaces, this->fill_expolygons), SurfaceType(surface_type));
+            this->fill_surfaces.append(intersection_ex_by_piece(to_expolygons(this_surfaces), fill_boundaries), SurfaceType(surface_type));
     }
 }
 
@@ -121,25 +149,6 @@ void LayerRegion::make_perimeters(const SurfaceCollection &slices, const LayerRe
         fill_no_overlap
     );
     
-    if (this->layer()->lower_layer != nullptr) {
-        // Cummulative sum of polygons over all the regions.
-        g.lower_slices = &this->layer()->lower_layer->lslices;
-        // BELT_MOD -- on a tilted floor the strip resting on the belt (or the cut face) has nothing
-        // below it in the layer stack, yet it is supported: add the floor's band through this slab
-        // so it is neither slowed as an overhang nor lifted as a bridge. Each layer writes only its
-        // own member, so the per-layer parallel loop stays safe.
-        if (const PrintObject *object = this->layer()->object(); object != nullptr && object->support_floor_is_tilted()) {
-            Layer *layer = const_cast<Layer*>(this->layer());
-            const SegmentSupportBounds floor_bounds(*object, 0.);
-            if (floor_bounds.is_active()) {
-                layer->lslices_with_floor = union_ex(layer->lower_layer->lslices,
-                                                     floor_bounds.floor_band(layer->print_z - layer->height, layer->print_z));
-                g.lower_slices = &layer->lslices_with_floor;
-            }
-        }
-        if (! this->layer()->lower_layer->segment_floor_support.empty())
-            g.lower_floor_support = &this->layer()->lower_layer->segment_floor_support;
-    }
     if (this->layer()->upper_layer != NULL)
         g.upper_slices = &this->layer()->upper_layer->lslices;
 
@@ -151,6 +160,35 @@ void LayerRegion::make_perimeters(const SurfaceCollection &slices, const LayerRe
     g.ext_perimeter_flow    = this->flow(frExternalPerimeter);
     g.overhang_flow         = this->bridging_flow(frPerimeter, object_config.thick_bridges);
     g.solid_infill_flow     = this->flow(frSolidInfill);
+
+    // Cumulative sum of polygons over all the regions, less what the lower layer could not print.
+    ExPolygons lower_slices;
+    if (this->layer()->lower_layer != nullptr) {
+        // UNLAYERED_MOD: nonplanar layers -- a held-back feature's first layer after its top's host stands on the held
+        // stack printed with the shell, which the clipped layer below does not show (set by NonplanarTop.cpp).
+        // On a tilted floor the member holds the belt band of an earlier pass instead, rebuilt below.
+        const PrintObject *floor_object = this->layer()->object();
+        const bool held_floor = ! this->layer()->lslices_with_floor.empty() &&
+                                ! (floor_object != nullptr && floor_object->support_floor_is_tilted());
+        lower_slices   = g.printable_slices(held_floor ? this->layer()->lslices_with_floor : this->layer()->lower_layer->lslices);
+        g.lower_slices = &lower_slices;
+        // BELT_MOD -- on a tilted floor the strip resting on the belt (or the cut face) has nothing
+        // below it in the layer stack, yet it is supported: add the floor's band through this slab
+        // so it is neither slowed as an overhang nor lifted as a bridge. The band is support, not
+        // printed material, so it joins after the printable filter. Each layer writes only its
+        // own member, so the per-layer parallel loop stays safe.
+        if (const PrintObject *object = this->layer()->object(); object != nullptr && object->support_floor_is_tilted()) {
+            Layer *layer = const_cast<Layer*>(this->layer());
+            const SegmentSupportBounds floor_bounds(*object, 0.);
+            if (floor_bounds.is_active()) {
+                layer->lslices_with_floor = union_ex(lower_slices,
+                                                     floor_bounds.floor_band(layer->print_z - layer->height, layer->print_z));
+                g.lower_slices = &layer->lslices_with_floor;
+            }
+        }
+        if (! this->layer()->lower_layer->segment_floor_support.empty())
+            g.lower_floor_support = &this->layer()->lower_layer->segment_floor_support;
+    }
 
     if (this->layer()->object()->config().wall_generator.value == PerimeterGeneratorType::Arachne && !spiral_mode)
         g.process_arachne();
@@ -227,7 +265,6 @@ std::vector<Bridge> get_grouped_bridges(
     {
         result.reserve(bridge_expansions.size());
         uint32_t group_id = 0;
-        using std::move_iterator;
         for (ExPolygon& expolygon : bridge_expolygons)
             result.push_back({ std::move(expolygon), group_id ++, bridge_expansions.end() });
     }
@@ -429,7 +466,6 @@ Surfaces expand_bridges_detect_orientations(
     const float closing_radius
 )
 {
-    using namespace Slic3r::Algorithm;
 
     double thickness;
     ExPolygons bridge_expolygons = fill_surfaces_extract_expolygons(surfaces, {stBottomBridge}, thickness);
@@ -651,9 +687,9 @@ void LayerRegion::process_external_surfaces(const Layer *lower_layer, const Poly
 }
 #else
 
-//#define EXTERNAL_SURFACES_OFFSET_PARAMETERS ClipperLib::jtMiter, 3.
-//#define EXTERNAL_SURFACES_OFFSET_PARAMETERS ClipperLib::jtMiter, 1.5
-#define EXTERNAL_SURFACES_OFFSET_PARAMETERS ClipperLib::jtSquare, 0.
+//#define EXTERNAL_SURFACES_OFFSET_PARAMETERS jtMiter, 3.
+//#define EXTERNAL_SURFACES_OFFSET_PARAMETERS jtMiter, 1.5
+#define EXTERNAL_SURFACES_OFFSET_PARAMETERS jtSquare, 0.
 
 void LayerRegion::process_external_surfaces(const Layer *lower_layer, const Polygons *lower_layer_covered)
 {
@@ -1098,17 +1134,14 @@ void LayerRegion::simplify_entity_collection(ExtrusionEntityCollection* entity_c
 
 void LayerRegion::simplify_path(ExtrusionPath* path)
 {
-    const auto print_config = this->layer()->object()->print()->config();
-    const bool spiral_mode = print_config.spiral_mode;
-    const bool enable_arc_fitting = print_config.enable_arc_fitting;
+    const auto &print_config = this->layer()->object()->print()->config();
+    const ArcFittingMode arc_fitting = print_config.enable_arc_fitting.value;
+    const bool is_sparse_infill = path->role() == erInternalInfill;
     const auto scaled_resolution = scaled<double>(print_config.resolution.value);
 
-    if (enable_arc_fitting &&
-        !spiral_mode) {
-        if (path->role() == erInternalInfill)
-            path->simplify_by_fitting_arc(SCALED_SPARSE_INFILL_RESOLUTION);
-        else
-            path->simplify_by_fitting_arc(scaled_resolution);
+    if (!print_config.spiral_mode &&
+        (arc_fitting == ArcFittingMode::Enabled || (arc_fitting == ArcFittingMode::SparseInfill && is_sparse_infill))) {
+        path->simplify_by_fitting_arc(is_sparse_infill ? SCALED_SPARSE_INFILL_RESOLUTION : scaled_resolution);
     } else {
         path->simplify(scaled_resolution);
     }
@@ -1116,42 +1149,14 @@ void LayerRegion::simplify_path(ExtrusionPath* path)
 
 void LayerRegion::simplify_multi_path(ExtrusionMultiPath* multipath)
 {
-    const auto print_config = this->layer()->object()->print()->config();
-    const bool spiral_mode = print_config.spiral_mode;
-    const bool enable_arc_fitting = print_config.enable_arc_fitting;
-    const auto scaled_resolution = scaled<double>(print_config.resolution.value);
-
-    for (size_t i = 0; i < multipath->paths.size(); ++i) {
-        if (enable_arc_fitting &&
-            !spiral_mode) {
-            if (multipath->paths[i].role() == erInternalInfill)
-                multipath->paths[i].simplify_by_fitting_arc(SCALED_SPARSE_INFILL_RESOLUTION);
-            else
-                multipath->paths[i].simplify_by_fitting_arc(scaled_resolution);
-        } else {
-            multipath->paths[i].simplify(scaled_resolution);
-        }
-    }
+    for (ExtrusionPath &path : multipath->paths)
+        this->simplify_path(&path);
 }
 
 void LayerRegion::simplify_loop(ExtrusionLoop* loop)
 {
-    const auto print_config = this->layer()->object()->print()->config();
-    const bool spiral_mode = print_config.spiral_mode;
-    const bool enable_arc_fitting = print_config.enable_arc_fitting;
-    const auto scaled_resolution = scaled<double>(print_config.resolution.value);
-
-    for (size_t i = 0; i < loop->paths.size(); ++i) {
-        if (enable_arc_fitting &&
-            !spiral_mode) {
-            if (loop->paths[i].role() == erInternalInfill)
-                loop->paths[i].simplify_by_fitting_arc(SCALED_SPARSE_INFILL_RESOLUTION);
-            else
-                loop->paths[i].simplify_by_fitting_arc(scaled_resolution);
-        } else {
-            loop->paths[i].simplify(scaled_resolution);
-        }
-    }
+    for (ExtrusionPath &path : loop->paths)
+        this->simplify_path(&path);
 }
 
 }

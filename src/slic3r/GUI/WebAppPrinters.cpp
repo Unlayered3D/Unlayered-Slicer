@@ -972,11 +972,8 @@ ControlPlan plan_bambu_control(MachineObject* obj, const std::string& action, co
         if (loaded)
             return ControlPlan::refuse(WAB_ACTION_DISABLED, "the filament is loaded in the tool head; unload it first, then read the tag",
                                        "filamentLoaded");
-        const int tray_index = ams_id * 4 + slot;
         return plan_with("Read the RFID tag of AMS " + itos(ams_id) + ", slot " + itos(slot), "rfid " + itos(ams_id) + " " + itos(slot),
-                         [np, ams_id, slot, tray_index](MachineObject* o) {
-                             return np ? o->command_ams_refresh_rfid2(ams_id, slot) : o->command_ams_refresh_rfid(std::to_string(tray_index));
-                         });
+                         [ams_id, slot](MachineObject* o) { return o->command_ams_refresh_rfid(ams_id, slot); });
     }
     if (action == "dryAms")
         return plan_dry(obj, p);

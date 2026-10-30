@@ -8,9 +8,9 @@
 <link rel="stylesheet" type="text/css" href="../css/common.css" />
 <link rel="stylesheet" type="text/css" href="../css/dark.css" />
 <link rel="stylesheet" type="text/css" href="21update.css" />
-<script type="text/javascript" src="../js/jquery-2.1.1.min.js"></script>
+<script type="text/javascript" src="../../include/jquery-3.6.0.min.js"></script>
 <script type="text/javascript" src="../js/json2.js"></script>
-<script type="text/javascript" src="../../data/text.js"></script>
+<script type="text/javascript" src="../../include/i18n.js"></script>
 <script type="text/javascript" src="../js/globalapi.js"></script>
 <script type="text/javascript" src="../js/common.js"></script>
 <script type="text/javascript" src="21update.js"></script>
@@ -23,28 +23,29 @@
      update is waiting (or the printer cannot be checked yet) the slicer keeps a flag, and the first
      check after the wizard offers it with the usual "Printer update available" notification,
      "Skip this version" or not. Nothing here blocks: Do it later / Next always go on.
-     Static texts: text.js unlupd1..unlupd7. Results come from the slicer, translated there. -->
+     Static texts: WebGuideDialog.cpp, guide_strings() (printer_update_*). Results come from the slicer,
+     translated there. -->
 <body onLoad="OnInit()">
 <div id="Title">
-	<div class="trans" tid="unlupd1">Update your Unlayered printer</div>
+	<div data-i18n="printer_update_title">Update your Unlayered printer</div>
 </div>
 <div id="Content">
-	<div class="FeatureText"><a class="trans TextS1" tid="unlupd2">Get the latest firmware and printer settings for your Unlayered printer. Connect it to your network, then press Check for updates. We install the firmware first, then the settings; you confirm each one. Your calibration, name and network settings are never replaced.</a></div>
+	<div class="FeatureText"><a class="TextS1" data-i18n="printer_update_desc">Get the latest firmware and printer settings for your Unlayered printer. Connect it to your network, then press Check for updates. We install the firmware first, then the settings; you confirm each one. Your calibration, name and network settings are never replaced.</a></div>
 	<div class="FeatureText" id="SignInNote" hidden>
-		<a class="trans TextS2" tid="unlupd6">Downloading the printer settings needs your free Unlayered account.</a>
-		<a class="trans" tid="unlupd7" id="SignInLink" onclick="GoSignIn()">Sign in</a>
+		<a class="TextS2" data-i18n="printer_update_account">Downloading the printer settings needs your free Unlayered account.</a>
+		<a id="SignInLink" onclick="GoSignIn()" data-i18n="sign_in">Sign in</a>
 	</div>
 	<div id="CheckArea">
-		<div class="ButtonStyleConfirm trans" tid="unlupd3" id="CheckBtn" onclick="DoCheck()">Check for updates</div>
+		<div class="ButtonStyleConfirm" id="CheckBtn" onclick="DoCheck()" data-i18n="check_for_updates">Check for updates</div>
 		<div class="FeatureText" id="PrinterText" hidden></div>
 		<div class="FeatureText" id="ResultText" hidden></div>
 	</div>
-	<div class="FeatureText"><a class="trans TextS2" tid="unlupd5">Later, you find this in the Prepare tab: press Connection (the signal icon next to Printer), then Firmware or Config. When an update is published, Unlayered Slicer also shows a "Printer update available" notification.</a></div>
+	<div class="FeatureText"><a class="TextS2" data-i18n="printer_update_later_where">Later, you find this in the Prepare tab: press Connection (the signal icon next to Printer), then Firmware or Config. When an update is published, Unlayered Slicer also shows a "Printer update available" notification.</a></div>
 </div>
 <div id="AcceptArea">
-	<div class="ButtonStyleRegular ButtonTypeChoice trans" tid="t8" id="PreBtn" onclick="GoBack()">Back</div>
-	<div class="ButtonStyleRegular ButtonTypeChoice trans" tid="unlupd4" id="LaterBtn" onclick="GoNext()">Do it later</div>
-	<div class="ButtonStyleConfirm ButtonTypeChoice trans" tid="t9" id="NextBtn" onclick="GoNext()" hidden>Next</div>
+	<div class="ButtonStyleRegular ButtonTypeChoice" id="PreBtn" onclick="GoBack()" data-i18n="back">Back</div>
+	<div class="ButtonStyleRegular ButtonTypeChoice" id="LaterBtn" onclick="GoNext()" data-i18n="do_it_later">Do it later</div>
+	<div class="ButtonStyleConfirm ButtonTypeChoice" id="NextBtn" onclick="GoNext()" data-i18n="next" hidden>Next</div>
 </div>
 </body>
 </html>

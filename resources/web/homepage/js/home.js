@@ -9,6 +9,10 @@ function OnInit()
 {
 	//-----Official-----
     TranslatePage();
+    let pluginTip = document.getElementById("NoPluginText");
+    if (pluginTip)
+        AppendTemplate(pluginTip, T("plugin_not_detected", "Bambu Network plug-in not detected. Click <a>here</a> to install it."),
+                       pluginTip.querySelector("a"));
 
 	SendMsg_GetLoginInfo();
 	SendMsg_GetBambuLoginInfo();
@@ -35,7 +39,7 @@ function Set_RecentFile_MouseRightBtn_Event()
 			
 			if(e.which == 3){
 				//鼠标点击了右键+$(this).attr('ff') );
-				ShowRecnetFileContextMenu();
+				//ShowRecnetFileContextMenu();
 			}else if(e.which == 2){
 				//鼠标点击了中键
 			}else if(e.which == 1){
@@ -49,12 +53,30 @@ function Set_RecentFile_MouseRightBtn_Event()
 		return false;
 	});	
 	
+	// ORCA file actions
+	$(".FileActions").mousedown(function(e){		
+		return false; // Block events on empty area & parent
+	});
+
+	$(".FileActionsReveal").mousedown(function(e){		
+		RightBtnFilePath=$(this).attr('fpath');
+		if(e.which == 1 && RightBtnFilePath != "")
+			OnExploreRecentFile();
+		return false; // Block events from parent
+	});
+	$(".FileActionsRemove").mousedown(function(e){		
+		RightBtnFilePath=$(this).attr('fpath');
+		if(e.which == 1)
+			OnDeleteRecentFile();
+		return false; // Block events from parent
+	});
+
     $(document).mousemove( function(e){
 		MousePosX=e.pageX;
 		MousePosY=e.pageY;
 		
-		let ContextMenuWidth=$('#recnet_context_menu').width();
-		let ContextMenuHeight=$('#recnet_context_menu').height();
+		//let ContextMenuWidth=$('#recnet_context_menu').width();
+		//let ContextMenuHeight=$('#recnet_context_menu').height();
 	
 		let DocumentWidth=$(document).width();
 		let DocumentHeight=$(document).height();
@@ -69,13 +91,13 @@ function Set_RecentFile_MouseRightBtn_Event()
 		var e = e || window.event;
         var elem = e.target || e.srcElement;
         while (elem) {
-			if (elem.id && elem.id == 'recnet_context_menu') {
-                    return;
-			}
+			//if (elem.id && elem.id == 'recnet_context_menu') {
+            //        return;
+			//}
 			elem = elem.parentNode;
 		}		
 		
-		$("#recnet_context_menu").hide();
+		//$("#recnet_context_menu").hide();
 	} );
 
 	
@@ -148,8 +170,40 @@ function HandleStudio( pVal )
   }
 }
 
+/*---- OrcaCloud opens as a native pane beside this page, so the shell only switches its
+      own cloud-mode state and asks the app to show or hide that pane (WebViewPanel::set_cloud_mode). ----*/
+var m_CloudMode=false;
+
+function SetCloudMode( bOn )
+{
+	if( m_CloudMode==bOn )
+		return;
+
+	m_CloudMode=bOn;
+	$("body").toggleClass("cloud-mode", bOn);
+
+	if( bOn )
+	{
+		$(".BtnItem").removeClass("BtnItemSelected");
+		$(".BtnItem[menu='orca_cloud']").addClass("BtnItemSelected");
+	}
+}
+
+function GotoCloud()
+{
+	SetCloudMode(true);
+	SendSimpleCommand("homepage_open_cloud");
+}
+
 function GotoMenu( strMenu )
 {
+	/*---- Any board in the right region means leaving the cloud pane. ----*/
+	if( m_CloudMode )
+	{
+		SetCloudMode(false);
+		SendSimpleCommand("homepage_close_cloud");
+	}
+
 	let MenuList=$(".BtnItem");
 	let nAll=MenuList.length;
 	
@@ -324,7 +378,7 @@ function ShowRecentFileList( pList )
 	let chips='';
 	if( sources.length>1 )
 	{
-		chips+='<span class="SourceChip'+(m_RecentSource==''?' SourceChipOn':'')+'" data-source="">All</span>';
+		chips+='<span class="SourceChip'+(m_RecentSource==''?' SourceChipOn':'')+'" data-source="">'+EscapeHtml(T("recent_source_all", "All"))+'</span>';
 		for(let n=0;n<sources.length;n++)
 			chips+='<span class="SourceChip'+(m_RecentSource==sources[n]?' SourceChipOn':'')+'" data-source="'+EscapeHtml(sources[n])+'">'+EscapeHtml(sources[n])+'</span>';
 	}
@@ -348,28 +402,39 @@ function ShowRecentFileList( pList )
 		
 		//let index=sPath.lastIndexOf('\\')>0?sPath.lastIndexOf('\\'):sPath.lastIndexOf('\/');
 		//let sShortName=sPath.substring(index+1,sPath.length);
+
+		let isExist  = !isNaN(sTime[0]); // its a valid file with time stamp
+		let btnStyle = isExist ? "ButtonStyleConfirm" : "ButtonStyleDisabled";
+		let btnPath  = isExist ? sPath : ""; // blank path will disable btn event
 		
-		let sBadge=sPublished? '<span class="FilePublishedBadge">PUB</span>':'';
+		let sBadge=sPublished? '<span class="FilePublishedBadge">'+T("published_badge", "PUB")+'</span>':'';
 		if( OneFile['other']=='1' )
 			sBadge+='<span class="FileSourceBadge">'+EscapeHtml(OneFile['source'])+'</span>';
 		let sLogoBadge=sPublished? '<img class="FileLogoBadge" src="../../images/UnlayeredSlicer_gradient_circle.svg" alt="" />':'';
 
 		let TmpHtml='<div class="FileItem"  fpath="'+sPath+'"  >'+
-				'<a class="FileTip" title="'+sPath+'"></a>'+
-				'<div class="FileImg" ><img src="'+sImg+'" onerror="this.onerror=null;this.src=\'img/d.png\';"  alt="No Image"  />'+sLogoBadge+'</div>'+
-				'<div class="FileNamePack">'+sBadge+'<div class="FileName TextS1">'+sName+'</div></div>'+
-				'<div class="FileDate">'+sTime+'</div>'+
-			    '</div>';
+						'<a class="FileTip" title="'+sPath+'"></a>'+
+						'<div class="FileImg" ><img src="'+sImg+'" onerror="this.onerror=null;this.src=\'img/d.png\';"  alt="No Image"  />'+sLogoBadge+'</div>'+
+						'<div class="FileNamePack">'+sBadge+'<div class="FileName TextS1">'+sName+'</div></div>'+
+						'<div class="FileDate">'+sTime+'</div>'+
+						'<div class="FileActions">'+
+							'<div class="FileActionsReveal '+btnStyle+' ButtonTypeWindow trans" fpath="'+btnPath+'" data-i18n="show_in_folder">Show in folder</div>'+
+							'<div class="FileActionsRemove ButtonStyleAlert ButtonTypeWindow" fpath="'+sPath+'">'+
+								'<div class="icon16"/></div>'+
+							'</div>'+
+						'</div>'+
+			    	'</div>';
 		
 		strHtml+=TmpHtml;
 	}
 	
 	$("#FileList").html(strHtml);	
+	TranslatePage();   // translate the data-i18n attributes on the freshly inserted cards
 	
     Set_RecentFile_MouseRightBtn_Event();
 	UpdateRecentClearBtnDisplay();
 }
-
+/*
 function ShowRecnetFileContextMenu()
 {
 	$("#recnet_context_menu").offset({top: 10000, left:-10000});
@@ -391,7 +456,7 @@ function ShowRecnetFileContextMenu()
 	
 	$("#recnet_context_menu").offset({top: RealY, left:RealX});
 }
-
+*/
 /*-------RecentFile MX Message------*/
 function SendMsg_GetLoginInfo()
 {
@@ -463,7 +528,7 @@ function OnOpenRecentFile( strPath )
 function OnDeleteRecentFile( )
 {
 	//Clear in UI
-	$("#recnet_context_menu").hide();
+	//$("#recnet_context_menu").hide();
 	
 	let AllFile=$(".FileItem");
 	let nFile=AllFile.length;
@@ -521,7 +586,7 @@ function OnExploreRecentFile( )
 	
 	SendWXMessage( JSON.stringify(tSend) );	
 	
-	$("#recnet_context_menu").hide();
+	//$("#recnet_context_menu").hide();
 }
 
 // --- Cloud providers ---

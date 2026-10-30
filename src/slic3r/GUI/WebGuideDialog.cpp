@@ -4,12 +4,30 @@
 #include "PrinterUpdateOffer.hpp"
 #include "slic3r/Utils/UsageTelemetry.hpp"
 #include "libslic3r/libslic3r.h"
+#include "CloudProvider.hpp"
 #include "ConfigWizard.hpp"
 
 #include <boost/filesystem/operations.hpp>
 #include <boost/filesystem/path.hpp>
 #include <boost/iostreams/detail/select.hpp>
 #include <boost/log/trivial.hpp>
+#include <boost/nowide/fstream.hpp>
+#include <map>
+#include "slic3r/GUI/GUI.hpp"
+#include "slic3r/GUI/GUI_Utils.hpp"
+#include <memory>
+#include <exception>
+#include "slic3r/GUI/Event.hpp"
+#include "slic3r/GUI/Plater.hpp"
+#include <set>
+#include <ostream>
+#include <iterator>
+#include "slic3r/GUI/UnsavedChangesDialog.hpp"
+#include "slic3r/GUI/ParamsDialog.hpp"
+#include "libslic3r/Semver.hpp"
+#include <ios>
+#include <stdexcept>
+#include <sstream>
 #include <string.h>
 #include "I18N.hpp"
 #include "libslic3r/AppConfig.hpp"
@@ -17,12 +35,28 @@
 #include "libslic3r/PresetBundle.hpp"
 #include "slic3r/GUI/wxExtensions.hpp"
 #include "slic3r/GUI/GUI_App.hpp"
+#include "slic3r/GUI/GUI.hpp"   // file_url_from_path
+#include <nlohmann/json.hpp>
 #include "libslic3r_version.h"
 
+#include <string>
+#include <vector>
+#include <utility>
+#include <wx/gdicmn.h>
+#include <wx/log.h>
+#include <wx/settings.h>
+#include <wx/event.h>
+#include <wx/setup.h>
+#include <unordered_set>
+#include <system_error>
 #include <wx/sizer.h>
+#include <wx/string.h>
+#include <wx/strconv.h>
 #include <wx/toolbar.h>
 #include <wx/textdlg.h>
 
+#include <wx/webview.h>
+#include <wx/utils.h>
 #include <wx/wx.h>
 #include <wx/display.h>
 #include <wx/fileconf.h>
@@ -32,23 +66,114 @@
 #include <boost/cast.hpp>
 #include <boost/lexical_cast.hpp>
 #include <boost/filesystem.hpp>
+#include <boost/thread.hpp>
 #include <unordered_map>
 
 #include "MainFrame.hpp"
+#include "Plater.hpp"
 #include <boost/dll.hpp>
 #include <slic3r/GUI/Widgets/WebView.hpp>
-#include <slic3r/Utils/Http.hpp>
-#include <libslic3r/miniz_extension.hpp>
+#include <slic3r/GUI/Widgets/WebViewHostDialog.hpp>
 #include <libslic3r/Utils.hpp>
 #include "CreatePresetsDialog.hpp"
+#include "libslic3r/PrintConfig.hpp"
+#include "slic3r/Utils/NetworkAgent.hpp"
+#include "slic3r/Utils/PresetUpdater.hpp"
 #include <wx/filesys.h>
 #include <wx/filename.h>
 
+class wxWindow;
+
 using namespace nlohmann;
+
+namespace fs = boost::filesystem;
 
 namespace Slic3r { namespace GUI {
 
 json m_ProfileJson;
+
+// The strings of every setup wizard page (resources/web/guide), keyed by their data-i18n and T() ids.
+// The pages share one web view, so they share one table.
+static json guide_strings()
+{
+    return {
+        {"loading", _u8L("Loading…")},
+        // TRN Sidebar entry of the printer selection page for the group of custom (user-defined) printers.
+        {"custom_vendor", _u8L_CONTEXT("Custom", "Printer vendor")},
+        {"welcome", _u8L("Welcome to Unlayered Slicer")},
+        {"setup_intro", _u8L("Unlayered Slicer will be set up in several steps. Let's start!")},
+        {"get_started", _u8L("Get Started")},
+        // Unlayered 0.1.6: the region page (guide/11) asks where the person lives; the places come
+        // from the slicer (PrivacyConsent). The privacy page (guide/13) shows the approved consent
+        // wording as written and takes only "back" from here.
+        {"where_do_you_live", _u8L("Where do you live?")},
+        {"where_do_you_live_help", _u8L("Choose where you live so we can apply the right privacy settings. It also sets the region for printer profiles. You can change it later in Preferences.")},
+        {"back", _u8L_CONTEXT("Back", "Navigation")},
+        {"next", _u8L("Next")},
+        {"finish", _u8L("Finish")},
+        {"confirm", _u8L("Confirm")},
+        {"cancel", _u8L("Cancel")},
+        {"ok", _u8L("OK")},
+        {"yes", _u8L("Yes")},
+        {"no", _u8L("No")},
+        {"error", _u8L("Error")},
+        {"information", _u8L("Information")},
+        {"printer_selection", _u8L("Printer Selection")},
+        {"vendors", _u8L("Vendors")},
+        {"search", _u8L("Search")},
+        {"custom_printer", _u8L("Custom Printer")},
+        {"nozzle", _u8L("Nozzle")},
+        {"create", _u8L("Create")},
+        {"check_new_printers", _u8L("Check for new printers")},
+        {"printer_required", _u8L("At least one printer must be selected.")},
+        {"new_printers_found", _u8L("New printers found")},
+        {"new_vendors_installed", _u8L("New printer vendors installed: %s")},
+        {"vendors_declined", _u8L("New printer vendors were found, but installation was cancelled.")},
+        {"no_new_printers", _u8L("No new printers found.")},
+        {"filament_selection", _u8L("Filament Selection")},
+        {"system_filaments", _u8L("System Filaments")},
+        {"custom_filaments", _u8L("Custom Filaments")},
+        {"create_new", _u8L("Create New")},
+        {"printer", _u8L("Printer")},
+        {"filament_type", _u8L("Filament type")},
+        {"vendor", _u8L("Vendor")},
+        {"all", _u8L("All")},
+        {"no_items", _u8L("No items")},
+        {"filter_items", _u8L("Filter items")},
+        {"checked", _u8L("Checked")},
+        {"unchecked", _u8L("Unchecked")},
+        {"select_filtered", _u8L("Select filtered")},
+        {"select_visible", _u8L("Select visible")},
+        {"clear_all", _u8L("Clear all")},
+        {"filament_required", _u8L("At least one filament must be selected.")},
+        {"use_default_filament", _u8L("Do you want to use the default filament?")},
+        {"proprietary_plugins", _u8L("Proprietary Plugins")},
+        {"proprietary_plugins_desc", _u8L("Some printer vendors require proprietary plugins for communication with their printers. Please select the corresponding plugin if you use such printers.")},
+        {"proprietary_plugins_risk", _u8L("Please be aware that these plugins are not developed or maintained by Unlayered Slicer. They should be used at your own discretion and risk.")},
+        {"install_bambu_plugin", _u8L("Install Bambu Network plug-in")},
+        // Unlayered: the multiplanar tutorial step (guide/25), the Bambu Lab network plug-in step
+        // (guide/4unlayered), and the Skip of "Settings from other slicers" (guide/5import, whose
+        // other texts come translated with its request_other_slicers answer, as do guide/13signin's).
+        {"skip", _u8L("Skip")},
+        {"multiplanar_title", _u8L("Printing in several directions")},
+        {"multiplanar_desc", _u8L("This slicer can cut a model into sections and print each one along its own build direction, so overhangs and layer lines no longer have to follow a single flat stack. It works differently from ordinary slicing, and the walkthrough is short.")},
+        {"multiplanar_reopen", _u8L("You can open it again at any time from Help > Multiplanar Tutorial.")},
+        {"open_tutorial", _u8L("Open the tutorial")},
+        {"bambu_printers", _u8L("Bambu Lab printers")},
+        {"bambu_plugin_desc", _u8L("The Bambu Lab network plug-in is required for wireless communication with Bambu Lab 3D printers: sending prints over Wi-Fi or LAN and seeing the printer's status and camera.")},
+        {"bambu_plugin_note", _u8L("It is made by Bambu Lab, not Unlayered, and is downloaded when you press Finish. Using a Bambu Lab printer? Tick the box - you can also install it later from Preferences.")},
+        {"install_bambu_lab_plugin", _u8L("Install the Bambu Lab network plug-in.")},
+        // Unlayered 0.1.8: "Update your Unlayered printer" (guide/21update). Its check results come
+        // translated from CheckPrinterUpdate().
+        {"printer_update_title", _u8L("Update your Unlayered printer")},
+        {"printer_update_desc", _u8L("Get the latest firmware and printer settings for your Unlayered printer. Connect it to your network, then press Check for updates. We install the firmware first, then the settings; you confirm each one. Your calibration, name and network settings are never replaced.")},
+        {"check_for_updates", _u8L("Check for updates")},
+        {"do_it_later", _u8L("Do it later")},
+        {"printer_update_later_where", _u8L("Later, you find this in the Prepare tab: press Connection (the signal icon next to Printer), then Firmware or Config. When an update is published, Unlayered Slicer also shows a \"Printer update available\" notification.")},
+        {"printer_update_account", _u8L("Downloading the printer settings needs your free Unlayered account.")},
+        {"sign_in", _u8L("Sign in")},
+    };
+}
 
 static wxString update_custom_filaments()
 {
@@ -122,6 +247,7 @@ GuideFrame::GuideFrame(GUI_App *pGUI, long style)
     SetBackgroundColour(*wxWHITE);
     // INI
     m_SectionName = "firstguide";
+    m_page        = BBL_WELCOME;
     PrivacyUse    = false;
     StealthMode   = false;
     InstallNetplugin = false;
@@ -133,15 +259,14 @@ GuideFrame::GuideFrame(GUI_App *pGUI, long style)
     // set the frame icon
     wxBoxSizer *topsizer = new wxBoxSizer(wxVERTICAL);
 
-    wxString TargetUrl = SetStartPage(BBL_WELCOME, false);
-    BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(",  set start page to welcome ");
-
-    // Create the webview
-    m_browser = WebView::CreateWebView(this, TargetUrl);
+    // Created empty and loaded by SetStartPage(BBL_REGION) below, after the strings are added, so the
+    // first load already has them.
+    m_browser = WebView::CreateWebView(this, wxEmptyString);
     if (m_browser == nullptr) {
         wxLogError("Could not init m_browser");
         return;
     }
+    m_browser->AddUserScript(wxString::FromUTF8(WebViewHostDialog::localized_strings_script(guide_strings())));
     m_browser->Hide();
     m_browser->SetSize(0, 0);
 
@@ -413,45 +538,46 @@ wxString GuideFrame::SetStartPage(GuidePage startpage, bool load)
     m_page = startpage;
     BOOST_LOG_TRIVIAL(info) << __FUNCTION__<< boost::format(" enter, load=%1%, start_page=%2%")%load%int(startpage);
     //wxLogMessage("GUIDE: webpage_1  %s", (boost::filesystem::path(resources_dir()) / "web\\guide\\1\\index.html").make_preferred().string().c_str() );
-    wxString TargetUrl = from_u8( (boost::filesystem::path(resources_dir()) / "web/guide/0/index.html?target=1").make_preferred().string() );
+    // The page is addressed as a percent-encoded file URL, so a '#', '%' or '?' in the install path
+    // is not read as a fragment, escape or query; the query is appended after the encoding.
+    const wxString guide_url = file_url_from_path(boost::filesystem::path(resources_dir()) / "web/guide/0/index.html");
+    wxString TargetUrl = guide_url + "?target=1";
     //wxLogMessage("GUIDE: webpage_2  %s", TargetUrl.mb_str());
 
     if (startpage == BBL_WELCOME){
         SetTitle(_L("Setup Wizard"));
-        TargetUrl = from_u8((boost::filesystem::path(resources_dir()) / "web/guide/0/index.html?target=1").make_preferred().string());
+        TargetUrl = guide_url + "?target=1";
     } else if (startpage == BBL_REGION) {
         SetTitle(_L("Setup Wizard"));
-        TargetUrl = from_u8((boost::filesystem::path(resources_dir()) / "web/guide/0/index.html?target=11").make_preferred().string());
+        TargetUrl = guide_url + "?target=11";
     } else if (startpage == BBL_MODELS) {
         SetTitle(_L("Setup Wizard"));
-        TargetUrl = from_u8((boost::filesystem::path(resources_dir()) / "web/guide/0/index.html?target=21").make_preferred().string());
+        TargetUrl = guide_url + "?target=21";
     } else if (startpage == BBL_FILAMENTS) {
         SetTitle(_L("Setup Wizard"));
 
         int nSize = m_ProfileJson["model"].size();
 
         if (nSize>0)
-            TargetUrl = from_u8((boost::filesystem::path(resources_dir()) / "web/guide/0/index.html?target=22&wait=detail").make_preferred().string());
+            TargetUrl = guide_url + "?target=22&wait=detail";
         else
-            TargetUrl = from_u8((boost::filesystem::path(resources_dir()) / "web/guide/0/index.html?target=21").make_preferred().string());
+            TargetUrl = guide_url + "?target=21";
     } else if (startpage == BBL_FILAMENT_ONLY) {
         SetTitle("");
-        TargetUrl = from_u8((boost::filesystem::path(resources_dir()) / "web/guide/0/index.html?target=23&wait=detail").make_preferred().string());
+        TargetUrl = guide_url + "?target=23&wait=detail";
     } else if (startpage == BBL_MODELS_ONLY) {
         SetTitle("");
-        TargetUrl = from_u8((boost::filesystem::path(resources_dir()) / "web/guide/0/index.html?target=24").make_preferred().string());
+        TargetUrl = guide_url + "?target=24";
     }
     else {
         SetTitle(_L("Setup Wizard"));
-        TargetUrl = from_u8((boost::filesystem::path(resources_dir()) / "web/guide/0/index.html?target=21").make_preferred().string());
+        TargetUrl = guide_url + "?target=21";
     }
 
     wxString strlang = wxGetApp().current_language_code_safe();
     BOOST_LOG_TRIVIAL(info) << __FUNCTION__<< boost::format(", strlang=%1%") % into_u8(strlang);
     if (strlang != "")
         TargetUrl = wxString::Format("%s&lang=%s", w2s(TargetUrl), strlang);
-
-    TargetUrl = "file://" + TargetUrl;
     if (load)
         load_url(TargetUrl);
 
@@ -497,6 +623,18 @@ void GuideFrame::OnNavigationRequest(wxWebViewEvent &evt)
 /**
  * Callback invoked when a navigation request was accepted
  */
+// The data is often ready before the loading page has run its scripts, and a
+// call into a page without HandleStudio is lost, so the message waits for both.
+void GuideFrame::notify_profile_loaded()
+{
+    if (!m_profile_ready || !m_page_ready)
+        return;
+    json res;
+    res["command"]     = "userguide_profile_load_finish";
+    res["sequence_id"] = "10001";
+    RunScript(wxString::Format("HandleStudio(%s)", res.dump(-1, ' ', true)));
+}
+
 void GuideFrame::OnNavigationComplete(wxWebViewEvent &evt)
 {
     //wxLogMessage("%s", "Navigation complete; url='" + evt.GetURL() + "'");
@@ -638,7 +776,11 @@ void GuideFrame::OnScriptMessage(wxWebViewEvent &evt)
             return;
         }
 
-        if (strCmd == "close_page") {
+        if (strCmd == "userguide_loading_page_ready") {
+            m_page_ready = true;
+            notify_profile_loaded();
+        }
+        else if (strCmd == "close_page") {
             this->EndModal(wxID_CANCEL);
         }
         if (strCmd == "user_clause") {
@@ -803,7 +945,7 @@ void GuideFrame::OnScriptMessage(wxWebViewEvent &evt)
                     if (wxGetApp().is_user_login()) {
                         BOOST_LOG_TRIVIAL(info) << "logout: user_logout on user_guide_finish";
                         // agent->user_logout();
-                        wxGetApp().request_user_logout();
+                        wxGetApp().request_user_logout(ORCA_CLOUD_PROVIDER, /*user_initiated=*/true);
                     }
                 }
             }
@@ -815,7 +957,7 @@ void GuideFrame::OnScriptMessage(wxWebViewEvent &evt)
         else if (strCmd == "user_guide_create_printer") {
             this->EndModal(wxID_CANCEL);
             this->Close();
-            GUI::wxGetApp().CallAfter([this] {GUI::wxGetApp().sidebar().create_printer_preset();});
+            GUI::wxGetApp().CallAfter([] {GUI::wxGetApp().sidebar().create_printer_preset();});
         }
         else if (strCmd == "user_guide_cancel") {
             this->EndModal(wxID_CANCEL);
@@ -1130,7 +1272,7 @@ int GuideFrame::SaveProfile()
     // they pressed Continue (PrivacyFlow), and nothing is sent while the wizard is open.
 
     //finish
-    m_MainPtr->app_config->set(std::string(m_SectionName.mb_str()), "finish", "1");
+    m_MainPtr->app_config->set(std::string(m_SectionName.mb_str()), "finish", true);
 
     m_MainPtr->app_config->save();
 
@@ -1285,8 +1427,7 @@ bool GuideFrame::apply_config(AppConfig *app_config, PresetBundle *preset_bundle
 
     std::string preferred_model;
     std::string preferred_variant;
-    PrinterTechnology preferred_pt = ptFFF;
-    auto get_preferred_printer_model = [preset_bundle, enabled_vendors, old_enabled_vendors, preferred_pt](const std::string& bundle_name, std::string& variant) {
+    auto get_preferred_printer_model = [preset_bundle, enabled_vendors, old_enabled_vendors](const std::string& bundle_name, std::string& variant) {
         const auto config = enabled_vendors.find(bundle_name);
         if (config == enabled_vendors.end())
             return std::string();
@@ -1467,6 +1608,8 @@ bool GuideFrame::run()
 
         app.app_config->set_legacy_datadir(false);
         app.update_mode();
+        if (Plater *plater = app.plater())
+            plater->normalize_bed_types(false);
         // BBS
         //app.obj_manipul()->update_ui_from_settings();
         BOOST_LOG_TRIVIAL(info) << "GuideFrame applied";
@@ -1678,11 +1821,8 @@ int GuideFrame::LoadProfileData()
 
             BOOST_LOG_TRIVIAL(info) << "GuideFrame::LoadProfileData, models ready, " << m_ProfileJson["model"].size() << " printer models";
 
-            json m_Res           = json::object();
-            m_Res["command"]     = "userguide_profile_load_finish";
-            m_Res["sequence_id"] = "10001";
-
-            RunScript(wxString::Format("HandleStudio(%s)", m_Res.dump(-1, ' ', true)));
+            m_profile_ready = true;
+            notify_profile_loaded();
         });
 
         // Stage 2: machine / filament / process presets. Accumulated into a local json on this
@@ -1820,13 +1960,13 @@ int GuideFrame::SaveProfileData()
     return 0;
 }
 
-void StringReplace(string &strBase, string strSrc, string strDes)
+void StringReplace(std::string &strBase, std::string strSrc, std::string strDes)
 {
-    string::size_type pos    = 0;
-    string::size_type srcLen = strSrc.size();
-    string::size_type desLen = strDes.size();
+    std::string::size_type pos    = 0;
+    std::string::size_type srcLen = strSrc.size();
+    std::string::size_type desLen = strDes.size();
     pos                      = strBase.find(strSrc, pos);
-    while ((pos != string::npos)) {
+    while ((pos != std::string::npos)) {
         strBase.replace(pos, srcLen, strDes);
         pos = strBase.find(strSrc, (pos + desLen));
     }
@@ -1908,26 +2048,50 @@ int GuideFrame::LoadProfileFamily(std::string strVendor, std::string strFilePath
         json pmachine = jLocal["machine_list"];
         nsize         = pmachine.size();
         BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(",  got %1% machines") % nsize;
+        // A machine may inherit printer_model / nozzle_diameter instead of setting them (Prusa's
+        // MMU3 and UltiMaker's 2+ profiles): look them up its inherits chain in this list.
+        std::map<std::string, std::string> machine_paths;
+        for (const json& m : pmachine)
+            if (m.contains("name") && m["name"].is_string() && m.contains("sub_path") && m["sub_path"].is_string())
+                machine_paths[m["name"].get<std::string>()] = m["sub_path"].get<std::string>();
+        auto load_machine = [&](const std::string& sub) -> json {
+            boost::filesystem::path p = boost::filesystem::absolute(vendor_dir / sub).make_preferred();
+            if (!boost::filesystem::exists(p))
+                return json();
+            std::string text;
+            LoadFile(p.string(), text);
+            return json::parse(text);
+        };
         for (int n = 0; n < nsize; n++) {
             json OneMachine = pmachine.at(n);
 
             std::string s1 = OneMachine["name"];
             std::string s2 = OneMachine["sub_path"];
 
-            // wxString ModelFilePath = wxString::Format("%s\\%s\\%s", strFolder, strVendor, s2);
-            boost::filesystem::path sub_path = boost::filesystem::absolute(vendor_dir / s2).make_preferred();
-            if (!boost::filesystem::exists(sub_path)) continue;
+            json pm = load_machine(s2);
+            if (!pm.is_object()) continue;
 
-            std::string             sub_file = sub_path.string();
-            LoadFile(sub_file, contents);
-            json pm = json::parse(contents);
-
-            std::string strInstant = pm["instantiation"];
-            if (strInstant.compare("true") == 0) {
-                OneMachine["model"] = pm["printer_model"];
-                OneMachine["nozzle"] = pm["nozzle_diameter"][0];
-
-                out["machine"][s1]=OneMachine;
+            if (pm.value("instantiation", std::string()) == "true") {
+                json model  = pm.contains("printer_model") ? pm["printer_model"] : json();
+                json nozzle = pm.contains("nozzle_diameter") ? pm["nozzle_diameter"] : json();
+                json parent = pm.contains("inherits") ? pm["inherits"] : json();
+                for (int depth = 0; depth < 16 && (!model.is_string() || !nozzle.is_array()) && parent.is_string(); ++depth) {
+                    const auto it = machine_paths.find(parent.get<std::string>());
+                    const json up = it == machine_paths.end() ? json() : load_machine(it->second);
+                    if (!up.is_object())
+                        break;
+                    if (!model.is_string() && up.contains("printer_model"))
+                        model = up["printer_model"];
+                    if (!nozzle.is_array() && up.contains("nozzle_diameter"))
+                        nozzle = up["nozzle_diameter"];
+                    parent = up.contains("inherits") ? up["inherits"] : json();
+                }
+                if (model.is_string() && nozzle.is_array() && !nozzle.empty() && nozzle[0].is_string()) {
+                    OneMachine["model"]  = model;
+                    OneMachine["nozzle"] = nozzle[0];
+                    out["machine"][s1]   = OneMachine;
+                } else
+                    BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << ": " << s1 << " has no printer_model or nozzle_diameter, left out";
             }
         }
 
@@ -1989,7 +2153,8 @@ int GuideFrame::LoadProfileFamily(std::string strVendor, std::string strFilePath
                     for (int i = 0; i < nPrinter; i++)
                     {
                         std::string sP = pPrinters.at(i);
-                        if (out["machine"].contains(sP))
+                        if (out["machine"].contains(sP) && out["machine"][sP]["model"].is_string() &&
+                            out["machine"][sP]["nozzle"].is_string())
                         {
                             std::string mModel = out["machine"][sP]["model"];
                             std::string mNozzle = out["machine"][sP]["nozzle"];

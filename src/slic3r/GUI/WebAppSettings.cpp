@@ -241,6 +241,32 @@ json option_schema_json(const std::string& key, const ConfigBase* cfg)
     return option;
 }
 
+// Every current warning of the Print's and each PrintObject's steps (the same states the GUI's slicing
+// notifications read). step_state_with_warnings() copies the state under the print's state mutex.
+json print_warnings_json(const Print& print)
+{
+    json warnings = json::array();
+    auto add      = [&warnings](const PrintStateBase::StateWithWarnings& state, const std::string& object) {
+        for (const PrintStateBase::Warning& w : state.warnings) {
+            if (!w.current)
+                continue;
+            json j = {{"message", w.message},
+                      {"level", w.level == PrintStateBase::WarningLevel::CRITICAL ? "critical" : "warning"}};
+            if (!object.empty())
+                j["object"] = object;
+            warnings.push_back(std::move(j));
+        }
+    };
+    for (int s = 0; s < int(psCount); ++s)
+        add(print.step_state_with_warnings(PrintStep(s)), {});
+    for (const PrintObject* po : print.objects()) {
+        const std::string name = po->model_object() != nullptr ? po->model_object()->name : std::string();
+        for (int s = 0; s < int(posCount); ++s)
+            add(po->step_state_with_warnings(PrintObjectStep(s)), name);
+    }
+    return warnings;
+}
+
 json slice_summary_json(PartPlate* plate)
 {
     if (plate == nullptr || !plate->is_slice_result_valid())
@@ -262,6 +288,7 @@ json slice_summary_json(PartPlate* plate)
         summary["filamentMm"] = stats.total_used_filament;
         summary["filamentG"]  = stats.total_weight;
         summary["cost"]       = stats.total_cost;
+        summary["warnings"]   = print_warnings_json(*print);
     }
     return summary;
 }

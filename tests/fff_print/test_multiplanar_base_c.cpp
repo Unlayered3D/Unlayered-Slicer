@@ -202,7 +202,7 @@ BaseCSlice slice_two_segment_cube(const Vec2d &offset, double tilt_deg, double a
     cp.normal = tilted(tilt_deg, azimuth_deg);
     stack.planes.push_back(cp);
     object->cut_planes  = stack;
-    instance->auto_drop = true;
+    object->auto_drop   = true;
     object->ensure_on_bed();
 
     DynamicPrintConfig config = DynamicPrintConfig::full_print_config();

@@ -77,7 +77,7 @@
 		"1"
 	],
 	"z_hop": [
-		"0.4"
+		"0"
 	],
 	"z_hop_types": [
 		"Normal Lift"
@@ -90,7 +90,8 @@
 	],
 	"belt_printer": "1",
 	"belt_slice_rotation": "x",
-	"belt_frame_tilt_angle": "45",
+	"belt_slice_rotation_angle": "45",
+	"build_plate_tilt_x": "45",
 	"purge_in_prime_tower": "0",
 	"scan_first_layer": "0",
 	"auxiliary_fan": "0"

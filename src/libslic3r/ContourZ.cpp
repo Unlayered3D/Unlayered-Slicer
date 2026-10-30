@@ -2,15 +2,23 @@
 #include "ExtrusionEntity.hpp"
 #include "ExtrusionEntityCollection.hpp"
 #include "Layer.hpp"
+#include "Line.hpp"
+#include "NonplanarTopSlice.hpp"
 #include "Point.hpp"
 #include "Print.hpp"
 #include "SLA/IndexedMesh.hpp"
 #include "libslic3r.h"
 #include <algorithm>
+#include <Eigen/Core>
 #include <cfloat>
 #include <cmath>
 #include <initializer_list>
+#include <math.h>
 #include <string>
+#include <utility>
+#include "Config.hpp"
+#include "Polyline.hpp"
+#include "PrintConfig.hpp"
 
 namespace Slic3r {
 
@@ -19,6 +27,8 @@ struct ContourZSurface
 {
     const sla::IndexedMesh                    &mesh;
     const std::vector<Layer::ContourZCeiling> &ceilings;
+    // UNLAYERED_MOD: nonplanar layers -- curved shell material near the paths (nullptr: none).
+    const NonplanarZaaLimits                  *np = nullptr;
 
     struct Hit
     {
@@ -71,7 +81,11 @@ static bool contour_extrusion_path(LayerRegion *region, const ContourZSurface &s
     if (path.nonplanar_shell || path.z_contoured)
         return false;
 
-    if (path.role() != erTopSolidInfill && path.role() != erIroning && path.role() != erExternalPerimeter && path.role() != erPerimeter) {
+    // UNLAYERED_MOD: nonplanar layers -- under a curved band every planar path of the layer reaching it is lowered onto
+    // the band's bottom (below); elsewhere only these roles are contoured.
+    const bool contoured_role = path.role() == erTopSolidInfill || path.role() == erIroning || path.role() == erExternalPerimeter ||
+                                path.role() == erPerimeter;
+    if (! contoured_role && surface.np == nullptr) {
             //BOOST_LOG_TRIVIAL(info) << "contour_extrusion_path: skipping role=" << path.role();
 
 		return false;
@@ -92,6 +106,23 @@ static bool contour_extrusion_path(LayerRegion *region, const ContourZSurface &s
 
 	Pointf3s contoured_points;
 	bool was_contoured = false;
+
+    // Normally, if the new point is collinear with the last two points, we do not add it to the list of contoured
+    // points. Instead we update the last point to be the new point. This is to avoid creating a large number of very
+    // short segments. However, if the new point corresponds to a point in the original path (original), even if it is
+    // collinear, we add it anyway. This is to avoid creating a degenerate polygon with only two points, which may cause
+    // issues in downstream code.
+    auto add_point = [&contoured_points](const Vec3d &new_point, bool original) {
+        if (contoured_points.size() >= 2 && !original) {
+            double dist = Linef3::distance_to_infinite_squared(new_point, contoured_points[contoured_points.size() - 2],
+                                                               contoured_points[contoured_points.size() - 1]);
+            if (dist < EPSILON * EPSILON) {
+                contoured_points[contoured_points.size() - 1] = new_point;
+                return;
+            }
+        }
+        contoured_points.push_back(new_point);
+    };
 
     if (points.size() < 2) {
         // Safety check. The loop below does not handle paths with less than two points correctly.
@@ -116,6 +147,21 @@ static bool contour_extrusion_path(LayerRegion *region, const ContourZSurface &s
 
             coordf_t x = p.x();
 			coordf_t y = p.y();
+
+            // UNLAYERED_MOD: nonplanar layers -- under a curved band printed with or after this layer the surface to follow
+            // is the band's bottom (S - T): lower onto it, as a top surface is contoured; never raise.
+            if (double band_z = 0.; surface.np != nullptr && surface.np->band_bottom(layer->id(), x, y, band_z)) {
+                double d = std::min(0., band_z - layer->print_z);
+                d        = std::max(d, -(height - min_z));
+                if (std::abs(d) > EPSILON)
+                    was_contoured = true;
+                add_point({p.x(), p.y(), d}, i == 0);
+                continue;
+            }
+            if (! contoured_role) {
+                add_point({p.x(), p.y(), 0.}, i == 0);
+                continue;
+            }
 
 			ContourZSurface::Hit hit_up = surface.query_up({x, y, mesh_slice_z});
             //BOOST_LOG_TRIVIAL(info) << "contour_extrusion_path: hit=" << hit_up.is_hit << " distance=" << hit_up.distance;
@@ -164,29 +210,24 @@ static bool contour_extrusion_path(LayerRegion *region, const ContourZSurface &s
                 d = 0;
             }
 
+            // UNLAYERED_MOD: nonplanar layers -- beside a curved shell a path is never lowered into the shell's material
+            // printed before it (Benchy: 0.06-0.09 mm under it), nor raised where a shell prints later.
+            if (surface.np != nullptr) {
+                double z_floor = 0.;
+                bool   no_raise = false;
+                if (surface.np->query(layer->id(), layer->print_z, x, y, z_floor, no_raise)) {
+                    if (no_raise && d > 0)
+                        d = 0;
+                    if (d < 0 && layer->print_z + d < z_floor)
+                        d = std::min(0., z_floor - layer->print_z);
+                }
+            }
+
             if (std::abs(d) > EPSILON) {
 				was_contoured = true;
 			}
 
-            Vec3d new_point = {p.x(), p.y(), d};
-
-            if (contoured_points.size() >= 2 && i != 0) {
-                // Normally, if the new point is collinear with the last two points, we do not add
-                // it to the list of contoured points. Instead we update the last point to be the
-                // new point. This is to avoid creating a large number of very short segments.
-                //
-                // However, if the new point corresponds to a point in the original path (i == 0),
-                // even if it is collinear, we add it anyway. This is to avoid creating a degenerate
-                // polygon with only two points, which may cause issues in downstream code.
-                double dist = Linef3::distance_to_infinite_squared(new_point, contoured_points[contoured_points.size() - 2],
-                                                                   contoured_points[contoured_points.size() - 1]);
-                if (dist < EPSILON * EPSILON) {
-                    contoured_points[contoured_points.size() - 1] = new_point;
-                    continue;
-                }
-            }
-
-            contoured_points.push_back(new_point);
+            add_point({p.x(), p.y(), d}, i == 0);
         }
     }
 
@@ -267,9 +308,10 @@ static void contour_extrusion_entity(LayerRegion *region, const ContourZSurface 
 	return;
 }
 
+// An empty role list visits every entity (contour_extrusion_path decides per path and per point).
 static void handle_extrusion_collection(LayerRegion *region, const ContourZSurface &surface, ExtrusionEntityCollection &collection, std::initializer_list<ExtrusionRole> roles) {
     for (ExtrusionEntity* extr : collection.entities) {
-        if (!contains(roles, extr->role())) {
+        if (roles.size() != 0 && !contains(roles, extr->role())) {
 			continue;
 		}
 
@@ -279,13 +321,21 @@ static void handle_extrusion_collection(LayerRegion *region, const ContourZSurfa
 
 void Layer::make_contour_z(const sla::IndexedMesh &mesh, const std::vector<ContourZCeiling> &ceilings)
 {
-    const ContourZSurface surface{mesh, ceilings};
+    const std::shared_ptr<const NonplanarZaaLimits> np = this->object() != nullptr ? nonplanar_top_zaa_limits(*this->object()) : nullptr;
+    const ContourZSurface surface{mesh, ceilings, np.get()};
 	for (LayerRegion *region : this->regions()) {
         if (!region->region().config().zaa_enabled)
             continue;
 
-        handle_extrusion_collection(region, surface, region->fills, {erTopSolidInfill, erIroning, erPerimeter, erExternalPerimeter, erMixed});
-        handle_extrusion_collection(region, surface, region->perimeters, {erPerimeter, erExternalPerimeter, erMixed});
+        // UNLAYERED_MOD: nonplanar layers -- with curved shells every fill and wall path is offered: the layer under a band
+        // is lowered onto it whatever its role (solid infill, gap fill, bridges as well).
+        if (np != nullptr) {
+            handle_extrusion_collection(region, surface, region->fills, {});
+            handle_extrusion_collection(region, surface, region->perimeters, {});
+        } else {
+            handle_extrusion_collection(region, surface, region->fills, {erTopSolidInfill, erIroning, erPerimeter, erExternalPerimeter, erMixed});
+            handle_extrusion_collection(region, surface, region->perimeters, {erPerimeter, erExternalPerimeter, erMixed});
+        }
     }
 }
 } // namespace Slic3r

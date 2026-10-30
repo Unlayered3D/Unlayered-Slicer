@@ -1,17 +1,51 @@
+#include <algorithm>
 #include <catch2/catch_all.hpp>
 
+#include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
+#include <catch2/catch_message.hpp>
+#include <catch2/matchers/catch_matchers.hpp>
+#include <catch2/matchers/catch_matchers_floating_point.hpp>
+#include "libslic3r/ClipperUtils.hpp"
 #include "libslic3r/GCodeReader.hpp"
-#include "libslic3r/Config.hpp"
+#include "libslic3r/Layer.hpp"
 #include "libslic3r/Geometry.hpp"
 #include "libslic3r/Geometry/ConvexHull.hpp"
-#include "libslic3r/Layer.hpp"
 
 #include <boost/algorithm/string.hpp>
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
+#include <cstddef>
+#include "libslic3r/Polygon.hpp"
+#include "libslic3r/Point.hpp"
+#include "libslic3r/Polyline.hpp"
+#include <string>
+#include "libslic3r/Model.hpp"
+#include <vector>
+#include "libslic3r/PrintConfig.hpp"
+#include "libslic3r/libslic3r.h"
+#include <string_view>
+#include <limits>
+#include <map>
+#include <set>
+#include <sstream>
+#include <boost/algorithm/string/predicate.hpp>
+#include <initializer_list>
+#include <utility>
 
 #include "test_helpers.hpp" // get access to init_print, etc
+#include "libslic3r/BoundingBox.hpp"
+#include "libslic3r/BrimEarsPoint.hpp"
+#include "libslic3r/ExPolygon.hpp"
+#include "libslic3r/ExtrusionEntityCollection.hpp"
+#include "libslic3r/ObjectID.hpp"
+#include "libslic3r/Print.hpp"
+#include "libslic3r/BeltBrim.hpp"
+#include "libslic3r/Config.hpp"
+#include "libslic3r/ExtrusionEntity.hpp"
+#include "libslic3r/TriangleMesh.hpp"
 
 using namespace Slic3r::Test;
 using namespace Slic3r;
@@ -177,6 +211,36 @@ TEST_CASE("Object brims are generated per instance", "[SkirtBrim]")
         REQUIRE(brim.instances.size() == 1);
         REQUIRE(brim.instances.front().object_id == print.get_object(0)->id());
     }
+}
+
+TEST_CASE("Brim groups the parts of an object by contact", "[SkirtBrim]")
+{
+    // 10 mm cubes along X as the parts of one object: A and B overlap, C and D touch, and E stands 0.5 mm clear of D.
+    const std::vector<double> part_x{ 0., 8., 30., 40., 50.5 };
+    DynamicPrintConfig config = DynamicPrintConfig::full_print_config();
+    config.set_deserialize_strict({ { "skirt_loops", 0 }, { "brim_type", "outer_only" }, { "brim_width", 3 }, { "layer_height", 0.2 } });
+    Print print;
+    Model model;
+    init_print({ cube(10) }, print, model, config, nullptr, false);
+    for (size_t i = 1; i < part_x.size(); ++ i) {
+        TriangleMesh part = cube(10);
+        part.translate(float(part_x[i]), 0.f, 0.f);
+        model.objects.front()->add_volume(std::move(part), ModelVolumeType::MODEL_PART, false);
+    }
+    print.apply(model, config);
+    print.process();
+
+    const PrintObject &object = *print.objects().front();
+    std::set<std::set<size_t>> groups;
+    for (const groupedVolumeSlices &group : object.firstLayerObjGroups()) {
+        std::set<size_t> parts;
+        for (const ObjectID &volume_id : group.volume_ids)
+            for (size_t i = 0; i < object.model_object()->volumes.size(); ++ i)
+                if (object.model_object()->volumes[i]->id() == volume_id)
+                    parts.insert(i);
+        groups.insert(parts);
+    }
+    CHECK(groups == std::set<std::set<size_t>>{ { 0, 1 }, { 2, 3 }, { 4 } });
 }
 
 TEST_CASE("Uncombined neighboring brims precede their respective objects", "[SkirtBrim]")

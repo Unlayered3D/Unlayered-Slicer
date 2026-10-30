@@ -5,17 +5,27 @@
 
 #include "../libslic3r.h"
 
+#include <cstdint>
+#include <cstddef>
+#include <algorithm>
 #include <functional>
 #include <map>
+#include <tuple>
+#include <set>
+#include <unordered_map>
+#include <string>
 #include <utility>
 
 #include <boost/container/small_vector.hpp>
-#include "../FilamentGroup.hpp"
+#include <vector>
 #include "../FilamentMixer.hpp"
 #include "../MultiNozzleUtils.hpp"
-#include "../ExtrusionEntity.hpp"
 #include "../ObjectID.hpp"
 #include "../PrintConfig.hpp"
+
+namespace Slic3r { class ExtrusionEntity; }
+namespace Slic3r { class ExtrusionEntityCollection; }
+namespace Slic3r { enum ExtrusionRole : uint8_t; }
 
 namespace Slic3r {
 
@@ -363,6 +373,7 @@ public:
                                                   std::vector<int> & initial_filaments);
 
     bool                has_non_support_filament(const PrintConfig &config);
+    bool                is_last_extrusion_layer(coordf_t print_z, unsigned int extruder_id) const;
 
 private:
     void				initialize_layers(std::vector<coordf_t> &zs);
@@ -406,6 +417,8 @@ private:
     // which keeps every legacy per-object code path bit-identical (loops over an empty map are
     // no-ops; downstream emission falls through to the per-object branch).
     std::map<unsigned int, std::map<LayerTools::MixedSubLayerGroup::VolumeKey, std::vector<size_t>>> m_gradient_volume_layers;
+    // Map: extruder_id -> print_z (z coordinate) of the last layer it is used on
+    std::map<unsigned int, coordf_t> m_last_layer_per_extruder;
     const PrintObject*         m_print_object_ptr = nullptr;
     Print*                     m_print;
     bool                       m_sorted = false;
@@ -423,6 +436,11 @@ private:
 
     int                        most_used_extruder;
 };
+
+// Parse the user defined cyclic toolchange sequence ("3,2 , 1 , 4") into 0-based filament indices.
+// Out-of-range entries, duplicates and non-numeric tokens are dropped, so a partially valid string
+// still orders the filaments it does name. Exposed for unit testing.
+std::vector<unsigned int> parse_cyclic_order(const std::string& str, unsigned int number_of_extruders);
 
 } // namespace SLic3r
 
