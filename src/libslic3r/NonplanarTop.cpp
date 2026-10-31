@@ -77,7 +77,6 @@ struct Params
     double flow_max   = kMaxFlow;
     double tip_r      = 0.5;  // radius of the nozzle's flat tip face, mm
     bool   hold_back  = false; // nonplanar_hold_back: islands next to a top print after its shell
-    bool   top_tip_lift = false; // nonplanar_top_surface_tip_lift: top surface lines raised like ironing
 };
 
 struct Cell
@@ -524,11 +523,9 @@ static NonplanarTopStats np_build(PrintObject &object, const sla::IndexedMesh &m
     P.max_angle  = nonplanar_effective_max_angle(rc, pc);
     P.max_height = rc.nonplanar_max_height.value;
     P.hold_back  = rc.nonplanar_hold_back.value;
-    P.top_tip_lift = object.config().nonplanar_top_surface_tip_lift.value;
-    // A nozzle's flat tip is about 2.5 orifice diameters across, unless the printer says otherwise.
-    if (object.config().nonplanar_nozzle_tip_diameter.value > EPSILON)
-        P.tip_r = 0.5 * object.config().nonplanar_nozzle_tip_diameter.value;
-    else if (! pc.nozzle_diameter.values.empty())
+    // A nozzle's flat tip is about 2.5 orifice diameters across. (nonplanar_nozzle_tip_diameter and
+    // nonplanar_top_surface_tip_lift are kept as options so presets that carry them still load; they do nothing.)
+    if (! pc.nozzle_diameter.values.empty())
         P.tip_r = 1.25 * pc.nozzle_diameter.values.front();
     if (! pc.max_layer_height.values.empty() && pc.max_layer_height.values.front() > EPSILON)
         P.flow_max = std::max(1., std::min(kMaxFlow, pc.max_layer_height.values.front() / P.h));
@@ -1973,14 +1970,12 @@ static NonplanarTopStats np_build(PrintObject &object, const sla::IndexedMesh &m
                 // Spikes (audit P0: an outline sample hit a higher part of the same top, 0.33-0.40 mm over 0.1 mm): a sample
                 // is checked against the top's own cells around it and against its neighbours on the path, and an outlier
                 // is re-interpolated from the good samples either side.
-                std::vector<float> slope_at(xy.size(), 0.f); // slope of the nearest cell of this top, degrees
                 {
                     const double tmax = std::tan(P.max_angle * M_PI / 180.);
                     std::vector<char> bad(xy.size(), 0);
                     for (size_t i = 0; i < xy.size(); ++ i) {
                         const int ci = int(std::lround((xy[i].x() - G.x0) / G.g)), cj = int(std::lround((xy[i].y() - G.y0) / G.g));
                         double best_d = 1e30, ref = 0.;
-                        float  ref_slope = 0.f;
                         for (int dj = -2; dj <= 2; ++ dj)
                             for (int di = -2; di <= 2; ++ di) {
                                 const int qa = ci + di, qb = cj + dj;
@@ -1989,10 +1984,9 @@ static NonplanarTopStats np_build(PrintObject &object, const sla::IndexedMesh &m
                                     const Cell &q = G.cells[v];
                                     if (! q.ok || (q.patch != pid && cov_of[size_t(v)] != pid)) continue;
                                     const double d = std::hypot(G.cx(qa) - xy[i].x(), G.cy(qb) - xy[i].y());
-                                    if (d < best_d) { best_d = d; ref = q.s; ref_slope = q.slope; }
+                                    if (d < best_d) { best_d = d; ref = q.s; }
                                 }
                             }
-                        slope_at[i] = ref_slope;
                         if (best_d < 1e29 && std::abs(z[i] - ref) > 0.5 * P.h + tmax * best_d)
                             bad[i] = 1;
                         // Past the top's edge the surface falls away more steeply than the top; a sample there stays
@@ -2026,15 +2020,6 @@ static NonplanarTopStats np_build(PrintObject &object, const sla::IndexedMesh &m
                 // Steps (audit: Benchy 98 segments at 50-60 deg, +-0.11-0.15 mm over 0.09 mm, where an outline sample reads
                 // another part of the surface): no segment may be steeper than the max angle + 3 deg. Only ever raised (the
                 // upper envelope), so a step is bridged a little above the surface instead of dipping into material.
-                // Ironing: the flat tip face (radius tip_r) on a slope touches the surface with its uphill rim, which lies
-                // tip_r * tan(slope) above the point under the nozzle's centre. Raise the centre by that much so the rim
-                // skims the surface instead of gouging it. Depends on the slope's magnitude only, never on the travel
-                // direction (patent constraint: no Z offset is ever conditioned on the sign of a slope).
-                // One switch for both, off by default: nonplanar_top_surface_tip_lift lifts the top surface lines
-                // and the curved ironing.
-                if (P.top_tip_lift && (job.role == erIroning || job.role == erTopSolidInfill))
-                    for (size_t i = 0; i < xy.size(); ++ i)
-                        z[i] += P.tip_r * std::tan(std::min(double(slope_at[i]), 60.) * M_PI / 180.);
                 upper_envelope(xy, z, tlim_env);
                 for (double &v : z)
                     v -= depth;

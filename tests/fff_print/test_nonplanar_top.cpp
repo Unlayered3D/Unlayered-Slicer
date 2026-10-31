@@ -835,8 +835,8 @@ TEST_CASE("Nonplanar layers: ironing follows the curved top", "[NonplanarTop]")
 {
     const HeightFn wedge = [](double x, double) { return 6. + (x + 12.5) * kTan8; };
     DynamicPrintConfig cfg = base_config(true);
-    cfg.set_deserialize_strict({ { "ironing_type", "top" }, { "nonplanar_nozzle_tip_diameter", 1. } });
-    // nonplanar_top_surface_tip_lift is off by default: the ironing follows the surface whatever the nozzle tip.
+    cfg.set_deserialize_strict({ { "ironing_type", "top" } });
+    // Curved ironing follows the surface (no tip lift).
     const double lift = 0.;
     Sliced s, s_off;
     slice(s, heightfield_block(12.5, 10., 25, 4, wedge), cfg);
@@ -866,40 +866,6 @@ TEST_CASE("Nonplanar layers: ironing follows the curved top", "[NonplanarTop]")
     visit_paths(*s_off.print.objects().front(), [&](const ExtrusionPath &p, const Layer &) { off_ironing += p.role() == erIroning; });
     CHECK(off_ironing == 0);
     CHECK(max_extrusion_z(s.gcode) < wedge(12.5, 0.) + lift + 0.05);
-}
-
-TEST_CASE("Nonplanar layers: the top surface takes the tip lift only when asked", "[NonplanarTop]")
-{
-    const HeightFn wedge = [](double x, double) { return 6. + (x + 12.5) * kTan8; };
-    const double   lift  = 0.5 * kTan8; // 1.0 mm tip on 8 deg
-    // Mean height of the curved top surface lines over the surface under them.
-    auto mean_over_surface = [&](bool tip_lift) {
-        DynamicPrintConfig cfg = base_config(true);
-        cfg.set_deserialize_strict({ { "nonplanar_nozzle_tip_diameter", 1. }, { "nonplanar_top_surface_tip_lift", tip_lift ? 1 : 0 } });
-        Sliced s;
-        slice(s, heightfield_block(12.5, 10., 25, 4, wedge), cfg);
-        const PrintObject &obj = *s.print.objects().front();
-        BoundingBox bb;
-        for (const ExPolygon &ex : obj.layers().front()->lslices) bb.merge(get_extents(ex.contour));
-        const Vec2d c = unscale(bb.center());
-        double sum = 0.;
-        size_t n   = 0;
-        visit_paths(obj, [&](const ExtrusionPath &p, const Layer &layer) {
-            if (p.role() != erTopSolidInfill || ! p.nonplanar_shell) return;
-            for (const Point3 &pt : p.polyline.points) {
-                const double x = unscale<double>(pt.x()) - c.x(), y = unscale<double>(pt.y()) - c.y();
-                if (std::abs(x) > 10.) continue; // away from the ends, where the clearance ramp shapes the edge
-                sum += layer.print_z + unscale<double>(pt.z()) - wedge(x, y);
-                ++ n;
-            }
-        });
-        REQUIRE(n > 50);
-        return sum / double(n);
-    };
-    const double off = mean_over_surface(false), on = mean_over_surface(true);
-    INFO("mean height over the surface: off " << off << ", on " << on << ", expected lift " << lift);
-    CHECK(std::abs(off) < 0.02);
-    CHECK(std::abs(on - off - lift) < 0.01);
 }
 
 // ---- single top surface, uniform offset (requirement: "all the printing before that must be the same as if

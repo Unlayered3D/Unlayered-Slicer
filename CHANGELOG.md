@@ -17,10 +17,7 @@ All notable changes to Unlayered Slicer are listed here, newest first.
   printed in height bands, and thin tops such as a rim, so a Benchy's roof, deck and rim can curve.
   Curved paths never step, and options left off still slice exactly as before. New option *Print
   features on curved tops afterwards*: a feature standing on a curved top (a chimney on a roof) prints
-  flat on top of the curved layers, so the curved top runs under it. New option *Raise curved top
-  surface and ironing on slopes* (off by default) lifts the top surface lines and the ironing by how
-  far the nozzle's flat tip reaches uphill; set *Nozzle tip diameter* if your nozzle's tip differs from
-  2.5 × the nozzle size.
+  flat on top of the curved layers, so the curved top runs under it.
 - **Nonplanar layers with Z contouring:** the flat layers under a curved top are Z-contoured down onto
   the curved layers' underside, like a top surface, so they meet it instead of ending in a staircase.
 - **Home page:** every recent project shows its Show in folder and remove buttons.

@@ -3185,8 +3185,6 @@ void TabPrint::build()
         optgroup->append_single_option_line("nonplanar_max_height");
         optgroup->append_single_option_line("nonplanar_layer_count");
         optgroup->append_single_option_line("nonplanar_hold_back");
-        optgroup->append_single_option_line("nonplanar_nozzle_tip_diameter");
-        optgroup->append_single_option_line("nonplanar_top_surface_tip_lift");
         optgroup->append_single_option_line("nonplanar_top_surface_direction_enable");
         optgroup->append_single_option_line("nonplanar_top_surface_direction");
         optgroup->append_single_option_line("nonplanar_top_surface_flow_ratio_enable");
