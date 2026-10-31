@@ -8,9 +8,9 @@
 <link rel="stylesheet" type="text/css" href="../css/common.css" />
 <link rel="stylesheet" type="text/css" href="../css/dark.css" />
 <link rel="stylesheet" type="text/css" href="4unlayered.css" />
-<script type="text/javascript" src="../js/jquery-2.1.1.min.js"></script>
+<script type="text/javascript" src="../../include/jquery-3.6.0.min.js"></script>
 <script type="text/javascript" src="../js/json2.js"></script>
-<script type="text/javascript" src="../../data/text.js"></script>
+<script type="text/javascript" src="../../include/i18n.js"></script>
 <script type="text/javascript" src="../js/globalapi.js"></script>
 <script type="text/javascript" src="../js/common.js"></script>
 <script type="text/javascript" src="4unlayered.js"></script>
@@ -26,31 +26,31 @@
      Since 2026-10-21 the plug-in box is ticked when OrcaSlicer or Bambu Studio has Bambu Lab printers
      in its printer list (WebGuideDialog "request_network_plugin_hint"), with a line saying so.
      GUI_App::run_wizard
-     starts the plug-in download when the wizard closes with the box ticked. Text without a tid is
-     shown as written (no translation entry yet).
+     starts the plug-in download when the wizard closes with the box ticked. The strings are in
+     WebGuideDialog.cpp, guide_strings(); the hint line comes translated from the slicer.
      Settings from other slicers are no longer offered here (0.1.7): they have their own step before
      the printer picker (guide 5import). -->
 <body onLoad="OnInit()">
 <div id="Title">
-	<div>Bambu Lab printers</div>
+	<div data-i18n="bambu_printers">Bambu Lab printers</div>
 </div>
 <div id="Content">
 
 	<div class="Section">
-		<div class="SectionTitle">Bambu Lab printers</div>
+		<div class="SectionTitle" data-i18n="bambu_printers">Bambu Lab printers</div>
 		<div class="FeatureText">
-			<div><a class="TextS1">The Bambu Lab network plug-in is required for wireless communication with Bambu Lab 3D printers: sending prints over Wi-Fi or LAN and seeing the printer's status and camera.</a></div>
-			<div><a class="TextS2">It is made by Bambu Lab, not Unlayered, and is downloaded when you press Finish. Using a Bambu Lab printer? Tick the box - you can also install it later from Preferences.</a></div>
+			<div><a class="TextS1" data-i18n="bambu_plugin_desc">The Bambu Lab network plug-in is required for wireless communication with Bambu Lab 3D printers: sending prints over Wi-Fi or LAN and seeing the printer's status and camera.</a></div>
+			<div><a class="TextS2" data-i18n="bambu_plugin_note">It is made by Bambu Lab, not Unlayered, and is downloaded when you press Finish. Using a Bambu Lab printer? Tick the box - you can also install it later from Preferences.</a></div>
 		</div>
-		<label class="CheckArea"><input id="InstallCheck" onClick="SendInstallPluginCheck()" type="checkbox"><a class="TextS1">Install the Bambu Lab network plug-in.</a></label>
+		<label class="CheckArea"><input id="InstallCheck" onClick="SendInstallPluginCheck()" type="checkbox"><a class="TextS1" data-i18n="install_bambu_lab_plugin">Install the Bambu Lab network plug-in.</a></label>
 		<div id="PluginHint" class="FeatureText" hidden><a class="TextS2" id="PluginHintText"></a></div>
 	</div>
 
-	<div id="RestartText" tid="t70" class="trans" ></div>
+	<div id="RestartText"></div>
 </div>
 <div id="AcceptArea">
-	<div class="ButtonStyleRegular ButtonTypeChoice trans" tid="t8" id="PreBtn"  onclick="window.history.back()">Back</div>
-	<div class="ButtonStyleConfirm ButtonTypeChoice trans" tid="t25" id="FinishBtn"  onclick="FinishGuide()">Finish</div>
+	<div class="ButtonStyleRegular ButtonTypeChoice" id="PreBtn" onclick="window.history.back()" data-i18n="back">Back</div>
+	<div class="ButtonStyleConfirm ButtonTypeChoice" id="FinishBtn" onclick="FinishGuide()" data-i18n="finish">Finish</div>
 </div>
 </body>
 </html>

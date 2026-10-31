@@ -8,35 +8,35 @@
 <link rel="stylesheet" type="text/css" href="../css/common.css" />
 <link rel="stylesheet" type="text/css" href="../css/dark.css" />
 <link rel="stylesheet" type="text/css" href="25.css" />
-<script type="text/javascript" src="../js/jquery-2.1.1.min.js"></script>
+<script type="text/javascript" src="../../include/jquery-3.6.0.min.js"></script>
 <script type="text/javascript" src="../js/json2.js"></script>
-<script type="text/javascript" src="../../data/text.js"></script>
+<script type="text/javascript" src="../../include/i18n.js"></script>
 <script type="text/javascript" src="../js/globalapi.js"></script>
 <script type="text/javascript" src="../js/common.js"></script>
 <script type="text/javascript" src="25.js"></script>
 </head>
 <body onLoad="OnInit()">
 <div id="Title">
-	<div class="trans" tid="orca13">Printing in several directions</div>
+	<div data-i18n="multiplanar_title">Printing in several directions</div>
 </div>
 <div id="Content">
 
 	<div id="FeatureText">
-		<div><a tid="orca14" class="trans TextS1">This slicer can cut a model into sections and print each one along its own build
+		<div><a class="TextS1" data-i18n="multiplanar_desc">This slicer can cut a model into sections and print each one along its own build
 			direction, so overhangs and layer lines no longer have to follow a single flat stack. It works
 			differently from ordinary slicing, and the walkthrough is short.</a></div>
 		<br/>
-		<div><a tid="orca15" class="trans TextS2">You can open it again at any time from Help &gt; Multiplanar Tutorial.</a></div>
+		<div><a class="TextS2" data-i18n="multiplanar_reopen">You can open it again at any time from Help &gt; Multiplanar Tutorial.</a></div>
 	</div>
 
 	<div id="TutorialArea">
-		<div class="ButtonStyleConfirm ButtonTypeWindow trans" tid="orca16" onclick="OpenTutorial()">Open the tutorial</div>
+		<div class="ButtonStyleConfirm ButtonTypeWindow" onclick="OpenTutorial()" data-i18n="open_tutorial">Open the tutorial</div>
 	</div>
 
 </div>
 <div id="AcceptArea">
-	<div class="ButtonStyleRegular ButtonTypeChoice trans" tid="t8" id="PreBtn" onclick="ReturnFilamentPage()">Back</div>
-	<div class="ButtonStyleConfirm ButtonTypeChoice trans" tid="t9" id="AcceptBtn" onclick="NextPage()">Next</div>
+	<div class="ButtonStyleRegular ButtonTypeChoice" id="PreBtn" onclick="ReturnFilamentPage()" data-i18n="back">Back</div>
+	<div class="ButtonStyleConfirm ButtonTypeChoice" id="AcceptBtn" onclick="NextPage()" data-i18n="next">Next</div>
 </div>
 </body>
 </html>

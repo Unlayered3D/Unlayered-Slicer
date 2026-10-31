@@ -4663,7 +4663,7 @@ static std::string handoff_state_token()
     size_t seed = plate_fingerprint();
     auto   mix  = [&seed](size_t v) { seed ^= v + 0x9e3779b97f4a7c15ull + (seed << 6) + (seed >> 2); };
     auto   mix_s = [&mix](const std::string& s) { mix(std::hash<std::string>{}(s)); };
-    auto   mix_cfg = [&mix, &mix_s](const ConfigBase& cfg) {
+    auto   mix_cfg = [&mix_s](const ConfigBase& cfg) {
         for (const std::string& key : cfg.keys()) {
             mix_s(key);
             mix_s(cfg.opt_serialize(key));

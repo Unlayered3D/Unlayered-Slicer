@@ -13,11 +13,11 @@ namespace Slic3r {
 // the gcode_remap_* axis remap.  Maps Cartesian (axis-permuted) G-code
 // coordinates into the printer's physical machine frame.
 //
-// Derived from the machine's physical tilt (belt_slice_rotation axis +
-// belt_frame_tilt_angle): a shear coupling the height axis to the belt-feed
-// axis (factor cot a) plus a 1/sin a scale on the gantry-height axis. The
-// print's slicing angle (belt_slice_rotation_angle, a process option) plays no
-// part here.
+// Derived entirely from the single belt tilt (belt_slice_rotation axis +
+// belt_slice_rotation_angle): a shear coupling the height axis to the belt-feed
+// axis (factor cot a) plus a 1/sin a scale on the gantry-height axis.  The expert
+// belt_frame_tilt_decouple flag lets the machine-frame angle differ from the
+// pre-slice rotation angle via belt_frame_tilt_angle.
 class MachineFrameTransform
 {
 public:

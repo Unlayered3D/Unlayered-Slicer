@@ -157,7 +157,7 @@ ModelVolume* add_mesh_as_volume(Model& model, int obj_idx, TriangleMesh&& mesh, 
 InvokeResult finish_added_volume(Model& model, int obj_idx, ModelVolume* v)
 {
     ModelObject& object = *model.objects[obj_idx];
-    if (v->is_model_part() && object.instances.front()->auto_drop)
+    if (v->is_model_part() && object.auto_drop)
         object.ensure_on_bed();
     parts::refresh_object_after_volume_change(obj_idx, v);
     const int vol_idx = parts::volume_index_in(object, v);
@@ -472,7 +472,7 @@ InvokeResult run_part_set_transform(InvokeContext& ctx)
     Plater::SuppressSnapshots suppress(ctx.plater());
     volume.set_transformation(Geometry::Transformation(inst.inverse() * world.get_matrix()));
     object.invalidate_bounding_box();
-    if (object.instances.front()->auto_drop && volume.is_model_part())
+    if (object.auto_drop && volume.is_model_part())
         object.ensure_on_bed();
     if (ObjectList* list = parts::object_list())
         list->notify_instance_updated(obj_idx);

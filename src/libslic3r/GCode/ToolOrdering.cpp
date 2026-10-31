@@ -1,4 +1,9 @@
+#include "libslic3r/Exception.hpp"
+#include "libslic3r/CustomGCode.hpp"
+#include "libslic3r/Config.hpp"
 #include "ExtrusionEntity.hpp"
+#include "libslic3r/ObjectID.hpp"
+#include "libslic3r/FilamentGroup.hpp"
 #include "Print.hpp"
 #include "ToolOrdering.hpp"
 #include "Layer.hpp"
@@ -9,10 +14,23 @@
 #include "MultiNozzleUtils.hpp"
 #include "FilamentMixer.hpp"
 #include "LocalesUtils.hpp"
+#include "libslic3r/PrintConfig.hpp"
 #include "Utils.hpp"
+#include "format.hpp"
 #include "I18N.hpp"
 
 #include <boost/log/trivial.hpp>
+#include <vector>
+#include <string>
+#include <utility>
+#include <cmath>
+#include <cstdlib>
+#include <optional>
+#include <functional>
+#include <exception>
+#include <memory>
+#include <tuple>
+#include <iostream>
 
 // #define SLIC3R_DEBUG
 
@@ -34,6 +52,11 @@
 #include <unordered_map>
 
 #include <libslic3r.h>
+#include "libslic3r/ExPolygon.hpp"
+#include "libslic3r/ExtrusionEntityCollection.hpp"
+#include "libslic3r/Model.hpp"
+#include "libslic3r/Polygon.hpp"
+#include "libslic3r/SurfaceCollection.hpp"
 
 namespace Slic3r {
 
@@ -82,8 +105,9 @@ bool check_filament_printable_after_group(const std::vector<unsigned int> &used_
         int printable_status = print_config->filament_printable.get_at(filament_id);
         int extruder_idx = filament_maps[filament_id];
         if (!(printable_status >> extruder_idx & 1)) {
-            std::string extruder_name = extruder_idx == 0 ? _L("left") : _L("right");
-            std::string error_msg     = _L("Grouping error: ") + filament_type + _L(" can not be placed in the ") + extruder_name + _L(" nozzle");
+            std::string error_msg = extruder_idx == 0 ?
+                                        Slic3r::format(_L("Grouping error: %1% cannot be placed in the left nozzle"), filament_type) :
+                                        Slic3r::format(_L("Grouping error: %1% cannot be placed in the right nozzle"), filament_type);
             throw Slic3r::RuntimeError(error_msg);
         }
     }
@@ -115,6 +139,29 @@ unsigned int LayerTools::internal_solid_filament_id(const PrintRegion &region) c
 	return resolve_mixed(result);
 }
 
+// 1 based filament of an island's extrusions; the tool ordering and the G-code export must agree on it.
+static unsigned int region_filament(const ExtrusionEntityCollection &extrusions, const PrintRegionConfig &config)
+{
+    if (extrusions.has_infill()) {
+        if (!extrusions.has_solid_infill())
+            return config.sparse_infill_filament_id.value;
+        // Orca: Gap fill takes the filament of the surface it fills.
+        ExtrusionRole role = erNone;
+        for (const ExtrusionEntity *ee : extrusions.entities)
+            if (const ExtrusionRole er = ee->role(); er != erGapFill)
+                role = (role == erNone || role == er) ? er : erMixed;
+        if (role == erTopSolidInfill || role == erIroning)
+            return config.top_surface_filament_id.value;
+        if (role == erBottomSurface)
+            return config.bottom_surface_filament_id.value;
+        return config.internal_solid_filament_id.value;
+    }
+    // Walls, and the gap fill between them.
+    const ExtrusionEntitiesPtr &walls = extrusions.entities;
+    return !walls.empty() && std::all_of(walls.begin(), walls.end(), [](const ExtrusionEntity *ee) { return is_inner_wall(*ee); }) ?
+        config.inner_wall_filament_id.value : config.outer_wall_filament_id.value;
+}
+
 // Returns a zero based extruder this eec should be printed with, according to PrintRegion config or extruder_override if overriden.
 unsigned int LayerTools::extruder(const ExtrusionEntityCollection &extrusions, const PrintRegion &region) const
 {
@@ -124,30 +171,7 @@ unsigned int LayerTools::extruder(const ExtrusionEntityCollection &extrusions, c
 	assert(region.config().top_surface_filament_id.value > 0);
 	assert(region.config().bottom_surface_filament_id.value > 0);
 	// 1 based extruder ID.
-    unsigned int extruder = 1;
-    if (this->extruder_override == 0) {
-        if (extrusions.has_infill()) {
-            if (extrusions.has_solid_infill()) {
-                ExtrusionRole role = extrusions.role();
-                if (role == erTopSolidInfill || role == erIroning)
-                    extruder = region.config().top_surface_filament_id;
-                else if (role == erBottomSurface)
-                    extruder = region.config().bottom_surface_filament_id;
-                else
-                    extruder = region.config().internal_solid_filament_id;
-            } else {
-                extruder = region.config().sparse_infill_filament_id;
-            }
-        } else {
-            const ExtrusionRole role = extrusions.role();
-            if (role == erPerimeter)
-                extruder = region.config().inner_wall_filament_id.value;
-            else
-                extruder = region.config().outer_wall_filament_id.value;
-        }
-    } else
-        extruder = this->extruder_override;
-
+    const unsigned int extruder = this->extruder_override == 0 ? region_filament(extrusions, region.config()) : this->extruder_override;
     unsigned int result = (extruder == 0) ? 0 : extruder - 1;
     return resolve_mixed(result);
 }
@@ -895,7 +919,12 @@ void ToolOrdering::collect_extruders(const PrintObject &object, const std::vecto
 
                 if (something_nonoverriddable){
                		layer_tools.extruders.emplace_back((extruder_override == 0) ? region.config().outer_wall_filament_id.value : extruder_override);
-                    if (extruder_override == 0 && region.config().wall_loops.value > 1)
+                    const ExtrusionEntitiesPtr &islands = layerm->perimeters.entities;
+                    const bool has_inner_wall = std::any_of(islands.begin(), islands.end(), [](const ExtrusionEntity *island) {
+                        const ExtrusionEntitiesPtr &walls = static_cast<const ExtrusionEntityCollection*>(island)->entities;
+                        return std::any_of(walls.begin(), walls.end(), [](const ExtrusionEntity *ee) { return is_inner_wall(*ee); });
+                    });
+                    if (extruder_override == 0 && region.config().wall_loops.value > 1 && has_inner_wall)
                         layer_tools.extruders.emplace_back(region.config().inner_wall_filament_id.value);
                     if (layerCount == 0) {
                         firstLayerExtruders.emplace_back((extruder_override == 0) ? region.config().outer_wall_filament_id.value : extruder_override);
@@ -905,23 +934,13 @@ void ToolOrdering::collect_extruders(const PrintObject &object, const std::vecto
                 layer_tools.has_object = true;
             }
 
-            bool has_infill             = false;
-            bool has_internal_solid     = false;
-            bool has_top_solid_surface  = false;
-            bool has_bottom_surface     = false;
+            std::vector<unsigned int> fill_filaments;
             bool something_nonoverriddable = false;
             for (const ExtrusionEntity *ee : layerm->fills.entities) {
                 // fill represents infill extrusions of a single island.
                 const auto *fill = dynamic_cast<const ExtrusionEntityCollection*>(ee);
-                ExtrusionRole role = fill->entities.empty() ? erNone : fill->entities.front()->role();
-                if (role == erTopSolidInfill || role == erIroning)
-                    has_top_solid_surface = true;
-                else if (role == erBottomSurface)
-                    has_bottom_surface = true;
-                else if (is_solid_infill(role))
-                    has_internal_solid = true;
-                else if (role != erNone)
-                    has_infill = true;
+                if (! fill->entities.empty())
+                    fill_filaments.emplace_back(region_filament(*fill, region.config()));
 
                 if (m_print_config_ptr) {
                     if (! layer_tools.wiping_extrusions().is_overriddable_and_mark(*fill, *m_print_config_ptr, object, region))
@@ -930,19 +949,12 @@ void ToolOrdering::collect_extruders(const PrintObject &object, const std::vecto
             }
 
             if (something_nonoverriddable || !m_print_config_ptr) {
-            	if (extruder_override == 0) {
-                    if (has_internal_solid)
-                        layer_tools.extruders.emplace_back(region.config().internal_solid_filament_id);
-                    if (has_top_solid_surface)
-                        layer_tools.extruders.emplace_back(region.config().top_surface_filament_id);
-                    if (has_bottom_surface)
-                        layer_tools.extruders.emplace_back(region.config().bottom_surface_filament_id);
-	                if (has_infill)
-	                    layer_tools.extruders.emplace_back(region.config().sparse_infill_filament_id);
-                } else if (has_internal_solid || has_top_solid_surface || has_bottom_surface || has_infill)
+            	if (extruder_override == 0)
+                    append(layer_tools.extruders, fill_filaments);
+                else if (! fill_filaments.empty())
             		layer_tools.extruders.emplace_back(extruder_override);
             }
-            if (has_internal_solid || has_top_solid_surface || has_bottom_surface || has_infill)
+            if (! fill_filaments.empty())
                 layer_tools.has_object = true;
         }
 
@@ -1292,6 +1304,13 @@ void ToolOrdering::collect_extruder_statistics(bool prime_multi_material)
         sort_remove_duplicates(m_all_printing_extruders);
     }
 
+    m_last_layer_per_extruder.clear();
+    for (const LayerTools& lt : m_layer_tools) {
+        for (unsigned int ext : lt.extruders) {
+            m_last_layer_per_extruder[ext] = lt.print_z;
+        }
+    }
+
     if (prime_multi_material && ! m_all_printing_extruders.empty()) {
         // Reorder m_all_printing_extruders in the sequence they will be primed, the last one will be m_first_printing_extruder.
         // Then set m_first_printing_extruder to the 1st extruder primed.
@@ -1334,15 +1353,21 @@ void ToolOrdering::cal_most_used_extruder(const PrintConfig &config)
 
 float ToolOrdering::cal_max_additional_fan(const PrintConfig &config)
 {
-    // record
+    std::set<unsigned int> used_filaments;
+    for (const LayerTools &layer_tools : m_layer_tools)
+        used_filaments.insert(layer_tools.extruders.begin(), layer_tools.extruders.end());
+    if (used_filaments.empty())
+        return 0;
+
+    // Orca: additional_cooling_fan_speed can hold one value per extruder variant a filament prints with;
+    // filament_self_index maps such a column to its filament.
+    const std::vector<int> &self_index = config.filament_self_index.values;
+    const size_t columns = std::max(config.additional_cooling_fan_speed.size(), size_t(*used_filaments.rbegin()) + 1);
     float max_fan = 0;
-    for (LayerTools &layer_tools : m_layer_tools) {
-        std::vector<unsigned int> filaments = layer_tools.extruders;
-        std::set<int>             layer_extruder_count;
-        // count once only
-        for (unsigned int &filament : filaments)
-            if (max_fan < config.additional_cooling_fan_speed.get_at(filament))
-                max_fan = config.additional_cooling_fan_speed.get_at(filament);
+    for (size_t column = 0; column < columns; ++column) {
+        const unsigned int filament_id = self_index.size() == columns ? self_index[column] - 1 : column;
+        if (used_filaments.count(filament_id) && max_fan < config.additional_cooling_fan_speed.get_at(column))
+            max_fan = config.additional_cooling_fan_speed.get_at(column);
     }
     return max_fan;
 }
@@ -1558,7 +1583,6 @@ static FilamentGroupContext build_filament_group_context(
     FilamentMapMode                                  mode,
     const std::unordered_map<int, int>&              nozzle_status)
 {
-    using namespace MultiNozzleUtils;
     using namespace FilamentGroupUtils;
 
     FilamentGroupContext context;
@@ -1594,10 +1618,10 @@ static FilamentGroupContext build_filament_group_context(
 
     auto machine_filament_info = build_machine_filaments(print->get_extruder_filament_info(), extruder_ams_counts, ignore_ext_filament);
 
-    std::vector<std::string>   filament_types      = print_config.filament_type.values;
-    std::vector<std::string>   filament_colours    = print_config.filament_colour.values;
-    std::vector<unsigned char> filament_is_support = print_config.filament_is_support.values;
-    std::vector<std::string>   filament_ids        = print_config.filament_ids.values;
+    // The grouping code walks filament_ids and indexes filament_info by the same position.
+    std::vector<std::string> filament_ids = print_config.filament_ids.values;
+    if (filament_ids.size() > filament_nums)
+        filament_ids.resize(filament_nums);
 
     FGMode fg_mode = mode == FilamentMapMode::fmmAutoForMatch ? FGMode::MatchMode : FGMode::FlushMode;
     context.model_info.flush_matrix          = std::move(nozzle_flush_mtx);
@@ -1606,11 +1630,14 @@ static FilamentGroupContext build_filament_group_context(
     context.model_info.filament_ids          = filament_ids;
     context.model_info.unprintable_volumes   = unprintable_volumes;
 
-    for (size_t idx = 0; idx < filament_types.size(); ++idx) {
+    // Consumers index filament_info by filament id, so it must span the filament count: a partial
+    // or legacy config can leave any of these arrays short, and get_at clamps.
+    context.model_info.filament_info.reserve(filament_nums);
+    for (size_t idx = 0; idx < filament_nums; ++idx) {
         FilamentGroupUtils::FilamentInfo info;
-        info.color      = filament_colours[idx];
-        info.type       = filament_types[idx];
-        info.is_support = filament_is_support[idx];
+        info.color      = print_config.filament_colour.get_at(idx);
+        info.type       = print_config.filament_type.get_at(idx);
+        info.is_support = print_config.filament_is_support.get_at(idx);
         context.model_info.filament_info.emplace_back(std::move(info));
     }
 
@@ -1654,7 +1681,7 @@ static FilamentGroupContext build_filament_group_context(
     context.nozzle_info.extruder_nozzle_list = build_extruder_nozzle_list(context.nozzle_info.nozzle_list);
 
     if (context.nozzle_info.nozzle_list.empty())
-        throw Slic3r::RuntimeError("No valid nozzle found. Please check nozzle count.");
+        throw Slic3r::RuntimeError(_L("No valid nozzle found. Please check nozzle count."));
 
     if (!nozzle_status.empty())
         context.nozzle_info.nozzle_status = nozzle_status;
@@ -1764,7 +1791,6 @@ static std::vector<int> apply_master_extruder_preference(const FilamentGroupCont
 // multi-nozzle (H2C/A2L) resolves to a nozzle-granular result.
 MultiNozzleUtils::LayeredNozzleGroupResult ToolOrdering::get_recommended_filament_maps(const std::vector<std::vector<unsigned int>>& layer_filaments, const Print* print, const FilamentMapMode mode, const std::vector<std::set<int>>& physical_unprintables, const std::vector<std::set<int>>& geometric_unprintables, const std::map<int, std::set<NozzleVolumeType>>& unprintable_volumes, const std::unordered_map<int, int>& nozzle_status)
 {
-    using namespace FilamentGroupUtils;
     using namespace MultiNozzleUtils;
 
     if (!print || layer_filaments.empty())
@@ -2838,6 +2864,28 @@ void ToolOrdering::enforce_mixed_component_order()
     }
 }
 
+// Declared in ToolOrdering.hpp (exposed for unit testing).
+std::vector<unsigned int> parse_cyclic_order(const std::string& str, unsigned int number_of_extruders)
+{
+    std::vector<unsigned int> order;
+    for (const std::string& token : split_string(str, ',')) {
+        try {
+            size_t pos      = 0;
+            int    filament = std::stoi(token, &pos); // stoi skips leading whitespace by itself
+            // stoi stops at the first non-digit, so "2x" would parse as 2. Require the whole token to be
+            // consumed (bar trailing whitespace) to drop it like any other garbage.
+            if (token.find_first_not_of(" \t\r\n", pos) != std::string::npos)
+                continue;
+            if (filament >= 1 && (unsigned int)filament <= number_of_extruders
+                && std::find(order.begin(), order.end(), (unsigned int)(filament - 1)) == order.end())
+                order.emplace_back((unsigned int)(filament - 1));
+        } catch (const std::exception&) {
+            // Not a number, ignore it.
+        }
+    }
+    return order;
+}
+
 void ToolOrdering::reorder_extruders_for_minimum_flush_volume(bool reorder_first_layer)
 {
     const PrintConfig* print_config = m_print_config_ptr;
@@ -2935,11 +2983,41 @@ void ToolOrdering::reorder_extruders_for_minimum_flush_volume(bool reorder_first
     const bool use_cyclic_ordering =
         (print_config->toolchange_ordering == ToolChangeOrderingType::Cyclic);
 
+    // By default the first layer keeps its adhesion-optimized order (and any custom first layer
+    // sequence); the cyclic sequence is only forced onto it when the user opts in.
+    const bool cyclic_first_layer = use_cyclic_ordering && print_config->toolchange_cyclic_first_layer.value;
+
+    // Optional user defined cyclic sequence, given as 1-based filament numbers ("3,2,1,4"). Filaments
+    // missing from it keep their ascending order after the listed ones, so a partial or bogus entry
+    // still yields the default cyclic order.
+    const std::vector<unsigned int> cyclic_order =
+        use_cyclic_ordering ? parse_cyclic_order(print_config->toolchange_cyclic_order.value, number_of_extruders)
+                            : std::vector<unsigned int>();
+
+    // Reorder a layer's filaments (0-based) for cyclic ordering: ascending by default, or following the
+    // user defined sequence when one was given. Filaments absent from the sequence keep ascending order
+    // after the listed ones.
+    auto apply_cyclic_order = [&cyclic_order](std::vector<unsigned int>& filaments) {
+        std::sort(filaments.begin(), filaments.end());
+        if (!cyclic_order.empty())
+            std::stable_sort(filaments.begin(), filaments.end(), [&cyclic_order](unsigned int lhs, unsigned int rhs) {
+                auto rank = [&cyclic_order](unsigned int filament) {
+                    return size_t(std::find(cyclic_order.begin(), cyclic_order.end(), filament) - cyclic_order.begin());
+                };
+                return rank(lhs) < rank(rhs);
+            });
+    };
+
     // other_layers_seq: the layer_idx and extruder_idx are base on 1
-    auto get_custom_seq = [&other_layers_seqs, &reorder_first_layer, &first_layer_filaments, &layer_filaments, use_cyclic_ordering](int layer_idx, std::vector<int>& out_seq) -> bool {
+    auto get_custom_seq = [&other_layers_seqs, &reorder_first_layer, &first_layer_filaments, &layer_filaments, use_cyclic_ordering, cyclic_first_layer, &apply_cyclic_order](int layer_idx, std::vector<int>& out_seq) -> bool {
         if (!reorder_first_layer && layer_idx == 0) {
-            out_seq.resize(first_layer_filaments.size());
-            std::transform(first_layer_filaments.begin(), first_layer_filaments.end(), out_seq.begin(), [](auto item) {return item + 1; });
+            // The first layer tool order is already decided (adhesion-optimized, plus any custom first
+            // layer sequence). Only override it with the cyclic sequence when the user opted in.
+            std::vector<unsigned int> ordered = first_layer_filaments;
+            if (cyclic_first_layer)
+                apply_cyclic_order(ordered);
+            out_seq.resize(ordered.size());
+            std::transform(ordered.begin(), ordered.end(), out_seq.begin(), [](auto item) {return int(item) + 1; });
             return true;
         }
         for (size_t idx = other_layers_seqs.size() - 1; idx != size_t(-1); --idx) {
@@ -2950,9 +3028,12 @@ void ToolOrdering::reorder_extruders_for_minimum_flush_volume(bool reorder_first
             }
         }
 
-        if (use_cyclic_ordering && layer_idx >= 0 && size_t(layer_idx) < layer_filaments.size()) {
+        // Skip the first layer here (layer_idx == 0 only reaches this point on the reorder_first_layer
+        // path) unless the user asked for cyclic order on it, so it keeps the default flush ordering.
+        if (use_cyclic_ordering && layer_idx >= 0 && (layer_idx != 0 || cyclic_first_layer)
+            && size_t(layer_idx) < layer_filaments.size()) {
             std::vector<unsigned int> ordered = layer_filaments[size_t(layer_idx)];
-            std::sort(ordered.begin(), ordered.end());
+            apply_cyclic_order(ordered);
             out_seq.resize(ordered.size());
             std::transform(ordered.begin(), ordered.end(), out_seq.begin(), [](auto item) { return int(item) + 1; });
             return true;
@@ -3618,5 +3699,11 @@ int WipingExtrusions::get_support_interface_extruder_overrides(const PrintObject
     return -1;
 }
 
-
+bool ToolOrdering::is_last_extrusion_layer(coordf_t print_z, unsigned int extruder_id) const
+{
+    auto it = m_last_layer_per_extruder.find(extruder_id);
+    if (it == m_last_layer_per_extruder.end())
+        return true;
+    return print_z >= it->second - EPSILON;
+}
 } // namespace Slic3r

@@ -157,8 +157,8 @@ void project_data_changed(Plater& plater)
 {
     plater.set_plater_dirty(true);
     Slic3r::put_other_changes();
-    if (MainFrame* frame = wxGetApp().mainframe; frame != nullptr && frame->m_project != nullptr && frame->m_project->IsShown())
-        frame->m_project->update_model_data();
+    if (ProjectPanel* project = ProjectPanel::if_built(); project != nullptr && project->IsShown())
+        project->update_model_data();
 }
 
 fs::path aux_dir(Plater& plater, const AuxFolder& folder) { return fs::path(plater.model().get_auxiliary_file_temp_path()) / folder.dir; }

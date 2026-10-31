@@ -1,5 +1,8 @@
 #include "MachineFrameTransform.hpp"
 #include "../Geometry.hpp"
+#include "../Point.hpp"
+#include "../PrintConfig.hpp"
+#include "../libslic3r.h"
 
 #include <cmath>
 
@@ -14,16 +17,17 @@ bool MachineFrameTransform::init_from_config(const PrintConfig &config)
     if (!config.belt_printer.value)
         return false;
 
-    // The machine-frame transform is the machine's own geometry: the physical
-    // tilt of the gantry (belt_frame_tilt_angle) about the tilt axis. The angle
-    // the print is sliced at is a separate, process-level choice and does not
-    // enter here -- the per-move un-rotation has already produced bed-frame
-    // coordinates by the time this runs.
+    // The machine-frame transform is derived from the single belt tilt (axis +
+    // angle) that also drives the pre-slice mesh rotation.  Expert decouple lets
+    // the machine-frame angle differ from the slicing rotation; otherwise both
+    // use belt_slice_rotation_angle.
     const BeltRotationAxis axis = config.belt_slice_rotation.value;
     if (axis == BeltRotationAxis::None || axis == BeltRotationAxis::Z)
         return false; // Z is an in-plane spin: no machine-frame tilt.
 
-    const double angle_deg = config.belt_frame_tilt_angle.value;
+    const double angle_deg = config.belt_frame_tilt_decouple.value
+        ? config.belt_frame_tilt_angle.value
+        : config.belt_slice_rotation_angle.value;
     if (std::abs(angle_deg) <= EPSILON)
         return false;
 

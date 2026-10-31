@@ -1,12 +1,35 @@
+#include <boost/filesystem/operations.hpp>
 #include <catch2/catch_all.hpp>
 
+#include <algorithm>
+#include <cstddef>
 #include <cstdlib>
+#include "libslic3r/PrintConfig.hpp"
+#include "libslic3r/BoundingBox.hpp"
+#include "libslic3r/Point.hpp"
+#include "libslic3r/Config.hpp"
+#include "libslic3r/Extruder.hpp"
+#include "libslic3r/Flow.hpp"
+#include "libslic3r/Geometry.hpp"
+#include "libslic3r/libslic3r.h"
+#include <map>
 #include <memory>
+#include <set>
 #include <sstream>
 #include <string>
 #include <tuple>
+#include <utility>
 #include <vector>
 
+#include <catch2/catch_test_macros.hpp>
+#include <catch2/matchers/catch_matchers.hpp>
+#include <catch2/matchers/catch_matchers_string.hpp>
+#include <catch2/matchers/catch_matchers_floating_point.hpp>
+#include <catch2/catch_message.hpp>
+#include <catch2/generators/catch_generators.hpp>
+#include "nlohmann/json.hpp"
+
+#include "libslic3r/GCodeReader.hpp"
 #include "libslic3r/GCodeWriter.hpp"
 #include "libslic3r/GCode/BeltKinematics.hpp"
 #include "libslic3r/Geometry.hpp"
@@ -15,17 +38,54 @@
 #include "libslic3r/Print.hpp"
 #include "libslic3r/ModelArrange.hpp"
 
+#include <boost/algorithm/string/predicate.hpp>
 #include <boost/filesystem.hpp>
 
 #include "test_helpers.hpp"
+#include <cmath>
+#include "libslic3r/GCode/GCodeProcessor.hpp"
+#include <algorithm>
+#include <limits>
+#include "libslic3r/GCode/BeltKinematics.hpp"
+#include "libslic3r/GCodeReader.hpp"
+#include "libslic3r/PrintConfig.hpp"
+#include "libslic3r/Arrange.hpp"
 
 using namespace Slic3r;
 using namespace Slic3r::Test;
 
-// Arrange on a finite bed, not an unbounded InfiniteBed: the latter places items
-// near INT64_MIN/4 (~2.3e18), which reaches ClipperLib's coordinate limit and throws
-// "Coordinate outside allowed range" on Windows/arm64. A 500x500 bed keeps coordinates
-// small while still covering large printers.
+TEST_CASE("Belt machine coordinates retain a non-45-degree slicing angle", "[GCodeWriter][belt]")
+{
+    PrintConfig config;
+    config.belt_printer.value               = true;
+    config.belt_slice_rotation.value        = BeltRotationAxis::X;
+    config.belt_slice_rotation_angle.value  = 30.;
+    config.gcode_remap_x.value              = RemapAxis::PosX;
+    config.gcode_remap_y.value              = RemapAxis::PosZ;
+    config.gcode_remap_z.value              = RemapAxis::PosY;
+
+    GCodeWriter writer;
+    install_belt_kinematics(writer, config);
+    writer.set_axis_remap(int(config.gcode_remap_x.value),
+                          int(config.gcode_remap_y.value),
+                          int(config.gcode_remap_z.value));
+
+    // Unlayered: the per-move un-rotation hands the writer bed coordinates (Orca's world
+    // coordinates), so the model point goes in as it is. Not decoupled, the slicing angle is the
+    // machine frame's tilt.
+    const Vec3d model(4., 10., 3.);
+    const Vec3d machine = writer.kinematics().to_machine(model);
+
+    // The conventional X-tilt remap produces (x, z, y). At 30 degrees the
+    // gantry coordinate is z/sin(30) and belt travel is y + z*cot(30).
+    // The complementary tan/inv-cos formulas accidentally used by the unified
+    // transform are indistinguishable at 45 degrees, but fail this case.
+    REQUIRE_THAT(machine.x(), Catch::Matchers::WithinAbs(4., 1e-9));
+    REQUIRE_THAT(machine.y(), Catch::Matchers::WithinAbs(3. / std::sin(Geometry::deg2rad(30.)), 1e-9));
+    REQUIRE_THAT(machine.z(), Catch::Matchers::WithinAbs(10. + 3. / std::tan(Geometry::deg2rad(30.)), 1e-9));
+}
+
+// Arrange on a 500x500 bed, which keeps coordinates small while still covering large printers.
 static void arrange_objects_on_test_bed(Model &model, const DynamicPrintConfig &config)
 {
     const BoundingBox bed{Point::new_scale(0., 0.), Point::new_scale(500., 500.)};
@@ -57,6 +117,236 @@ SCENARIO("set_speed emits values with fixed-point output.", "[GCodeWriter]") {
             }
         }
     }
+}
+
+TEST_CASE("High precision G-code keeps the requested flow of short circular extrusion moves", "[GCodeWriter][Regression]")
+{
+    const bool relative_e = GENERATE(false, true);
+    CAPTURE(relative_e);
+
+    PrintConfig config;
+    config.gcode_flavor.value                   = gcfKlipper;
+    config.high_precision_gcode.value           = true;
+    config.use_relative_e_distances.value       = relative_e;
+    config.single_extruder_multi_material.value = false;
+    config.filament_diameter.values             = {1.75};
+    config.filament_flow_ratio.values           = {1.0};
+    config.filament_map.values                  = {1};
+
+    GCodeWriter writer;
+    writer.apply_print_config(config);
+    writer.set_extruders({0});
+    writer.set_extruder(0);
+
+    // A thin layer makes the E increment small enough for export rounding to
+    // distort the flow, even when the source segments form a regular polygon.
+    constexpr int segment_count = 180;
+    constexpr double radius = 4.89;
+    constexpr double speed = 60.;
+    const Flow flow(0.22f, 0.02f, 0.2f);
+    const double filament_area = PI * std::pow(config.filament_diameter.get_at(0) / 2., 2);
+    const double e_per_mm = flow.mm3_per_mm() / filament_area;
+    const Vec2d center(66.035532, 54.9999352);
+    Vec2d previous = center + Vec2d(radius, 0.);
+    std::string gcode = writer.preamble();
+    gcode += writer.travel_to_xyz(Vec3d(previous.x(), previous.y(), flow.height()));
+    gcode += writer.set_speed(speed * MM_PER_MIN);
+    double expected_e = 0.;
+    for (int i = 1; i <= segment_count; ++i) {
+        const double angle = 2. * PI * i / segment_count;
+        const Vec2d point = center + radius * Vec2d(std::cos(angle), std::sin(angle));
+        const double e = e_per_mm * (point - previous).norm();
+        gcode += writer.extrude_to_xy(point, e);
+        expected_e += e;
+        previous = point;
+    }
+
+    const double expected_flow = flow.mm3_per_mm() * speed;
+    double max_relative_error = 0.;
+    double exported_e = 0.;
+    std::size_t extrusion_count = 0;
+    GCodeReader reader;
+    reader.apply_config(writer.config);
+    reader.parse_buffer(gcode, [&](GCodeReader &self, const GCodeReader::GCodeLine &line) {
+        if (!line.extruding(self) || line.dist_XY(self) <= 0.)
+            return;
+        const double e = line.dist_E(self);
+        const double actual_flow = filament_area * e / line.dist_XY(self) * line.new_F(self) / MM_PER_MIN;
+        max_relative_error = std::max(max_relative_error, std::abs(actual_flow / expected_flow - 1.));
+        exported_e += e;
+        ++extrusion_count;
+    });
+
+    CHECK(extrusion_count == segment_count);
+    CHECK(max_relative_error < 0.004);
+    CHECK_THAT(exported_e, Catch::Matchers::WithinRel(expected_e, 0.001));
+}
+
+TEST_CASE("G-code export uses the selected precision for linear and arc moves", "[GCodeWriter][Regression]")
+{
+    const bool high_precision = GENERATE(false, true);
+    const bool relative_e = GENERATE(false, true);
+    CAPTURE(high_precision, relative_e);
+
+    PrintConfig config;
+    CHECK_FALSE(config.high_precision_gcode.value);
+    config.high_precision_gcode.value           = high_precision;
+    config.gcode_flavor.value                   = gcfKlipper;
+    config.use_relative_e_distances.value       = relative_e;
+    config.single_extruder_multi_material.value = false;
+    config.filament_diameter.values             = {1.75};
+    config.filament_flow_ratio.values           = {1.0};
+    config.filament_map.values                  = {1};
+
+    GCodeWriter writer;
+    writer.apply_print_config(config);
+    writer.set_extruders({0});
+    writer.set_extruder(0);
+    writer.set_current_position_clear(true);
+
+    std::string gcode = writer.travel_to_xyz(Vec3d(10.123456, 20.123456, 0.234567));
+    gcode += writer.set_speed(1234.56789);
+    gcode += writer.extrude_to_xy(Vec2d(10.654321, 20.654321), 0.00123456);
+    gcode += writer.extrude_arc_to_xy(Vec2d(10.987654, 20.987654), Vec2d(0.123456, 0.654321), 0.00123456, true);
+    // The Z difference survives rounding only at the higher coordinate precision.
+    gcode += writer.extrude_to_xyz(Vec3d(11., 21., 0.23454), 0.00123456);
+
+    std::vector<GCodeReader::GCodeLine> moves;
+    GCodeReader reader;
+    reader.apply_config(writer.config);
+    reader.parse_buffer(gcode, [&](GCodeReader &, const GCodeReader::GCodeLine &line) {
+        if (line.cmd_is("G1") || line.cmd_is("G3"))
+            moves.push_back(line);
+    });
+    REQUIRE(moves.size() == 5);
+    // The parsed doubles, unlike the float accessors, tell one more written decimal apart.
+    constexpr double eps = 1e-9;
+    CHECK_THAT(moves[0].precise_value(X), Catch::Matchers::WithinAbs(high_precision ? 10.1235 : 10.123, eps));
+    CHECK_THAT(moves[0].precise_value(Y), Catch::Matchers::WithinAbs(high_precision ? 20.1235 : 20.123, eps));
+    CHECK_THAT(moves[0].precise_value(Z), Catch::Matchers::WithinAbs(high_precision ? 0.2346 : 0.235, eps));
+    CHECK_THAT(moves[1].precise_value(F), Catch::Matchers::WithinAbs(1234.568, eps));
+    CHECK_THAT(moves[2].precise_value(X), Catch::Matchers::WithinAbs(high_precision ? 10.6543 : 10.654, eps));
+    CHECK_THAT(moves[2].precise_value(E), Catch::Matchers::WithinAbs(high_precision ? 0.001235 : 0.00123, eps));
+    CHECK(moves[3].cmd_is("G3"));
+    CHECK_THAT(moves[3].precise_value(X), Catch::Matchers::WithinAbs(high_precision ? 10.9877 : 10.988, eps));
+    CHECK_THAT(moves[3].precise_value(I), Catch::Matchers::WithinAbs(high_precision ? 0.1235 : 0.123, eps));
+    CHECK_THAT(moves[3].precise_value(J), Catch::Matchers::WithinAbs(high_precision ? 0.6543 : 0.654, eps));
+    // High precision carries the rounding of relative E into the next move: 0.00123456 was written as 0.001235,
+    // so the arc writes 0.00123456 - 0.00000044, which rounds to 0.001234.
+    const double expected_arc_e = relative_e ? (high_precision ? 0.001234 : 0.00123) : (high_precision ? 0.002469 : 0.00247);
+    CHECK_THAT(moves[3].precise_value(E), Catch::Matchers::WithinAbs(expected_arc_e, eps));
+    CHECK(moves[4].has_z() == high_precision);
+    if (high_precision)
+        CHECK_THAT(moves[4].precise_value(Z), Catch::Matchers::WithinAbs(0.2345, eps));
+}
+
+TEST_CASE("High precision G-code carries the rounding of relative extrusion into the next move", "[GCodeWriter][Regression]")
+{
+    const bool high_precision = GENERATE(false, true);
+    CAPTURE(high_precision);
+
+    PrintConfig config;
+    config.high_precision_gcode.value           = high_precision;
+    config.gcode_flavor.value                   = gcfKlipper;
+    config.use_relative_e_distances.value       = true;
+    config.single_extruder_multi_material.value = false;
+    config.filament_diameter.values             = {1.75};
+    config.filament_flow_ratio.values           = {1.0};
+    config.filament_map.values                  = {1};
+
+    GCodeWriter writer;
+    writer.apply_print_config(config);
+    writer.set_extruders({0});
+    writer.set_extruder(0);
+
+    // Rounded on its own, every move of 0.0003061 mm is written as 0.00031 at 5 decimals and as 0.000306 at 6,
+    // which over- or under-extrudes all of them the same way.
+    constexpr int    move_count = 100;
+    constexpr double move_e     = 0.0003061;
+    std::string gcode;
+    for (int i = 1; i <= move_count; ++i)
+        gcode += writer.extrude_to_xy(Vec2d(0.1 * i, 0.), move_e);
+
+    std::vector<double> written_e;
+    GCodeReader reader;
+    reader.apply_config(writer.config);
+    reader.parse_buffer(gcode, [&](GCodeReader &self, const GCodeReader::GCodeLine &line) {
+        if (line.extruding(self))
+            written_e.push_back(line.precise_value(E));
+    });
+    REQUIRE(written_e.size() == size_t(move_count));
+
+    if (high_precision) {
+        // The written moves add up to the extruded length within half of the last decimal.
+        double total = 0.;
+        for (const double e : written_e)
+            total += e;
+        CHECK_THAT(total, Catch::Matchers::WithinAbs(move_count * move_e, 0.5e-6 + 1e-12));
+    } else {
+        // Without the option, each move is rounded on its own as before.
+        for (const double e : written_e)
+            CHECK_THAT(e, Catch::Matchers::WithinAbs(0.00031, 1e-12));
+    }
+}
+
+TEST_CASE("Forced standard precision writes extrusions and XY travels as without high precision G-code", "[GCodeWriter][Regression]")
+{
+    const bool relative_e = GENERATE(false, true);
+    CAPTURE(relative_e);
+
+    PrintConfig config;
+    config.high_precision_gcode.value           = true;
+    config.gcode_flavor.value                   = gcfKlipper;
+    config.use_relative_e_distances.value       = relative_e;
+    config.single_extruder_multi_material.value = false;
+    config.filament_diameter.values             = {1.75};
+    config.filament_flow_ratio.values           = {1.0};
+    config.filament_map.values                  = {1};
+
+    GCodeWriter writer;
+    writer.apply_print_config(config);
+    writer.set_extruders({0});
+    writer.set_extruder(0);
+    writer.set_current_position_clear(true);
+
+    REQUIRE(writer.high_precision());
+    std::string gcode = writer.travel_to_xyz(Vec3d(10.123456, 20.123456, 0.234567));
+    gcode += writer.extrude_to_xy(Vec2d(10.654321, 20.654321), 0.00123456);
+    // As GCode::extrude_support() does for supports.
+    CHECK_FALSE(writer.force_standard_precision(true));
+    CHECK_FALSE(writer.high_precision());
+    gcode += writer.travel_to_xy(Vec2d(10.7654321, 20.7654321));
+    gcode += writer.extrude_arc_to_xy(Vec2d(10.987654, 20.987654), Vec2d(0.123456, 0.654321), 0.00123456, true);
+    gcode += writer.travel_to_z(0.345678);
+    CHECK(writer.force_standard_precision(false));
+    CHECK(writer.high_precision());
+    gcode += writer.extrude_to_xy(Vec2d(11.123456, 21.123456), 0.00123456);
+
+    std::vector<GCodeReader::GCodeLine> moves;
+    GCodeReader reader;
+    reader.apply_config(writer.config);
+    reader.parse_buffer(gcode, [&](GCodeReader &, const GCodeReader::GCodeLine &line) {
+        if (line.cmd_is("G1") || line.cmd_is("G3"))
+            moves.push_back(line);
+    });
+    REQUIRE(moves.size() == 6);
+    constexpr double eps = 1e-9;
+    CHECK_THAT(moves[1].precise_value(X), Catch::Matchers::WithinAbs(10.6543, eps));
+    CHECK_THAT(moves[1].precise_value(E), Catch::Matchers::WithinAbs(0.001235, eps));
+    CHECK_THAT(moves[2].precise_value(X), Catch::Matchers::WithinAbs(10.765, eps));
+    CHECK_THAT(moves[2].precise_value(Y), Catch::Matchers::WithinAbs(20.765, eps));
+    CHECK(moves[3].cmd_is("G3"));
+    CHECK_THAT(moves[3].precise_value(X), Catch::Matchers::WithinAbs(10.988, eps));
+    CHECK_THAT(moves[3].precise_value(I), Catch::Matchers::WithinAbs(0.123, eps));
+    CHECK_THAT(moves[3].precise_value(J), Catch::Matchers::WithinAbs(0.654, eps));
+    // Relative E is rounded on its own, without the carry.
+    CHECK_THAT(moves[3].precise_value(E), Catch::Matchers::WithinAbs(relative_e ? 0.00123 : 0.00247, eps));
+    // A travel that changes Z keeps high precision, as that Z also holds for the moves after it.
+    CHECK_THAT(moves[4].precise_value(Z), Catch::Matchers::WithinAbs(0.3457, eps));
+    // The first extrusion was written as 0.001235 and left -0.00000044 to carry. The arc kept it, so the next move
+    // written with high precision writes 0.00123456 - 0.00000044 = 0.00123412 as 0.001234.
+    CHECK_THAT(moves[5].precise_value(X), Catch::Matchers::WithinAbs(11.1235, eps));
+    CHECK_THAT(moves[5].precise_value(E), Catch::Matchers::WithinAbs(relative_e ? 0.001234 : 0.003704, eps));
 }
 
 SCENARIO("z_hop lifts the nozzle when a lift is requested", "[GCodeWriter]") {
@@ -142,13 +432,14 @@ SCENARIO("Machine kinematics: axis remap decides which axis words are emitted", 
 // BELT_MOD -- ported from OrcaSlicer's belt regression net. There the writer received the
 // slicing-frame point and BeltBackTransform recovered the model point first; here the per-object
 // segment trafo has already done that before the writer maps anything, so the input is the bed
-// point itself and the expected machine coordinates are unchanged. The machine frame follows the
-// printer's physical tilt; the print's slicing angle (a process option) plays no part in it.
+// point itself and the expected machine coordinates are unchanged. Decoupled, the machine frame
+// follows belt_frame_tilt_angle and the slicing angle plays no part in it.
 TEST_CASE("Belt machine coordinates retain a non-45-degree tilt", "[GCodeWriter][belt]")
 {
     PrintConfig config;
     config.belt_printer.value              = true;
     config.belt_slice_rotation.value       = BeltRotationAxis::X;
+    config.belt_frame_tilt_decouple.value  = true;
     config.belt_frame_tilt_angle.value     = 30.;
     config.belt_slice_rotation_angle.value = 45.;   // irrelevant to the machine frame
     config.gcode_remap_x.value             = RemapAxis::PosX;
@@ -236,6 +527,22 @@ SCENARIO("Origin manipulation", "[GCodeWriter]") {
     		REQUIRE(gcodegen.origin() == Vec2d(15,5));
     	}
     }
+}
+
+TEST_CASE("A cached config slot is looked up again whenever its key changes", "[GCodeWriter]")
+{
+    GCode::ConfigIndexCache cache;
+    int lookups = 0;
+    auto slot = [&](int filament, size_t layer, size_t generation) {
+        return cache.get(filament, layer, generation, [&] { ++lookups; return filament * 100 + int(layer) * 10 + int(generation); });
+    };
+    REQUIRE(slot(1, 2, 3) == 123);
+    REQUIRE(slot(1, 2, 3) == 123);
+    REQUIRE(lookups == 1);
+    REQUIRE(slot(4, 2, 3) == 423);
+    REQUIRE(slot(4, 5, 3) == 453);
+    REQUIRE(slot(4, 5, 6) == 456);
+    REQUIRE(lookups == 4);
 }
 
 // Verify that emit_machine_limits_to_gcode emits the correct max value across
@@ -562,6 +869,65 @@ TEST_CASE("EXTRUDER_LIMIT per-extruder clamping and max fallback", "[GCodeWriter
     }
 }
 
+TEST_CASE("Acceleration and velocity limit commands print their values in general notation", "[GCodeWriter]")
+{
+    enum class Command { Print, Travel, KlipperLimits };
+    struct Case
+    {
+        GCodeFlavor              flavor;
+        Command                  command;
+        unsigned int             acceleration;
+        double                   jerk;
+        bool                     comments;
+        std::vector<std::string> present;
+        std::vector<std::string> absent;
+    };
+    // accel_to_decel_factor is 50%, so ACCEL_TO_DECEL is half the acceleration.
+    const Case c = GENERATE(values<Case>({
+        {gcfKlipper, Command::KlipperLimits, 2000000, 25. / 3., false,
+         {"SET_VELOCITY_LIMIT ACCEL=2000000 ", "ACCEL_TO_DECEL=1e+06 ", "SQUARE_CORNER_VELOCITY=8.33333\n"}, {}},
+        {gcfKlipper, Command::KlipperLimits, 12345, 0., false, {"ACCEL=12345 ", "ACCEL_TO_DECEL=6172.5 ", "MINIMUM_CRUISE_RATIO=0.5\n"}, {"SQUARE_CORNER_VELOCITY"}},
+        {gcfKlipper, Command::KlipperLimits, 0, 0.25, true, {"SQUARE_CORNER_VELOCITY=0.25 ", "; adjust VELOCITY_LIMIT"}, {"ACCEL"}},
+        {gcfKlipper, Command::Print, 3001, 0., true, {"ACCEL=3001 ", "ACCEL_TO_DECEL=1500.5 ", "; adjust ACCEL_TO_DECEL", "; adjust acceleration"}, {}},
+        {gcfMarlinFirmware, Command::Print, 2500, 0., false, {"M204 P2500\n"}, {}},
+        {gcfMarlinFirmware, Command::Travel, 7000, 0., false, {"M204 T7000\n"}, {}},
+        {gcfRepRapFirmware, Command::Travel, 7000, 0., true, {"M204 T7000 ", "; adjust acceleration"}, {}},
+        {gcfMarlinLegacy, Command::Print, 2500, 0., false, {"M204 S2500\n"}, {}},
+        {gcfRepetier, Command::Print, 2500, 0., false, {"M201 X2500 Y2500\n"}, {}},
+        {gcfRepetier, Command::Travel, 7000, 0., false, {"M202 X7000 Y7000\n"}, {}},
+    }));
+
+    struct CommentGuard
+    {
+        bool saved = GCodeWriter::full_gcode_comment;
+        ~CommentGuard() { GCodeWriter::full_gcode_comment = saved; }
+    } comment_guard;
+    GCodeWriter::full_gcode_comment = c.comments;
+
+    DynamicPrintConfig config = DynamicPrintConfig::full_print_config();
+    config.set_key_value("gcode_flavor", new ConfigOptionEnum<GCodeFlavor>(c.flavor));
+    config.set_key_value("accel_to_decel_enable", new ConfigOptionBool(true));
+    config.set_key_value("accel_to_decel_factor", new ConfigOptionPercent(50));
+    for (const char *limit : {"machine_max_acceleration_extruding", "machine_max_acceleration_travel", "machine_max_acceleration_x",
+                              "machine_max_acceleration_y", "machine_max_jerk_x", "machine_max_jerk_y"}) {
+        std::vector<double> &values = config.option<ConfigOptionFloats>(limit)->values;
+        std::fill(values.begin(), values.end(), 0.);
+    }
+    PrintConfig print_config;
+    print_config.apply(config, true);
+    GCodeWriter writer;
+    writer.apply_print_config(print_config);
+
+    const std::string line = c.command == Command::Print         ? writer.set_print_acceleration(c.acceleration) :
+                             c.command == Command::Travel        ? writer.set_travel_acceleration(c.acceleration) :
+                                                                   writer.set_accel_and_jerk(c.acceleration, c.jerk);
+    INFO(line);
+    for (const std::string &token : c.present)
+        CHECK_THAT(line, Catch::Matchers::ContainsSubstring(token));
+    for (const std::string &token : c.absent)
+        CHECK_THAT(line, !Catch::Matchers::ContainsSubstring(token));
+}
+
 SCENARIO("Extruder reads the injected config column", "[GCodeWriter][H2C]") {
     GIVEN("A writer whose per-variant arrays hold three columns for two filaments") {
         GCodeWriter writer;
@@ -868,20 +1234,41 @@ static std::string slice_two_object_bbl(DynamicPrintConfig &config)
 }
 
 // The real change_filament_gcode of a shipped "<printer> 0.4 nozzle" machine profile.
+// The profile does not state it inline any more: it names the template carrying it in
+// `include`, and the loader layers that template under the preset. Follow the same list
+// - so a profile that stops naming one fails here instead of silently slicing G-code it
+// no longer ships.
 static std::string shipped_change_filament_gcode(const std::string &printer)
 {
-    const std::string path = std::string(PROFILES_DIR) + "/BBL/machine/Bambu Lab " + printer + " 0.4 nozzle.json";
+    const std::string machine_dir   = std::string(PROFILES_DIR) + "/BBL/machine/";
+    const std::string machine_path  = machine_dir + "Bambu Lab " + printer + " 0.4 nozzle.json";
+    const std::string template_name = "Bambu Lab " + printer + " 0.4 nozzle template change_filament_gcode";
     // PROFILES_DIR is an absolute path baked in at build time; a sparse test checkout
     // without resources/ leaves it missing. Skip rather than dereference a config that
-    // never loaded - this is the only fff_print test that reads a shipped profile.
-    if (!boost::filesystem::exists(path))
-        SKIP("shipped profile not present in this checkout: " << path);
-    DynamicPrintConfig                 config;
-    std::map<std::string, std::string> key_values;
-    std::string                        reason;
-    config.load_from_json(path, ForwardCompatibilitySubstitutionRule::Enable, key_values, reason);
-    // Fail loudly on a malformed/renamed profile instead of null-dereferencing in opt_string.
-    INFO("profile: " << path << (reason.empty() ? "" : ("  load reason: " + reason)));
+    // never loaded.
+    if (!boost::filesystem::exists(machine_path))
+        SKIP("shipped profile not present in this checkout: " << machine_path);
+
+    auto load = [](const std::string &file, std::map<std::string, std::string> &key_values) {
+        DynamicPrintConfig        config;
+        ConfigSubstitutionContext substitutions{ForwardCompatibilitySubstitutionRule::Enable};
+        std::string               reason;
+        // false: `inherits` and `include` stay out of the config and land in key_values,
+        // for the loader to resolve - neither is a slicing setting.
+        config.load_from_json(file, substitutions, false, key_values, reason);
+        // Fail loudly on a malformed/renamed profile instead of null-dereferencing in opt_string.
+        INFO("profile: " << file << (reason.empty() ? "" : ("  load reason: " + reason)));
+        return config;
+    };
+
+    std::map<std::string, std::string> machine_values;
+    load(machine_path, machine_values);
+    REQUIRE(machine_values.count("include") == 1);
+    const nlohmann::json includes = nlohmann::json::parse(machine_values["include"]);
+    REQUIRE(std::find(includes.begin(), includes.end(), nlohmann::json(template_name)) != includes.end());
+
+    std::map<std::string, std::string> template_values;
+    const DynamicPrintConfig           config = load(machine_dir + template_name + ".json", template_values);
     REQUIRE(config.has("change_filament_gcode"));
     return config.opt_string("change_filament_gcode");
 }
@@ -966,6 +1353,270 @@ SCENARIO("Shipped dual-nozzle change_filament_gcode resolves during a real slice
     }
 }
 
+
+SCENARIO("set_pressure_advance emits nothing for negative PA", "[GCodeWriter][PressureAdvance]") {
+    GIVEN("A default GCodeWriter") {
+        GCodeWriter writer;
+        THEN("Negative PA returns empty regardless of firmware flavor") {
+            writer.config.gcode_flavor.value = gcfKlipper;
+            REQUIRE(writer.set_pressure_advance(-1.0).empty());
+            writer.config.gcode_flavor.value = gcfRepRapFirmware;
+            REQUIRE(writer.set_pressure_advance(-0.001).empty());
+            writer.config.gcode_flavor.value = gcfMarlinFirmware;
+            REQUIRE(writer.set_pressure_advance(-100.0).empty());
+        }
+    }
+}
+
+SCENARIO("set_pressure_advance emits Klipper form with optional EXTRUDER=extruder<N>", "[GCodeWriter][PressureAdvance]") {
+    GIVEN("A Klipper-flavored GCodeWriter") {
+        GCodeWriter writer;
+        writer.config.gcode_flavor.value = gcfKlipper;
+
+        WHEN("set_pressure_advance is called without a tool index") {
+            std::string out = writer.set_pressure_advance(0.05);
+            THEN("Output contains SET_PRESSURE_ADVANCE ADVANCE=0.05 with no EXTRUDER qualifier") {
+                REQUIRE_THAT(out, Catch::Matchers::ContainsSubstring("SET_PRESSURE_ADVANCE"));
+                REQUIRE_THAT(out, Catch::Matchers::ContainsSubstring("ADVANCE=0.05; Override"));
+                REQUIRE_THAT(out, !Catch::Matchers::ContainsSubstring("EXTRUDER="));
+            }
+        }
+        WHEN("set_pressure_advance is called with tool=0") {
+            std::string out = writer.set_pressure_advance(0.04, 0);
+            THEN("Output targets EXTRUDER=extruder (no trailing index)") {
+                REQUIRE_THAT(out, Catch::Matchers::ContainsSubstring("EXTRUDER=extruder;"));
+                REQUIRE_THAT(out, !Catch::Matchers::ContainsSubstring("EXTRUDER=extruder0"));
+            }
+        }
+        WHEN("set_pressure_advance is called with tool=3") {
+            std::string out = writer.set_pressure_advance(0.06, 3);
+            THEN("Output targets EXTRUDER=extruder3") {
+                REQUIRE_THAT(out, Catch::Matchers::ContainsSubstring("EXTRUDER=extruder3"));
+            }
+        }
+    }
+}
+
+SCENARIO("set_pressure_advance emits RepRapFirmware form with D<N>", "[GCodeWriter][PressureAdvance]") {
+    GIVEN("An RRF-flavored GCodeWriter") {
+        GCodeWriter writer;
+        writer.config.gcode_flavor.value = gcfRepRapFirmware;
+
+        WHEN("set_pressure_advance is called without a tool index") {
+            std::string out = writer.set_pressure_advance(0.07);
+            THEN("Output keeps the historical D0 rather than depending on the selected tool") {
+                REQUIRE_THAT(out, Catch::Matchers::ContainsSubstring("M572 D0 S0.07"));
+            }
+        }
+        WHEN("set_pressure_advance is called with tool=0") {
+            std::string out = writer.set_pressure_advance(0.08, 0);
+            THEN("Output contains D0, same as the tool-less form") {
+                REQUIRE_THAT(out, Catch::Matchers::ContainsSubstring("M572 D0 S0.08"));
+            }
+        }
+        WHEN("set_pressure_advance is called with tool=2") {
+            std::string out = writer.set_pressure_advance(0.09, 2);
+            THEN("Output contains D2") {
+                REQUIRE_THAT(out, Catch::Matchers::ContainsSubstring("M572 D2 S0.09"));
+            }
+        }
+    }
+}
+
+SCENARIO("set_pressure_advance emits Marlin 2.x form with optional T<N>", "[GCodeWriter][PressureAdvance]") {
+    GIVEN("A Marlin 2-flavored GCodeWriter") {
+        GCodeWriter writer;
+        writer.config.gcode_flavor.value = gcfMarlinFirmware;
+
+        WHEN("set_pressure_advance is called without a tool index") {
+            std::string out = writer.set_pressure_advance(0.10);
+            THEN("Output is bare M900 K... with no T qualifier") {
+                REQUIRE_THAT(out, Catch::Matchers::ContainsSubstring("M900 K0.1; Override"));
+                REQUIRE_THAT(out, !Catch::Matchers::ContainsSubstring(" T"));
+            }
+        }
+        WHEN("set_pressure_advance is called with tool=0") {
+            std::string out = writer.set_pressure_advance(0.11, 0);
+            THEN("Output contains T0") {
+                REQUIRE_THAT(out, Catch::Matchers::ContainsSubstring("M900 K0.11 T0"));
+            }
+        }
+        WHEN("set_pressure_advance is called with tool=1") {
+            std::string out = writer.set_pressure_advance(0.12, 1);
+            THEN("Output contains T1") {
+                REQUIRE_THAT(out, Catch::Matchers::ContainsSubstring("M900 K0.12 T1"));
+            }
+        }
+    }
+}
+
+SCENARIO("set_pressure_advance emits Marlin Legacy form without tool qualifier even when tool index is supplied",
+         "[GCodeWriter][PressureAdvance]") {
+    GIVEN("A Marlin Legacy-flavored GCodeWriter") {
+        GCodeWriter writer;
+        writer.config.gcode_flavor.value = gcfMarlinLegacy;
+
+        WHEN("set_pressure_advance is called without a tool index") {
+            std::string out = writer.set_pressure_advance(0.05);
+            THEN("Output is bare M900 K...") {
+                REQUIRE_THAT(out, Catch::Matchers::ContainsSubstring("M900 K0.05"));
+                REQUIRE_THAT(out, !Catch::Matchers::ContainsSubstring(" T"));
+            }
+        }
+        WHEN("set_pressure_advance is called with tool=2 (a hypothetical IMEX secondary)") {
+            std::string out = writer.set_pressure_advance(0.06, 2);
+            THEN("Output is still bare M900 — Marlin Legacy has no per-tool LA") {
+                REQUIRE_THAT(out, Catch::Matchers::ContainsSubstring("M900 K0.06"));
+                REQUIRE_THAT(out, !Catch::Matchers::ContainsSubstring(" T2"));
+            }
+        }
+    }
+}
+
+SCENARIO("set_temperature per-flavor command routing", "[GCodeWriter][Temperature]") {
+    GIVEN("temperature=210, no tool index, no wait") {
+        WHEN("flavor is Marlin 2") {
+            std::string out = GCodeWriter::set_temperature(210, gcfMarlinFirmware, false, -1, std::string());
+            THEN("output is M104 S210 with no tool qualifier") {
+                REQUIRE_THAT(out, Catch::Matchers::ContainsSubstring("M104 S210"));
+                REQUIRE_THAT(out, !Catch::Matchers::ContainsSubstring(" T"));
+                REQUIRE_THAT(out, !Catch::Matchers::ContainsSubstring("M109"));
+            }
+        }
+        WHEN("flavor is RepRapFirmware") {
+            std::string out = GCodeWriter::set_temperature(210, gcfRepRapFirmware, false, -1, std::string());
+            THEN("output is G10 S210 (M104 is deprecated on RRF)") {
+                REQUIRE_THAT(out, Catch::Matchers::ContainsSubstring("G10 S210"));
+                REQUIRE_THAT(out, !Catch::Matchers::ContainsSubstring("M104"));
+            }
+        }
+        WHEN("flavor is Mach3 or Machinekit") {
+            std::string mach3      = GCodeWriter::set_temperature(210, gcfMach3,      false, -1, std::string());
+            std::string machinekit = GCodeWriter::set_temperature(210, gcfMachinekit, false, -1, std::string());
+            THEN("output uses P-prefix for the value instead of S") {
+                REQUIRE_THAT(mach3,      Catch::Matchers::ContainsSubstring("M104 P210"));
+                REQUIRE_THAT(machinekit, Catch::Matchers::ContainsSubstring("M104 P210"));
+                REQUIRE_THAT(mach3,      !Catch::Matchers::ContainsSubstring("S210"));
+            }
+        }
+    }
+}
+
+SCENARIO("set_temperature wait=true handling per firmware", "[GCodeWriter][Temperature]") {
+    WHEN("flavor is Marlin 2 with wait") {
+        std::string out = GCodeWriter::set_temperature(210, gcfMarlinFirmware, true, -1, std::string());
+        THEN("output is M109 S210 (blocking wait)") {
+            REQUIRE_THAT(out, Catch::Matchers::ContainsSubstring("M109 S210"));
+            REQUIRE_THAT(out, !Catch::Matchers::ContainsSubstring("M104"));
+        }
+    }
+    WHEN("flavor is MakerWare or Sailfish with wait") {
+        std::string mw = GCodeWriter::set_temperature(210, gcfMakerWare, true, -1, std::string());
+        std::string sf = GCodeWriter::set_temperature(210, gcfSailfish,  true, -1, std::string());
+        THEN("output is empty — these flavors don't support blocking waits") {
+            REQUIRE(mw.empty());
+            REQUIRE(sf.empty());
+        }
+    }
+    WHEN("flavor is Teacup with wait") {
+        std::string out = GCodeWriter::set_temperature(210, gcfTeacup, true, -1, std::string());
+        THEN("output emits M104 + a separate M116 poll (Teacup doesn't support M109)") {
+            REQUIRE_THAT(out, Catch::Matchers::ContainsSubstring("M104 S210"));
+            REQUIRE_THAT(out, Catch::Matchers::ContainsSubstring("M116"));
+            REQUIRE_THAT(out, !Catch::Matchers::ContainsSubstring("M109"));
+        }
+    }
+    WHEN("flavor is RepRapFirmware with wait") {
+        std::string out = GCodeWriter::set_temperature(210, gcfRepRapFirmware, true, -1, std::string());
+        THEN("output emits G10 + M116 (same poll pattern as Teacup)") {
+            REQUIRE_THAT(out, Catch::Matchers::ContainsSubstring("G10 S210"));
+            REQUIRE_THAT(out, Catch::Matchers::ContainsSubstring("M116"));
+        }
+    }
+}
+
+SCENARIO("set_temperature per-tool qualifier routing for IMEX secondary carriages",
+         "[GCodeWriter][Temperature]") {
+    // IMEX secondary tools never go through a tool-change, so layer-change temperature
+    // for them is emitted via the tool-qualified static set_temperature overload.
+    GIVEN("temperature=220, tool=2, no wait") {
+        WHEN("flavor is Marlin 2") {
+            std::string out = GCodeWriter::set_temperature(220, gcfMarlinFirmware, false, 2, std::string());
+            THEN("output contains T2 qualifier") {
+                REQUIRE_THAT(out, Catch::Matchers::ContainsSubstring("M104 S220 T2"));
+            }
+        }
+        WHEN("flavor is RepRapFirmware") {
+            std::string out = GCodeWriter::set_temperature(220, gcfRepRapFirmware, false, 2, std::string());
+            THEN("output uses P-prefix for tool (RRF convention), not T") {
+                REQUIRE_THAT(out, Catch::Matchers::ContainsSubstring("G10 S220 P2"));
+                REQUIRE_THAT(out, !Catch::Matchers::ContainsSubstring(" T2"));
+            }
+        }
+        WHEN("flavor is Klipper") {
+            std::string out = GCodeWriter::set_temperature(220, gcfKlipper, false, 1, std::string());
+            THEN("output contains T1 qualifier (Klipper layer-change temperature uses T)") {
+                REQUIRE_THAT(out, Catch::Matchers::ContainsSubstring("M104 S220 T1"));
+            }
+        }
+    }
+}
+
+SCENARIO("set_temperature instance overload forces tool=-1 on single-extruder writers",
+         "[GCodeWriter][Temperature]") {
+    // Guards against spuriously emitting `T0` on printers that only have one extruder.
+    // The instance overload discards the tool argument when !multiple_extruders.
+    GIVEN("A default GCodeWriter (multiple_extruders=false)") {
+        GCodeWriter writer;
+        writer.config.gcode_flavor.value = gcfMarlinFirmware;
+
+        WHEN("set_temperature is called with tool=2") {
+            std::string out = writer.set_temperature(210, false, 2);
+            THEN("output has no T qualifier despite the caller passing tool=2") {
+                REQUIRE_THAT(out, Catch::Matchers::ContainsSubstring("M104 S210"));
+                REQUIRE_THAT(out, !Catch::Matchers::ContainsSubstring(" T"));
+            }
+        }
+    }
+    GIVEN("A GCodeWriter with multiple_extruders=true (not SEMM)") {
+        GCodeWriter writer;
+        writer.config.gcode_flavor.value = gcfMarlinFirmware;
+        writer.multiple_extruders = true;
+
+        WHEN("set_temperature is called with tool=2") {
+            std::string out = writer.set_temperature(210, false, 2);
+            THEN("tool argument passes through — output contains T2") {
+                REQUIRE_THAT(out, Catch::Matchers::ContainsSubstring("M104 S210 T2"));
+            }
+        }
+    }
+}
+
+SCENARIO("set_pressure_advance emits BBL M900 L1000 M10 regardless of tool index",
+         "[GCodeWriter][PressureAdvance]") {
+    GIVEN("A BBL-flagged GCodeWriter (the flag overrides firmware flavor routing)") {
+        GCodeWriter writer;
+        writer.set_is_bbl_machine(true);
+        // Flavor intentionally set to something other than the BBL branch to prove the flag wins.
+        writer.config.gcode_flavor.value = gcfMarlinFirmware;
+
+        WHEN("set_pressure_advance is called without a tool index") {
+            std::string out = writer.set_pressure_advance(0.05);
+            THEN("Output is the BBL-specific M900 Kx L1000 M10 form") {
+                REQUIRE_THAT(out, Catch::Matchers::ContainsSubstring("M900 K0.05 L1000 M10"));
+            }
+        }
+        WHEN("set_pressure_advance is called with a tool index") {
+            std::string out = writer.set_pressure_advance(0.05, 2);
+            THEN("BBL output is unchanged — no per-tool qualifier is emitted on BBL printers") {
+                REQUIRE_THAT(out, Catch::Matchers::ContainsSubstring("M900 K0.05 L1000 M10"));
+                REQUIRE_THAT(out, !Catch::Matchers::ContainsSubstring(" T2"));
+                REQUIRE_THAT(out, !Catch::Matchers::ContainsSubstring("EXTRUDER="));
+            }
+        }
+    }
+}
+
 TEST_CASE("Custom G-code motion limits are restored before generated moves", "[GCodeWriter]")
 {
     const std::string gcode = Slic3r::Test::slice({ cube(20) }, {
@@ -991,6 +1642,41 @@ TEST_CASE("Custom G-code motion limits are restored before generated moves", "[G
     REQUIRE(custom_gcode_pos != std::string::npos);
     REQUIRE(gcode.find("M204 S6000 ; adjust acceleration", custom_gcode_pos) != std::string::npos);
     REQUIRE(gcode.find("M205 X8 Y8 ; adjust jerk", custom_gcode_pos) != std::string::npos);
+}
+
+TEST_CASE("Klipper acceleration commands send accel_to_decel both as ACCEL_TO_DECEL and as the cruise ratio", "[GCodeWriter]")
+{
+    // Klipper 0.13 defines MINIMUM_CRUISE_RATIO = 1 - ACCEL_TO_DECEL / ACCEL; older releases read only the
+    // first parameter and current ones only the second, so both have to describe the same limit.
+    GCodeWriter writer;
+    writer.config.gcode_flavor.value = gcfKlipper;
+    writer.config.accel_to_decel_enable.value = true;
+    // The writer appends "; adjust ..." comments by default; keep them out so the line ends at the ratio.
+    struct CommentGuard
+    {
+        bool saved = GCodeWriter::full_gcode_comment;
+        ~CommentGuard() { GCodeWriter::full_gcode_comment = saved; }
+    } comment_guard;
+    GCodeWriter::full_gcode_comment = false;
+
+    SECTION("a 25% factor") {
+        writer.config.accel_to_decel_factor.value = 25;
+        REQUIRE_THAT(writer.set_print_acceleration(2000),
+                     Catch::Matchers::StartsWith("SET_VELOCITY_LIMIT ACCEL=2000 ACCEL_TO_DECEL=500 MINIMUM_CRUISE_RATIO=0.75"));
+        REQUIRE_THAT(writer.set_accel_and_jerk(3000, 0.0),
+                     Catch::Matchers::StartsWith("SET_VELOCITY_LIMIT ACCEL=3000 ACCEL_TO_DECEL=750 MINIMUM_CRUISE_RATIO=0.75"));
+    }
+    SECTION("a 100% factor turns the cruise ratio off") {
+        writer.config.accel_to_decel_factor.value = 100;
+        REQUIRE_THAT(writer.set_print_acceleration(2000),
+                     Catch::Matchers::StartsWith("SET_VELOCITY_LIMIT ACCEL=2000 ACCEL_TO_DECEL=2000 MINIMUM_CRUISE_RATIO=0\n"));
+    }
+    SECTION("neither is sent while the option is off") {
+        writer.config.accel_to_decel_enable.value = false;
+        const std::string line = writer.set_print_acceleration(2000);
+        REQUIRE_THAT(line, Catch::Matchers::StartsWith("SET_VELOCITY_LIMIT ACCEL=2000"));
+        REQUIRE_THAT(line, !Catch::Matchers::ContainsSubstring("ACCEL_TO_DECEL") && !Catch::Matchers::ContainsSubstring("MINIMUM_CRUISE_RATIO"));
+    }
 }
 
 // BELT_MOD -- with a bed-frame band installed, first-layer travel speed follows the destination's
@@ -1025,4 +1711,73 @@ SCENARIO("Writer: first-layer travel speed follows the bed-frame band", "[GCodeW
             }
         }
     }
+}
+
+TEST_CASE("Percent accelerations resolve against the option they are a percentage of", "[GCodeWriter]")
+{
+    DynamicPrintConfig config = DynamicPrintConfig::full_print_config();
+    config.set_deserialize_strict({
+        { "gcode_flavor",                       "marlin" },
+        { "machine_max_acceleration_extruding", "20000,20000" },
+        { "default_acceleration",               "4000" },
+        { "initial_layer_acceleration",         "0" },
+        { "outer_wall_acceleration",            "3000" },
+        { "bridge_acceleration",                "50%" },
+        { "sparse_infill_acceleration",         "25%" },
+        { "internal_solid_infill_acceleration", "60%" },
+        { "sparse_infill_density",              "20%" },
+    });
+    // get_abs_value_at() resolves each percentage through the ratio_over in the config definitions.
+    const std::map<std::string, int> expected = {
+        { "Bridge",                int(config.get_abs_value_at("bridge_acceleration", 0)) },
+        { "Sparse infill",         int(config.get_abs_value_at("sparse_infill_acceleration", 0)) },
+        { "Internal solid infill", int(config.get_abs_value_at("internal_solid_infill_acceleration", 0)) },
+    };
+    REQUIRE(expected.at("Bridge") == 1500);
+    REQUIRE(expected.at("Sparse infill") == 1000);
+    REQUIRE(expected.at("Internal solid infill") == 2400);
+
+    std::map<std::string, std::set<int>> accelerations_by_role;
+    std::string role;
+    int         acceleration = 0;
+    GCodeReader reader;
+    reader.parse_buffer(Slic3r::Test::slice({ TestMesh::bridge }, config), [&](GCodeReader &self, const GCodeReader::GCodeLine &line) {
+        float value;
+        if (boost::starts_with(line.raw(), ";TYPE:"))
+            role = line.raw().substr(6);
+        else if (line.cmd_is("M204") && line.has_value('S', value))
+            acceleration = int(value);
+        else if (line.extruding(self) && line.dist_XY(self) > 0)
+            accelerations_by_role[role].insert(acceleration);
+    });
+    for (const auto &[role_name, value] : expected) {
+        INFO(role_name);
+        REQUIRE(accelerations_by_role[role_name] == std::set<int>{ value });
+    }
+}
+
+TEST_CASE("Initial filament start G-code tolerates a list shorter than the filament count", "[GCodeWriter]")
+{
+    // Two filaments but only one filament_start_gcode entry, and the only object prints on
+    // filament 2, so the BBL export starts on a filament past the end of the list.
+    DynamicPrintConfig config = multifilament_config(2);
+    config.set_key_value("filament_start_gcode", new ConfigOptionStrings({"; filament start"}));
+
+    Model model;
+    auto *obj = model.add_object();
+    obj->add_volume(cube(20));
+    obj->add_instance();
+    obj->config.set_key_value("extruder", new ConfigOptionInt(2));
+
+    Print print;
+    print.is_BBL_printer() = true;
+    arrange_objects_on_test_bed(model, config);
+    for (auto *mo : model.objects) {
+        mo->ensure_on_bed();
+        print.auto_assign_extruders(mo);
+    }
+    print.apply(model, config);
+    print.validate();
+
+    REQUIRE_NOTHROW(Slic3r::Test::gcode(print));
 }

@@ -410,7 +410,7 @@ TEST_CASE("Nonplanar layers: a cut-plane object slices, and a gentle cut face is
     cp.normal = Vec3d(std::sin(8. * M_PI / 180.), 0., std::cos(8. * M_PI / 180.));
     stack.planes.push_back(cp);
     object->cut_planes  = stack;
-    instance->auto_drop = true;
+    object->auto_drop   = true;
     object->ensure_on_bed();
     DynamicPrintConfig config = base_config(true);
     config.set_deserialize_strict({ { "enable_nonplanar", "1" }, { "axis_selection", "virtual" }, { "print_sequence", "by group" } });

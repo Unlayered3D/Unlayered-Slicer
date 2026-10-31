@@ -1,9 +1,13 @@
 #ifndef slic3r_GUI_StateColor_hpp_
 #define slic3r_GUI_StateColor_hpp_
 
+#include <tuple>
+#include <utility>
+#include <vector>
 #include <wx/colour.h>
 
 #include <map>
+#include <wx/string.h>
 
 // Orders the std::map<wxColour, wxColour> tables below. Declared here rather than in
 // StateColor.cpp so every translation unit that looks up GetDarkMap() sees the same ordering.

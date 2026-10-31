@@ -117,7 +117,7 @@ TEST_CASE("A 3x3x3 grid of planes peels into seven chunks conserving volume", "[
     Model model;
     ModelObject *mo = make_object(model, { make_cube(20., 20., 20.) });
     mo->cut_planes.enabled = true;
-    for (const Vec3d &normal : { Vec3d::UnitX(), Vec3d::UnitY(), Vec3d::UnitZ() })
+    for (const Vec3d normal : { Vec3d::UnitX(), Vec3d::UnitY(), Vec3d::UnitZ() })
         for (double offset : { 5., 15. })
             mo->cut_planes.planes.push_back(plane_at(normal * offset, normal));
 

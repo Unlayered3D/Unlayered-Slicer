@@ -580,7 +580,7 @@ InvokeResult run_set_view(InvokeContext& ctx)
                                    {{"reason", "slider_menu_open"}});
     }
     if (r.view_type)
-        gv.select_view_type(*r.view_type); // as a pick in the legend's combo: label, visibility, moves slider
+        gv.pick_offered_view_type(*r.view_type); // as a pick in the legend's combo: label, visibility, moves slider
     if (r.time_mode)
         gv.set_time_mode(*r.time_mode);
     if (p.value("showAllFeatures", false))

@@ -2,16 +2,36 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstddef>
+#include <cstring>
 #include <functional>
 #include <map>
 #include <set>
+#include <wx/colour.h>
+#include <wx/gdicmn.h>
+#include <wx/event.h>
+#include "slic3r/GUI/Widgets/StateColor.hpp"
+#include <vector>
+#include <string>
+#include "slic3r/GUI/GUI_Utils.hpp"
+#include <wx/dc.h>
+#include <wx/dcmemory.h>
+#include <utility>
+#include <wx/chartype.h>
+#include <tuple>
+#include <wx/arrstr.h>
 #include <wx/image.h>
+#include <wx/panel.h>
 #include <wx/sizer.h>
 #include <wx/dcclient.h>
 #include <wx/dcbuffer.h>
 #include <wx/dcgraph.h>
 #include <wx/scrolwin.h>
+#include <wx/string.h>
 #include <wx/textctrl.h>
+#include <wx/toplevel.h>
+#include <wx/window.h>
+#include <wx/tglbtn.h>
 #include <wx/wrapsizer.h>
 #include <wx/tokenzr.h>
 
@@ -1150,7 +1170,7 @@ wxBoxSizer* MixedFilamentDialog::create_recommendation_grid()
     outer->Add(title_sizer, 0, wxEXPAND | wxBOTTOM, FromDIP(4));
 
     m_recommendation_scroll = new wxScrolledWindow(this, wxID_ANY, wxDefaultPosition, wxSize(-1, FromDIP(116)));
-    m_recommendation_scroll->SetScrollRate(0, 5);
+    m_recommendation_scroll->SetScrollRate(0, FromDIP(20));
     m_recommendation_scroll->SetBackgroundColour(StateColor::darkModeColorFor(wxColour("#F8F8F8")));
 
     m_recommendation_grid = new wxWrapSizer(wxHORIZONTAL, wxREMOVE_LEADING_SPACES);
@@ -1681,7 +1701,7 @@ void MixedFilamentDialog::update_ok_button_state()
             wxString parts;
             for (auto it = type_groups.begin(); it != type_groups.end(); ++it) {
                 if (!parts.empty())
-                    parts += _L(" and ");
+                    parts += "; ";
                 wxString slots;
                 for (size_t j = 0; j < it->second.size(); ++j) {
                     if (!slots.empty()) slots += ", ";
@@ -1689,7 +1709,7 @@ void MixedFilamentDialog::update_ok_button_state()
                 }
                 parts += wxString::Format(_L("Slot %s (%s)"), slots, wxString::FromUTF8(it->first));
             }
-            m_type_mismatch_msg = parts + " " + _L("cannot be mixed. Please select the same filament type.");
+            m_type_mismatch_msg = wxString::Format(_L("Different filament types cannot be mixed: %s. Please select the same filament type."), parts);
         } else {
             m_type_mismatch_msg.clear();
         }

@@ -5,14 +5,16 @@
 #include "slic3r/GUI/GLCanvas3D.hpp"
 #include "slic3r/GUI/CameraUtils.hpp"
 
-#include <GL/glew.h>
+#include <glad/gl.h>
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <map>
 #include <queue>
 
+#include "slic3r/GUI/GUI.hpp"
 #include "slic3r/GUI/GUI_App.hpp"
+#include "slic3r/GUI/ImGuiWrapper.hpp"
 #include "slic3r/GUI/Plater.hpp"
 #include "slic3r/GUI/Gizmos/GizmoObjectManipulation.hpp"
 #include "slic3r/GUI/format.hpp"

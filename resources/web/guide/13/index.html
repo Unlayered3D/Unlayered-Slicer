@@ -8,9 +8,9 @@
 <link rel="stylesheet" type="text/css" href="../css/common.css" />
 <link rel="stylesheet" type="text/css" href="../css/dark.css" />
 <link rel="stylesheet" type="text/css" href="privacy.css" />
-<script type="text/javascript" src="../js/jquery-3.6.0.min.js"></script>
+<script type="text/javascript" src="../../include/jquery-3.6.0.min.js"></script>
 <script type="text/javascript" src="../js/json2.js"></script>
-<script type="text/javascript" src="../../data/text.js"></script>
+<script type="text/javascript" src="../../include/i18n.js"></script>
 <script type="text/javascript" src="../js/globalapi.js"></script>
 <script type="text/javascript" src="../js/common.js"></script>
 <script type="text/javascript" src="13.js"></script>
@@ -21,7 +21,9 @@
      Under "Share", a separate "Slicing improvement program" box, never ticked in advance anywhere: the only
      consent that lets diagnostics be used for AI training. Continue stays disabled until there is an
      answer. The slicer saves the answer the moment Continue is pressed (PrivacyFlow), before anything
-     optional could start. Wording changes that need a new answer bump PrivacyConsent::NOTICE_VERSION. -->
+     optional could start. Wording changes that need a new answer bump PrivacyConsent::NOTICE_VERSION.
+     The approved consent wording is shown as written (no data-i18n): a translation would need its own
+     approval. Only the Back button is translated (guide_strings() "back"). -->
 <body onLoad="OnInit()">
 <div id="Title">
 	<div id="PrivacyTitle">Help us build a better slicer</div>
@@ -57,7 +59,7 @@
 	<div id="SaveError" class="Notice" role="alert" hidden>Your choice could not be saved. Go back and check where you live.</div>
 </div>
 <div id="AcceptArea">
-	<button type="button" class="ButtonStyleRegular ButtonTypeChoice trans" tid="t8" id="PreBtn" onclick="GoBack()">Back</button>
+	<button type="button" class="ButtonStyleRegular ButtonTypeChoice" id="PreBtn" onclick="GoBack()" data-i18n="back">Back</button>
 	<button type="button" class="ButtonStyleConfirm ButtonTypeChoice" id="ContinueBtn" onclick="GoContinue()" disabled>Continue</button>
 </div>
 </body>

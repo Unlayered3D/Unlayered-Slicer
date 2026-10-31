@@ -18,7 +18,7 @@
 #include <CGAL/Polygon_mesh_processing/stitch_borders.h>
 #include <CGAL/Polygon_mesh_processing/refine.h>
 #include <CGAL/AABB_tree.h>
-#include <CGAL/AABB_traits.h>
+#include <CGAL/AABB_traits_3.h>
 #include <CGAL/AABB_face_graph_triangle_primitive.h>
 #include <CGAL/Constrained_Delaunay_triangulation_2.h>
 
@@ -26,6 +26,7 @@
 
 #include <future>
 #include <thread>
+#include <variant>
 
 #include <Eigen/SVD>
 #include <Eigen/Sparse>
@@ -53,7 +54,7 @@ using Point_3   = K::Point_3;
 using Plane_3   = K::Plane_3;
 using Mesh      = CGAL::Surface_mesh<Point_3>;
 using Primitive = CGAL::AABB_face_graph_triangle_primitive<Mesh>;
-using Traits    = CGAL::AABB_traits<K, Primitive>;
+using Traits    = CGAL::AABB_traits_3<K, Primitive>;
 using Tree      = CGAL::AABB_tree<Traits>;
 namespace PMP   = CGAL::Polygon_mesh_processing;
 
@@ -2823,7 +2824,7 @@ static VoxGrid voxelize(const Eigen::MatrixXd& V, const Eigen::MatrixXi& F, int 
         std::vector<double> zs;
         zs.reserve(hits.size());
         for (auto& h : hits)
-            if (const Point_3* pt = boost::get<Point_3>(&h.first))
+            if (const Point_3* pt = std::get_if<Point_3>(&h.first))   // CGAL 6: std::variant
                 zs.push_back(pt->z());
         if (zs.empty()) continue;
 

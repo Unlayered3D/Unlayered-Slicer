@@ -199,7 +199,10 @@ json restore_settings(BridgeHost& host, const TurnLog::Turn& turn, json& skipped
     std::map<std::string, std::vector<const TurnLog::SettingWrite*>> by_type;
     for (const TurnLog::SettingWrite& w : turn.settings)
         by_type[w.type].push_back(&w);
-    for (auto& [type_name, writes] : by_type) {
+    for (auto& entry : by_type) {
+        // Named, not a structured binding: the skip lambdas below capture it, which is C++20.
+        const std::string& type_name = entry.first;
+        auto&              writes    = entry.second;
         if (type_name == "project") {
             // Project configuration (filament colours, flush volumes, bed type ...): not a tab.
             if (wxGetApp().preset_bundle == nullptr || wxGetApp().plater() == nullptr)

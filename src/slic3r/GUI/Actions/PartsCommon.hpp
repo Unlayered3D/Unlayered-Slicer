@@ -100,7 +100,7 @@ inline TriangleMesh make_primitive(const std::string& shape, double side)
     if (shape == "sphere")   return TriangleMesh(its_make_sphere(0.5 * side, PI / 90));
     if (shape == "cone")     return TriangleMesh(its_make_cone(0.5 * side, side));
     if (shape == "disc")     return TriangleMesh(its_make_cylinder(0.5 * side, 0.2f));
-    if (shape == "torus")    return TriangleMesh(its_make_torus(0.5 * side, 0.125 * side, PI / 60));
+    if (shape == "torus")    return TriangleMesh(its_make_torus(0.5 * side, 0.125 * side, PI / 60, PI / 60));
     return {};
 }
 

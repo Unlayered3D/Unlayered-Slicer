@@ -1,9 +1,28 @@
 #include "calib.hpp"
+#include "GCode/BeltKinematics.hpp"
 #include "BoundingBox.hpp"
 #include "Config.hpp"
+#include "Extruder.hpp"
+#include "Flow.hpp"
+#include "GCodeWriter.hpp"
+#include "GCode/GCodeProcessor.hpp"
+#include "CustomGCode.hpp"
 #include "Model.hpp"
 #include "GCode.hpp"
+#include "PrintConfig.hpp"
+#include <algorithm>
+#include "Point.hpp"
+#include "libslic3r.h"
 #include <cmath>
+#include <string>
+#include <sstream>
+#include <math.h>
+#include <iomanip>
+#include <vector>
+#include <cstddef>
+#include <memory>
+#include <utility>
+#include "clonable_ptr.hpp"
 
 namespace Slic3r {
 
@@ -11,12 +30,23 @@ namespace Slic3r {
 float CalibPressureAdvance::find_optimal_PA_speed(const DynamicPrintConfig &config, double line_width, double layer_height, int extruder_id, int filament_idx)
 {
     const double general_suggested_min_speed   = 100.0;
-    double       filament_max_volumetric_speed = config.option<ConfigOptionFloats>("filament_max_volumetric_speed")->get_at(filament_idx);
+    // Read defensively — CLI callers may hand us a config missing optional keys.
+    auto vector_at = [&config](const char *key, int idx) -> double {
+        if (const auto *o = config.option<ConfigOptionFloats>(key)) return o->get_at(idx);
+        const ConfigOptionDef *d = config.def() ? config.def()->get(key) : nullptr;
+        return (d && d->default_value) ? d->get_default_value<ConfigOptionFloats>()->get_at(idx) : 0.0;
+    };
+    auto nullable_at = [&config](const char *key, int idx) -> double {
+        if (const auto *o = config.option<ConfigOptionFloatsNullable>(key)) return o->get_at(idx);
+        const ConfigOptionDef *d = config.def() ? config.def()->get(key) : nullptr;
+        return (d && d->default_value) ? d->get_default_value<ConfigOptionFloatsNullable>()->get_at(idx) : 0.0;
+    };
+    double       filament_max_volumetric_speed = vector_at("filament_max_volumetric_speed", filament_idx);
     // todo multi_extruders:
-    const float  nozzle_diameter               = config.option<ConfigOptionFloats>("nozzle_diameter")->get_at(extruder_id);
+    const float  nozzle_diameter               = vector_at("nozzle_diameter", extruder_id);
     if (line_width <= 0.) line_width = Flow::auto_extrusion_width(frPerimeter, nozzle_diameter);
     Flow         pattern_line = Flow(line_width, layer_height, nozzle_diameter);
-    auto         pa_speed     = std::min(std::max(general_suggested_min_speed, config.option<ConfigOptionFloatsNullable>("outer_wall_speed")->get_at(extruder_id)),
+    auto         pa_speed     = std::min(std::max(general_suggested_min_speed, nullable_at("outer_wall_speed", extruder_id)),
                                          filament_max_volumetric_speed / pattern_line.mm3_per_mm());
 
     return std::floor(pa_speed);
@@ -238,12 +268,13 @@ double CalibPressureAdvance::get_distance(Vec2d from, Vec2d to) const
 }
 
 std::string CalibPressureAdvance::draw_line(
-    GCodeWriter &writer, Vec2d to_pt, double line_width, double layer_height, double speed, const std::string &comment)
+    GCodeWriter &writer, Vec2d to_pt, double line_width, double layer_height, double speed, const std::string &comment, double e_per_mm)
 {
-    const double e_per_mm = CalibPressureAdvance::e_per_mm(line_width, layer_height,
-                                                           m_config.option<ConfigOptionFloats>("nozzle_diameter")->get_at(0),
-                                                           m_config.option<ConfigOptionFloats>("filament_diameter")->get_at(0),
-                                                           m_config.option<ConfigOptionFloatsNullable>("filament_flow_ratio")->get_at(0));
+    if (e_per_mm <= 0.)
+        e_per_mm = CalibPressureAdvance::e_per_mm(line_width, layer_height,
+                                                  m_config.option<ConfigOptionFloats>("nozzle_diameter")->get_at(0),
+                                                  m_config.option<ConfigOptionFloats>("filament_diameter")->get_at(0),
+                                                  m_config.option<ConfigOptionFloatsNullable>("filament_flow_ratio")->get_at(0));
 
     const double length = get_distance(Vec2d(m_last_pos.x(), m_last_pos.y()), to_pt);
     auto         dE     = e_per_mm * length;
@@ -294,19 +325,19 @@ std::string CalibPressureAdvance::draw_box(GCodeWriter &writer, double min_x, do
 
         y += size_y - i * spacing * 2;
         comment = "Draw perimeter (up)";
-        gcode << draw_line(writer, Vec2d(x, y), line_arg_line_width, line_arg_height, line_arg_speed, comment);
+        gcode << draw_line(writer, Vec2d(x, y), line_arg_line_width, line_arg_height, line_arg_speed, comment, opt_args.e_per_mm);
 
         x += size_x - i * spacing * 2;
         comment = "Draw perimeter (right)";
-        gcode << draw_line(writer, Vec2d(x, y), line_arg_line_width, line_arg_height, line_arg_speed, comment);
+        gcode << draw_line(writer, Vec2d(x, y), line_arg_line_width, line_arg_height, line_arg_speed, comment, opt_args.e_per_mm);
 
         y -= size_y - i * spacing * 2;
         comment = "Draw perimeter (down)";
-        gcode << draw_line(writer, Vec2d(x, y), line_arg_line_width, line_arg_height, line_arg_speed, comment);
+        gcode << draw_line(writer, Vec2d(x, y), line_arg_line_width, line_arg_height, line_arg_speed, comment, opt_args.e_per_mm);
 
         x -= size_x - i * spacing * 2;
         comment = "Draw perimeter (left)";
-        gcode << draw_line(writer, Vec2d(x, y), line_arg_line_width, line_arg_height, line_arg_speed, comment);
+        gcode << draw_line(writer, Vec2d(x, y), line_arg_line_width, line_arg_height, line_arg_speed, comment, opt_args.e_per_mm);
     }
 
     if (!opt_args.is_filled) {
@@ -343,7 +374,7 @@ std::string CalibPressureAdvance::draw_box(GCodeWriter &writer, double min_x, do
                 y += x - x_min_bound;
                 x                     = x_min_bound;
                 comment = "Fill: Print up/left";
-                gcode << draw_line(writer, Vec2d(x, y), line_arg_line_width, line_arg_height, line_arg_speed, comment);
+                gcode << draw_line(writer, Vec2d(x, y), line_arg_line_width, line_arg_height, line_arg_speed, comment, opt_args.e_per_mm);
             } else {
                 y += spacing_45;
                 x = x_min_bound;
@@ -352,7 +383,7 @@ std::string CalibPressureAdvance::draw_box(GCodeWriter &writer, double min_x, do
                 x += y - y_min_bound;
                 y                     = y_min_bound;
                 comment = "Fill: Print down/right";
-                gcode << draw_line(writer, Vec2d(x, y), line_arg_line_width, line_arg_height, line_arg_speed, comment);
+                gcode << draw_line(writer, Vec2d(x, y), line_arg_line_width, line_arg_height, line_arg_speed, comment, opt_args.e_per_mm);
             }
         } else if (i < std::max(x_count, y_count)) {
             if (x_count > y_count) {
@@ -365,7 +396,7 @@ std::string CalibPressureAdvance::draw_box(GCodeWriter &writer, double min_x, do
                     x -= y_max_bound - y_min_bound;
                     y                     = y_max_bound;
                     comment = "Fill: Print up/left";
-                    gcode << draw_line(writer, Vec2d(x, y), line_arg_line_width, line_arg_height, line_arg_speed, comment);
+                    gcode << draw_line(writer, Vec2d(x, y), line_arg_line_width, line_arg_height, line_arg_speed, comment, opt_args.e_per_mm);
                 } else {
                     if (i == y_count) {
                         x += spacing_45 - y_remainder;
@@ -379,7 +410,7 @@ std::string CalibPressureAdvance::draw_box(GCodeWriter &writer, double min_x, do
                     x += y_max_bound - y_min_bound;
                     y                     = y_min_bound;
                     comment = "Fill: Print down/right";
-                    gcode << draw_line(writer, Vec2d(x, y), line_arg_line_width, line_arg_height, line_arg_speed, comment);
+                    gcode << draw_line(writer, Vec2d(x, y), line_arg_line_width, line_arg_height, line_arg_speed, comment, opt_args.e_per_mm);
                 }
             } else {
                 // box is taller than wide
@@ -396,7 +427,7 @@ std::string CalibPressureAdvance::draw_box(GCodeWriter &writer, double min_x, do
                     x = x_min_bound;
                     y += x_max_bound - x_min_bound;
                     comment = "Fill: Print up/left";
-                    gcode << draw_line(writer, Vec2d(x, y), line_arg_line_width, line_arg_height, line_arg_speed, comment);
+                    gcode << draw_line(writer, Vec2d(x, y), line_arg_line_width, line_arg_height, line_arg_speed, comment, opt_args.e_per_mm);
                 } else {
                     x = x_min_bound;
                     y += spacing_45;
@@ -405,7 +436,7 @@ std::string CalibPressureAdvance::draw_box(GCodeWriter &writer, double min_x, do
                     x = x_max_bound;
                     y -= x_max_bound - x_min_bound;
                     comment = "Fill: Print down/right";
-                    gcode << draw_line(writer, Vec2d(x, y), line_arg_line_width, line_arg_height, line_arg_speed, comment);
+                    gcode << draw_line(writer, Vec2d(x, y), line_arg_line_width, line_arg_height, line_arg_speed, comment, opt_args.e_per_mm);
                 }
             }
         } else {
@@ -421,7 +452,7 @@ std::string CalibPressureAdvance::draw_box(GCodeWriter &writer, double min_x, do
                 x -= y_max_bound - y;
                 y                     = y_max_bound;
                 comment = "Fill: Print up/left";
-                gcode << draw_line(writer, Vec2d(x, y), line_arg_line_width, line_arg_height, line_arg_speed, comment);
+                gcode << draw_line(writer, Vec2d(x, y), line_arg_line_width, line_arg_height, line_arg_speed, comment, opt_args.e_per_mm);
             } else {
                 if (i == y_count) {
                     x += spacing_45 - y_remainder;
@@ -434,7 +465,7 @@ std::string CalibPressureAdvance::draw_box(GCodeWriter &writer, double min_x, do
                 y -= x_max_bound - x;
                 x                     = x_max_bound;
                 comment = "Fill: Print down/right";
-                gcode << draw_line(writer, Vec2d(x, y), line_arg_line_width, line_arg_height, line_arg_speed, comment);
+                gcode << draw_line(writer, Vec2d(x, y), line_arg_line_width, line_arg_height, line_arg_speed, comment, opt_args.e_per_mm);
             }
         }
     }
@@ -442,8 +473,11 @@ std::string CalibPressureAdvance::draw_box(GCodeWriter &writer, double min_x, do
     return gcode.str();
 }
 CalibPressureAdvanceLine::CalibPressureAdvanceLine(GCode* gcodegen)
-    : CalibPressureAdvance(gcodegen->config()), mp_gcodegen(gcodegen), m_nozzle_diameter(gcodegen->config().nozzle_diameter.get_at(0))
+    : CalibPressureAdvance(gcodegen->config()), mp_gcodegen(gcodegen)
 {
+    // The test prints with the filament the G-code generator has selected, on that filament's extruder.
+    const Extruder *filament = gcodegen->writer().filament();
+    m_nozzle_diameter   = gcodegen->config().nozzle_diameter.get_at(filament ? filament->extruder_id() : 0);
     m_line_width        = m_nozzle_diameter < 0.51 ? m_nozzle_diameter * 1.5 : m_nozzle_diameter * 1.05;
     m_height_layer      = gcodegen->config().initial_layer_print_height;
     m_number_line_width = m_thin_line_width = m_nozzle_diameter;
@@ -501,16 +535,16 @@ std::string CalibPressureAdvanceLine::print_pa_lines(double start_x, double star
     auto       &writer = mp_gcodegen->writer();
     const auto &config = mp_gcodegen->config();
 
-    const auto filament_diameter = config.filament_diameter.get_at(0);
-    const auto print_flow_ratio  = config.print_flow_ratio;
     const auto z_offset          = config.z_offset;
 
-    const double e_per_mm        = CalibPressureAdvance::e_per_mm(m_line_width, m_height_layer, m_nozzle_diameter, filament_diameter,
-                                                                  print_flow_ratio);
-    const double thin_e_per_mm   = CalibPressureAdvance::e_per_mm(m_thin_line_width, m_height_layer, m_nozzle_diameter, filament_diameter,
-                                                                  print_flow_ratio);
-    const double number_e_per_mm = CalibPressureAdvance::e_per_mm(m_number_line_width, m_height_layer, m_nozzle_diameter, filament_diameter,
-                                                                  print_flow_ratio);
+    // Extrude like a regular print with the selected filament: its diameter and flow ratio, times the print flow ratio.
+    const Extruder *filament      = writer.filament();
+    const auto      line_e_per_mm = [&](double line_width) {
+        return filament->e_per_mm(Flow(line_width, m_height_layer, m_nozzle_diameter).mm3_per_mm() * config.print_flow_ratio);
+    };
+    const double e_per_mm        = line_e_per_mm(m_line_width);
+    const double thin_e_per_mm   = line_e_per_mm(m_thin_line_width);
+    const double number_e_per_mm = line_e_per_mm(m_number_line_width);
 
     const double      fast = CalibPressureAdvance::speed_adjust(m_fast_speed);
     const double      slow = CalibPressureAdvance::speed_adjust(m_slow_speed);
@@ -561,6 +595,7 @@ std::string CalibPressureAdvanceLine::print_pa_lines(double start_x, double star
         DrawBoxOptArgs default_box_opt_args(2, m_height_layer, m_line_width, fast);
         //Draw box
         default_box_opt_args.is_filled = true;
+        default_box_opt_args.e_per_mm  = e_per_mm; // same line width and height as the PA lines
         gcode << ";" << GCodeProcessor::reserved_tag(GCodeProcessor::ETags::Role) << "Bottom surface\n";
         gcode << draw_box(writer, box_start_x, start_y - m_space_y,
                           number_spacing() * 8, (num + 1) * m_space_y, default_box_opt_args);
@@ -848,6 +883,28 @@ void CalibPressureAdvancePattern::_refresh_writer(bool is_bbl_machine, const Mod
 {
     PrintConfig print_config;
     print_config.apply(m_config, true);
+
+    // ORCA-Belt: the pattern is drawn in logical bed coordinates directly on
+    // the build surface — on a belt printer that means the belt plane, which
+    // needs the machine kinematics (axis remap + frame shear/scale) with the
+    // coordinates interpreted as world points (see set_world_coordinates).
+    if (print_config.belt_printer.value) {
+        auto belt_writer = std::make_shared<GCodeWriter>();
+        install_belt_kinematics(*belt_writer, print_config, /*world_coordinates=*/true);
+        const int rx = int(print_config.gcode_remap_x.value);
+        const int ry = int(print_config.gcode_remap_y.value);
+        const int rz = int(print_config.gcode_remap_z.value);
+        if (rx != 0 || ry != 1 || rz != 2) {
+            belt_writer->set_axis_remap(rx, ry, rz);
+            BoundingBoxf bbox_bed(print_config.printable_area.values);
+            belt_writer->set_build_volume_max(Vec3d(bbox_bed.max.x(), bbox_bed.max.y(),
+                                                    print_config.printable_height.value));
+        }
+        m_writer = std::move(belt_writer);
+    } else if (m_writer && dynamic_cast<const BeltKinematics *>(&m_writer->kinematics()) != nullptr) {
+        // Previously configured for a belt printer; drop back to a plain writer.
+        m_writer = std::make_shared<GCodeWriter>();
+    }
 
     m_writer->apply_print_config(print_config);
     m_writer->set_xy_offset(origin(0), origin(1));

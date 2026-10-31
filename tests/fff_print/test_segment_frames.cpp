@@ -59,12 +59,11 @@ struct SegmentedCube
         cp.normal = plane_normal;
         stack.planes.push_back(cp);
         object->cut_planes = stack;
-        // ensure_on_bed() skips any instance whose auto_drop is clear, and it defaults to clear
-        // under the seat-once import policy -- so this call is a no-op unless the flag is set, and
-        // the cube would sit wherever the instance transform left it. Under the mirrored variant
-        // that is 20 mm UNDER the plate, which is not what this fixture means by "a cube" and not
-        // what its first-layer assertions are about.
-        instance->auto_drop = true;
+        // ensure_on_bed() does nothing for an object whose auto_drop is clear, and the cube would
+        // then sit wherever the instance transform left it. Under the mirrored variant that is
+        // 20 mm UNDER the plate, which is not what this fixture means by "a cube" and not what its
+        // first-layer assertions are about.
+        object->auto_drop = true;
         object->ensure_on_bed();
 
         DynamicPrintConfig config = DynamicPrintConfig::full_print_config();

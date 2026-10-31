@@ -3,10 +3,16 @@
 #include "libslic3r/libslic3r.h"
 #include "libslic3r/Geometry.hpp"
 #include "libslic3r/Layer.hpp"
+#include "libslic3r/Model.hpp"
+#include "libslic3r/Polygon.hpp"
 #include "libslic3r/Print.hpp"
 #include "libslic3r/Support/SupportDirection.hpp"
+#include "libslic3r/TriangleSelector.hpp"
 
 #include "test_helpers.hpp"
+
+#include <algorithm>
+#include <utility>
 
 using namespace Slic3r;
 using Catch::Matchers::WithinAbs;

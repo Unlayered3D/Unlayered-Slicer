@@ -16,6 +16,11 @@ set(ORCA_VERSION_PATCH ${CMAKE_MATCH_3})
 
 set(SLIC3R_VERSION "02.08.01.55")
 
+# The OrcaSlicer version this tree is based on: upstream's SoftFever_VERSION, copied at each upstream merge.
+# 3MF files record it where OrcaSlicer records its own version, so OrcaSlicer and this fork judge them on
+# OrcaSlicer's version line; UNLAYERED_VERSION is this fork's own release.
+set(ORCA_BASE_VERSION "2.5.0-dev")
+
 # Windows FileVersion/ProductVersion and the macOS CFBundleVersion are built from this. It was never
 # set, so every shipped binary reported a blank version in its file properties.
 set(SLIC3R_BUILD_ID "${SLIC3R_APP_NAME}-${UNLAYERED_VERSION}")

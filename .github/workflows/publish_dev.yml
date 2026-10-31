@@ -1,6 +1,6 @@
 name: Publish dev build
 
-# Publishes one Build all run's installers to unlayered3d.com's dev channel (/software/beta), with
+# Publishes one Build all run's installers to unlayered3d.com's dev channel (admins only, /admin/software), with
 # .github/publish/publish-software.mjs. Called at the end of Build all when its `publish` input is
 # on (nightly_dev.yml turns it on), or run by hand with an earlier run's ID to publish that run
 # without rebuilding. See .github/publish/README.md.

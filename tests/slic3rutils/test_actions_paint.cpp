@@ -287,8 +287,8 @@ TEST_CASE("Brim ear corners: convex corners of outlines, concave corners of hole
 {
     // A 20 mm square with a 6 mm square hole: the four outer corners get ears; the hole's corners are
     // reflex seen from the material, so none there (the tool reverses holes and takes concave points).
-    Polygon outer({{0, 0}, {scaled(20.), 0}, {scaled(20.), scaled(20.)}, {0, scaled(20.)}});
-    Polygon hole({{scaled(7.), scaled(7.)}, {scaled(7.), scaled(13.)}, {scaled(13.), scaled(13.)}, {scaled(13.), scaled(7.)}});
+    Slic3r::Polygon outer({{0, 0}, {scaled(20.), 0}, {scaled(20.), scaled(20.)}, {0, scaled(20.)}});
+    Slic3r::Polygon hole({{scaled(7.), scaled(7.)}, {scaled(7.), scaled(13.)}, {scaled(13.), scaled(13.)}, {scaled(13.), scaled(7.)}});
     ExPolygon ex;
     ex.contour = outer;
     ex.holes   = {hole};

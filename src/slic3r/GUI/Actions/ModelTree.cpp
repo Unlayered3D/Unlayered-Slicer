@@ -174,7 +174,7 @@ nlohmann::json build_model_tree(const Model& model, const PartPlateList* plates_
                                          {"scale", vec3_json(mi->get_scaling_factor())},
                                          {"mirrored", mi->is_left_handed()},
                                          {"printable", mi->printable},
-                                         {"autoDrop", mi->auto_drop},
+                                         {"autoDrop", mo->auto_drop},
                                          {"bboxMm", bbox_json(mo->instance_bounding_box(i))}};
             if (plates != nullptr)
                 inst["plate"] = inst_plates[i];
@@ -321,7 +321,7 @@ std::string tree_version(const Model& model)
         for (const ModelInstance* mi : mo->instances) {
             s += "I" + std::to_string(mi->id().id);
             s += mi->printable ? "p" : "n";
-            s += mi->auto_drop ? "a" : "-";
+            s += mo->auto_drop ? "a" : "-";
             mat(mi->get_matrix());
         }
         for (const ModelVolume* mv : mo->volumes) {

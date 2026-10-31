@@ -1,6 +1,8 @@
 #include "Preferences.hpp"
+#include "CloudProvider.hpp"
 #include "OptionsGroup.hpp"
 #include "GUI_App.hpp"
+#include "ImGuiWrapper.hpp"
 #include "FocusRing.hpp"
 #include "Theme.hpp"
 #include <wx/clrpicker.h>
@@ -11,6 +13,7 @@
 #include <gtk/gtk.h>
 #endif
 #include "MainFrame.hpp"
+#include "WebViewDialog.hpp"
 #include "Plater.hpp"
 #include "GLCanvas3D.hpp" // ORCA: for live preview refresh when toggling "Dim lower layers"
 #include "MsgDialog.hpp"
@@ -20,14 +23,64 @@
 #include "SliceServiceOptionsDialog.hpp"
 #include "libslic3r/AppConfig.hpp"
 #include "libslic3r/Format/DRC.hpp"
+#include <wx/gdicmn.h>
+#include <wx/arrstr.h>
+#include "slic3r/GUI/Widgets/Label.hpp"
+#include <wx/event.h>
+#include <wx/dcclient.h>
+#include "slic3r/GUI/Widgets/StateColor.hpp"
+#include <cmath>
+#include <tuple>
+#include <string>
+#include <vector>
+#include <functional>
+#include <cstdlib>
+#include <cassert>
+#include <algorithm>
+#include <wx/intl.h>
+#include <cstddef>
+#include "libslic3r/libslic3r.h"
+#include "libslic3r/Utils.hpp"
+#include "slic3r/GUI/Widgets/TextInput.hpp"
+#include <utility>
+#include "slic3r/GUI/Widgets/SpinInput.hpp"
+#include "slic3r/GUI/Widgets/CheckBox.hpp"
+#include "libslic3r/Format/bbs_3mf.hpp"
+#include <boost/lexical_cast.hpp>
+#include "slic3r/GUI/Event.hpp"
+#include <boost/log/trivial.hpp>
+#include "libslic3r/Preset.hpp"
+#include "slic3r/GUI/Widgets/Button.hpp"
+#include <wx/chartype.h>
+#include <wx/dirdlg.h>
+#include "slic3r/GUI/GUI_Utils.hpp"
+#include "slic3r/GUI/GUI.hpp"
+#include "slic3r/GUI/Widgets/TabCtrl.hpp"
+#include "slic3r/GUI/Field.hpp"
+#include <map>
+#include "slic3r/GUI/ReleaseNote.hpp"
 #include <wx/language.h>
 #include "OG_CustomCtrl.hpp"
+#include "libslic3r_version.h"
 #include "wx/graphics.h"
 #include <wx/listimpl.cpp>
 #include <wx/display.h>
+#include <wx/string.h>
+#include <wx/panel.h>
+#include <wx/utils.h>
+#include <wx/valtext.h>
+#include <wx/textctrl.h>
+#include <wx/spinctrl.h>
+#include <wx/tglbtn.h>
+#include <wx/stattext.h>
+#include <wx/treebase.h>
+#include <wx/types.h>
+#include <wx/timer.h>
 #include "NetworkTestDialog.hpp"
+#include "SceneBenchmark.hpp"
 #include "Widgets/StaticLine.hpp"
 #include "Widgets/RadioGroup.hpp"
+#include "Shortcuts.hpp"
 #include "slic3r/Utils/bambu_networking.hpp"
 #include "slic3r/Utils/NetworkAgent.hpp"
 #include "slic3r/Utils/UsageTelemetry.hpp"
@@ -280,7 +333,7 @@ wxBoxSizer *PreferencesDialog::create_item_label(wxString label, wxString toolti
     if(!wiki_url.IsEmpty())
         url = "https://www.orcaslicer.com/wiki/" + wiki_url;
 
-    auto label_ctrl = new WikiLabel(m_parent, label, url, wxDefaultPosition, DESIGN_TITLE_SIZE);
+    auto label_ctrl = new WikiLabel(m_parent, label, url, wxDefaultPosition, PREFERENCES_TITLE_SIZE);
 
     label_ctrl->SetToolTip(tooltip);
 
@@ -299,6 +352,7 @@ std::tuple<wxBoxSizer*, ComboBox*> PreferencesDialog::create_item_combobox_base(
     auto combobox = new ::ComboBox(m_parent, wxID_ANY, wxEmptyString, wxDefaultPosition, DESIGN_LARGE_COMBOBOX_SIZE, 0, nullptr, wxCB_READONLY);
     combobox->GetDropDown().SetUseContentWidth(true);
     combobox->SetToolTip(tip);
+    combobox->SetName(param);   // select_tab() finds the row by this name
 
     std::vector<wxString>::iterator iter;
     for (iter = vlist.begin(); iter != vlist.end(); iter++) {
@@ -341,7 +395,7 @@ wxBoxSizer *PreferencesDialog::create_item_combobox(wxString title, wxString too
 
     auto current_setting = app_config->get(param);
     if (!current_setting.empty()) {
-        auto compare  = [current_setting](string possible_setting) { return current_setting == possible_setting; };
+        auto compare  = [current_setting](std::string possible_setting) { return current_setting == possible_setting; };
         auto iterator = find_if(config_name_index.begin(), config_name_index.end(), compare);
         if (iterator != config_name_index.end())
             current_index = static_cast<unsigned int>(iterator - config_name_index.begin());
@@ -384,7 +438,8 @@ wxBoxSizer *PreferencesDialog::create_item_language_combobox(wxString title, wxS
         wxLANGUAGE_PORTUGUESE_BRAZILIAN,
         wxLANGUAGE_LITHUANIAN,
         wxLANGUAGE_VIETNAMESE,
-        wxLANGUAGE_THAI
+        wxLANGUAGE_THAI,
+        wxLANGUAGE_ROMANIAN
     };
 
     auto translations = wxTranslations::Get()->GetAvailableTranslations(SLIC3R_APP_CATALOG);
@@ -521,29 +576,26 @@ wxBoxSizer *PreferencesDialog::create_item_language_combobox(wxString title, wxS
                         wxString(SLIC3R_APP_FULL_NAME) + " - " + _L("Save"), wxYES_NO | wxCANCEL | wxYES_DEFAULT | wxCENTRE).ShowModal();
 
                     if (result == wxID_YES) {
-                        wxGetApp().plater()->save_project();
+                        if (wxGetApp().plater()->save_project() != wxID_YES) {
+                            // The save was cancelled (e.g. the unresolved-plugin warning): do not
+                            // switch languages as if the project had been saved.
+                            combobox->SetSelection(m_current_language_selected);
+                            return;
+                        }
+                    } else if (result != wxID_NO) {
+                        // Cancel or ESC on the save prompt: keep the current language.
+                        combobox->SetSelection(m_current_language_selected);
+                        return;
                     }
                 }
 
-
-                // the dialog needs to be destroyed before the call to switch_language()
-                // or sometimes the application crashes into wxDialogBase() destructor
-                // so we put it into an inner scope
-                MessageDialog msg_wingow(nullptr, _L("Switching languages requires the application to restart.\n") + "\n" + _L("Do you want to continue?"),
-                                         L("Language selection"), wxICON_QUESTION | wxOK | wxCANCEL);
-                if (msg_wingow.ShowModal() == wxID_CANCEL) {
+                MessageDialog msg_window(nullptr, _L("Switching languages requires the application to restart.\n") + "\n" + _L("Do you want to continue?"),
+                                         _L("Language selection"), wxICON_QUESTION | wxOK | wxCANCEL);
+                if (msg_window.ShowModal() == wxID_CANCEL) {
                     combobox->SetSelection(m_current_language_selected);
                     return;
                 }
             }
-
-            auto check = [](bool yes_or_no) {
-                // if (yes_or_no)
-                //    return true;
-                int act_btns = ActionButtons::SAVE;
-                return wxGetApp().check_and_keep_current_preset_changes(_L("Switching application language"),
-                                                                        _L("Switching application language while some presets are modified."), act_btns);
-            };
 
             m_current_language_selected = combobox->GetSelection();
             if (m_current_language_selected >= 0 && m_current_language_selected < vlist.size()) {
@@ -563,7 +615,7 @@ wxBoxSizer *PreferencesDialog::create_item_language_combobox(wxString title, wxS
 wxBoxSizer *PreferencesDialog::create_item_region_combobox(wxString title, wxString tooltip)
 {
 
-    std::vector<wxString> Regions         = {_L("Asia-Pacific"), _L("China"), _L("Europe"), _L("North America"), _L("Others")};
+    std::vector<wxString> Regions         = {_L("Asia-Pacific"), _L("China"), _L("Europe"), _L("North America"), _L_CONTEXT("Others", "Region")};
     std::vector<wxString> local_regions = {"Asia-Pacific", "China", "Europe", "North America", "Others"};
 
     auto vlist = Regions;
@@ -621,7 +673,7 @@ wxBoxSizer *PreferencesDialog::create_item_region_combobox(wxString title, wxStr
                 combobox->SetSelection(current_region);
                 return;
             } else {
-                wxGetApp().request_user_logout();
+                wxGetApp().request_user_logout(ORCA_CLOUD_PROVIDER, /*user_initiated=*/true);
                 config->set("region", region.ToStdString());
                 auto area = config->get_country_code();
                 if (agent) {
@@ -646,7 +698,7 @@ wxBoxSizer *PreferencesDialog::create_item_loglevel_combobox(wxString title, wxS
 
     wxBoxSizer *m_sizer = create_item_label(title, tip);
 
-    auto combobox = new ::ComboBox(m_parent, wxID_ANY, wxEmptyString, wxDefaultPosition, DESIGN_COMBOBOX_SIZE, 0, nullptr, wxCB_READONLY);
+    auto combobox = new ::ComboBox(m_parent, wxID_ANY, wxEmptyString, wxDefaultPosition, PREFERENCES_COMBOBOX_SIZE, 0, nullptr, wxCB_READONLY);
     combobox->GetDropDown().SetUseContentWidth(true);
     combobox->SetToolTip(tip);
 
@@ -674,7 +726,7 @@ wxBoxSizer *PreferencesDialog::create_item_input(wxString title, wxString title2
 
     wxBoxSizer *m_sizer = create_item_label(title, tip, wiki_url);
 
-    auto       input = new ::TextInput(m_parent, wxEmptyString, wxEmptyString, wxEmptyString, wxDefaultPosition, DESIGN_INPUT_SIZE, wxTE_PROCESS_ENTER);
+    auto       input = new ::TextInput(m_parent, wxEmptyString, wxEmptyString, wxEmptyString, wxDefaultPosition, PREFERENCES_INPUT_SIZE, wxTE_PROCESS_ENTER);
     StateColor input_bg(std::pair<wxColour, int>(wxColour("#F0F0F1"), StateColor::Disabled), std::pair<wxColour, int>(*wxWHITE, StateColor::Enabled));
     input->SetBackgroundColor(input_bg);
     input->GetTextCtrl()->SetValue(app_config->get(param));
@@ -724,14 +776,14 @@ wxBoxSizer *PreferencesDialog::create_item_input(wxString title, wxString title2
 wxBoxSizer *PreferencesDialog::create_item_url_input(wxString title, wxString tooltip, std::string param, std::function<void()> on_commit)
 {
     wxBoxSizer *sizer_input = new wxBoxSizer(wxHORIZONTAL);
-    auto        input_title = new wxStaticText(m_parent, wxID_ANY, title, wxDefaultPosition, DESIGN_TITLE_SIZE, wxST_NO_AUTORESIZE);
+    auto        input_title = new wxStaticText(m_parent, wxID_ANY, title, wxDefaultPosition, PREFERENCES_TITLE_SIZE, wxST_NO_AUTORESIZE);
     input_title->SetForegroundColour(DESIGN_GRAY900_COLOR);
     input_title->SetFont(::Label::Body_14);
     input_title->SetToolTip(tooltip);
-    input_title->Wrap(DESIGN_TITLE_SIZE.x);
+    input_title->Wrap(PREFERENCES_TITLE_SIZE.x);
 
     auto input = new ::TextInput(m_parent, wxEmptyString, wxEmptyString, wxEmptyString, wxDefaultPosition,
-                                 wxSize(FromDIP(260), DESIGN_INPUT_SIZE.y), wxTE_PROCESS_ENTER);
+                                 wxSize(FromDIP(260), PREFERENCES_INPUT_SIZE.y), wxTE_PROCESS_ENTER);
     StateColor input_bg(std::pair<wxColour, int>(wxColour("#F0F0F1"), StateColor::Disabled),
                         std::pair<wxColour, int>(*wxWHITE, StateColor::Enabled));
     input->SetBackgroundColor(input_bg);
@@ -775,7 +827,7 @@ wxBoxSizer *PreferencesDialog::create_item_spinctrl(wxString title, wxString tit
 
     wxBoxSizer *m_sizer = create_item_label(title, tip, wiki_url);
 
-    auto input = new SpinInput(m_parent, wxEmptyString, side_label, wxDefaultPosition, DESIGN_INPUT_SIZE, wxSP_ARROW_KEYS, min, max, stoi(app_config->get(param)));
+    auto input = new SpinInput(m_parent, wxEmptyString, side_label, wxDefaultPosition, PREFERENCES_INPUT_SIZE, wxSP_ARROW_KEYS, min, max, stoi(app_config->get(param)));
     input->SetToolTip(tip);
 
     // ORCA: this one is only meaningful while the dimming it controls is enabled
@@ -828,7 +880,7 @@ wxBoxSizer *PreferencesDialog::create_camera_orbit_mult_input(wxString title, wx
 
     auto param = "camera_orbit_mult";
 
-    auto       input = new ::TextInput(m_parent, wxEmptyString, wxEmptyString, wxEmptyString, wxDefaultPosition, DESIGN_INPUT_SIZE, wxTE_PROCESS_ENTER);
+    auto       input = new ::TextInput(m_parent, wxEmptyString, wxEmptyString, wxEmptyString, wxDefaultPosition, PREFERENCES_INPUT_SIZE, wxTE_PROCESS_ENTER);
     StateColor input_bg(std::pair<wxColour, int>(wxColour("#F0F0F1"), StateColor::Disabled), std::pair<wxColour, int>(*wxWHITE, StateColor::Enabled));
     input->SetBackgroundColor(input_bg);
     input->GetTextCtrl()->SetValue(app_config->get(param));
@@ -875,7 +927,7 @@ wxBoxSizer *PreferencesDialog::create_item_decimal_input(wxString title, wxStrin
 
     wxBoxSizer *m_sizer = create_item_label(title, tip, wiki_url);
 
-    auto       input = new ::TextInput(m_parent, wxEmptyString, title2, wxEmptyString, wxDefaultPosition, DESIGN_INPUT_SIZE, wxTE_PROCESS_ENTER);
+    auto       input = new ::TextInput(m_parent, wxEmptyString, title2, wxEmptyString, wxDefaultPosition, PREFERENCES_INPUT_SIZE, wxTE_PROCESS_ENTER);
     StateColor input_bg(std::pair<wxColour, int>(wxColour("#F0F0F1"), StateColor::Disabled), std::pair<wxColour, int>(*wxWHITE, StateColor::Enabled));
     input->SetBackgroundColor(input_bg);
     input->GetTextCtrl()->SetValue(app_config->get(param));
@@ -1148,6 +1200,7 @@ wxBoxSizer *PreferencesDialog::create_item_checkbox(wxString title, wxString too
     checkbox->SetToolTip(tip);
 
     if (param == "sync_user_preset") { m_sync_user_preset_checkbox = checkbox; }
+    if (param == SETTING_OPENGL_SKIP_IDENTICAL_FRAMES) { m_skip_identical_frames_checkbox = checkbox; }
     if (param == "usage_diagnostics") {
         // The privacy choice decides, not the mirror key.
         m_usage_diagnostics_checkbox = checkbox;
@@ -1177,11 +1230,6 @@ wxBoxSizer *PreferencesDialog::create_item_checkbox(wxString title, wxString too
         app_config->set_bool(param, checkbox->GetValue());
         app_config->save();
 
-        // if (param == "staff_pick_switch") {
-        //     bool pbool = app_config->get("staff_pick_switch") == "true";
-        //     wxGetApp().switch_staff_pick(pbool);
-        // }
-
         if (param == "usage_diagnostics") {
             on_usage_diagnostics_toggled(checkbox->GetValue());
         }
@@ -1197,6 +1245,9 @@ wxBoxSizer *PreferencesDialog::create_item_checkbox(wxString title, wxString too
             }
             BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << " sync_user_preset: " << (sync ? "true" : "false");
         }
+        else if (param == SETTING_OPENGL_SCENE_CACHE) {
+            if (m_skip_identical_frames_checkbox) m_skip_identical_frames_checkbox->Enable(checkbox->GetValue());
+        }
         else if (param == "stealth_mode") {
             bool enabled = app_config->get_stealth_mode();
             if (enabled) wxGetApp().on_stealth_mode_enter();
@@ -1204,12 +1255,12 @@ wxBoxSizer *PreferencesDialog::create_item_checkbox(wxString title, wxString too
             if (m_bambu_cloud_checkbox)      m_bambu_cloud_checkbox->Enable(!enabled);
             // Stealth mode now also gates the home page's account panel, so push the change
             // through immediately -- otherwise the panel would not follow until a restart.
-            if (wxGetApp().mainframe && wxGetApp().mainframe->m_webview)
-                wxGetApp().mainframe->m_webview->SendCloudProvidersInfo();
+            if (WebViewPanel* home = WebViewPanel::if_built())
+                home->SendCloudProvidersInfo();
         }
         else if (param == "hide_login_side_panel") {
-            if (wxGetApp().mainframe && wxGetApp().mainframe->m_webview) {
-                wxGetApp().mainframe->m_webview->SendCloudProvidersInfo();
+            if (WebViewPanel* home = WebViewPanel::if_built()) {
+                home->SendCloudProvidersInfo();
             }
         }
         else if (param == "show_cut_chunk_colors") {
@@ -1224,6 +1275,16 @@ wxBoxSizer *PreferencesDialog::create_item_checkbox(wxString title, wxString too
             wxGetApp().imgui()->set_opaque_overlays(app_config->get_bool(param));
             if (Plater* plater = wxGetApp().plater()) {
                 if (GLCanvas3D* canvas = plater->get_current_canvas3D()) {
+                    canvas->set_as_dirty();
+                    canvas->request_extra_frame();
+                }
+            }
+        }
+        // ORCA: apply the filament translucency change immediately to the currently loaded preview
+        else if (param == "preview_translucent_filaments") {
+            if (Plater* plater = wxGetApp().plater()) {
+                if (GLCanvas3D* canvas = plater->get_preview_canvas3D()) {
+                    canvas->get_gcode_viewer().set_translucent_filaments(app_config->get_bool(param));
                     canvas->set_as_dirty();
                     canvas->request_extra_frame();
                 }
@@ -1474,9 +1535,8 @@ wxBoxSizer *PreferencesDialog::create_item_bambu_cloud(wxString title, wxString 
         app_config->save();
 
         // Update homepage visibility immediately
-        auto *mainframe = wxGetApp().mainframe;
-        if (mainframe && mainframe->m_webview)
-            mainframe->m_webview->SendCloudProvidersInfo();
+        if (WebViewPanel* home = WebViewPanel::if_built())
+            home->SendCloudProvidersInfo();
     });
 
     m_sizer->Add(cb, 0, wxALIGN_CENTER);
@@ -1607,8 +1667,10 @@ wxBoxSizer *PreferencesDialog::create_item_network_plugin_version(wxString title
 #ifdef WIN32
 wxBoxSizer* PreferencesDialog::create_item_link_association( wxString url_prefix, wxString website_name)
 {
-    wxString title = _L("Associate") + (boost::format(" %1%://") % url_prefix.c_str()).str();
-    wxString tooltip = _L("Associate") + " " + url_prefix + ":// " + _L("with Unlayered Slicer so that it can open models from") + " " + website_name;
+    // TRN %s is a URL scheme, for example "prusaslicer".
+    wxString title = wxString::Format(_L("Associate %s://"), url_prefix);
+    // TRN The first %s is a URL scheme, for example "prusaslicer"; the second is a website name.
+    wxString tooltip = wxString::Format(_L("Associate %s:// with Unlayered Slicer so that it can open models from %s"), url_prefix, website_name);
 
     std::wstring registered_bin; // not used, just here to provide a ref to check fn
     bool reg_to_current_instance = wxGetApp().check_url_association(url_prefix.ToStdWstring(), registered_bin);
@@ -1622,7 +1684,7 @@ wxBoxSizer* PreferencesDialog::create_item_link_association( wxString url_prefix
     checkbox->SetValue(reg_to_current_instance); // If registered to the current instance, checkbox should be checked
 
     // build text next to checkbox
-    auto checkbox_title = new wxStaticText(m_parent, wxID_ANY, title, wxDefaultPosition, DESIGN_TITLE_SIZE);
+    auto checkbox_title = new wxStaticText(m_parent, wxID_ANY, title, wxDefaultPosition, PREFERENCES_TITLE_SIZE);
     checkbox_title->SetToolTip(tooltip);
     checkbox_title->SetForegroundColour(DESIGN_GRAY900_COLOR);
     checkbox_title->SetFont(::Label::Body_14);
@@ -1663,7 +1725,7 @@ wxBoxSizer* PreferencesDialog::create_item_link_association( wxString url_prefix
         }
 
         registered_instance_title->SetLabel(current_association_str);
-        registered_instance_title->SetMaxSize(wxSize(DESIGN_WINDOW_SIZE.x - FromDIP(DESIGN_LEFT_MARGIN) - FromDIP(40), -1)); // prevent horizontal scroll
+        registered_instance_title->SetMaxSize(wxSize(PREFERENCES_WINDOW_SIZE.x - FromDIP(DESIGN_LEFT_MARGIN) - FromDIP(40), -1)); // prevent horizontal scroll
     };
     update_current_association_str();
 
@@ -1709,7 +1771,7 @@ PreferencesDialog::PreferencesDialog(wxWindow *parent, wxWindowID id, const wxSt
     });
 #endif
     SetBackgroundColour(*wxWHITE);
-    SetMinSize(DESIGN_WINDOW_SIZE);
+    SetMinSize(PREFERENCES_WINDOW_SIZE);
     create();
     wxGetApp().UpdateDlgDarkUI(this);
 }
@@ -1719,7 +1781,7 @@ void PreferencesDialog::create()
     app_config = get_app_config();
 
     m_parent = new MyscrolledWindow(this, wxID_ANY, wxDefaultPosition, wxDefaultSize, wxVSCROLL);
-    m_parent->SetScrollRate(5, 5);
+    m_parent->SetScrollRate(0, FromDIP(20));
     m_parent->SetBackgroundColour(*wxWHITE);
 
     m_sizer_body = new wxBoxSizer(wxVERTICAL);
@@ -1770,7 +1832,7 @@ void PreferencesDialog::create()
         if (sscanf(saved.c_str(), "%d,%d", &w, &h) == 2 && w > 0 && h > 0)
             size = wxSize(w, h);
         else
-            size.y = std::max(size.y, DESIGN_FONT_SCALED(860));
+            size.y = std::max(size.y, PREFERENCES_FONT_SCALED(860));
         const wxRect area = wxDisplay(wxDisplay::GetFromWindow(this)).GetClientArea();
         size.x = std::min(size.x, area.width);
         size.y = std::min(size.y, area.height);
@@ -1783,6 +1845,19 @@ PreferencesDialog::~PreferencesDialog()
 {
     if (app_config != nullptr && !IsMaximized())
         app_config->set("preferences_dialog_size", std::to_string(GetSize().x) + "," + std::to_string(GetSize().y));
+}
+
+void PreferencesDialog::select_tab(PreferencesTab tab, const std::string& option)
+{
+    if (const auto index = m_tab_index.find(tab); index != m_tab_index.end())
+        m_pref_tabs->SelectItem(index->second);
+    wxWindow* control = option.empty() ? nullptr : m_parent->FindWindow(wxString(option));
+    if (control == nullptr)
+        return;
+    int unit = 1;
+    m_parent->GetScrollPixelsPerUnit(nullptr, &unit);
+    m_parent->Scroll(wxDefaultCoord, (m_parent->CalcUnscrolledPosition(control->GetPosition()).y - FromDIP(10)) / unit);
+    control->SetFocus();   // the focused tint marks the row
 }
 
 void PreferencesDialog::on_dpi_changed(const wxRect &suggested_rect) {
@@ -1810,7 +1885,7 @@ void PreferencesDialog::on_dpi_changed(const wxRect &suggested_rect) {
             else if (auto* spn = dynamic_cast<SpinInput*>(child))
                 spn->Rescale();
             else if (auto* lbl = dynamic_cast<WikiLabel*>(child)){
-                lbl->SetSize(DESIGN_TITLE_SIZE);
+                lbl->SetSize(PREFERENCES_TITLE_SIZE);
                 lbl->Rescale();
             }
                 
@@ -1862,7 +1937,7 @@ void PreferencesDialog::create_items()
     //////////////////////////
     //// GENERAL TAB 
     /////////////////////////////////////
-    m_pref_tabs->AppendItem(_L("General"));
+    m_tab_index[PreferencesTab::General] = m_pref_tabs->AppendItem(_L("General"));
     f_sizers.push_back(new wxFlexGridSizer(1, 1, v_gap, 0));
     g_sizer = f_sizers.back();
     g_sizer->AddGrowableCol(0, 1);
@@ -1896,6 +1971,15 @@ void PreferencesDialog::create_items()
     g_sizer->Add(item_show_splash_scr);
 
 #ifdef __linux__
+    // TRN "GPU" is the graphics card; the option only matters on computers that have two of them.
+    auto item_discrete_gpu = create_item_checkbox(_L("Render on the discrete GPU"),
+        // TRN DRI_PRIME is an environment variable name and must stay as it is.
+        _L("On a computer with two GPUs, run OrcaSlicer on the discrete GPU instead of the one that drives the display. "
+           "Some Wayland systems cannot show frames rendered on the other GPU, or fail to open the window at all. "
+           "Turn this off if the 3D view stays empty; if OrcaSlicer no longer starts, start it once with DRI_PRIME=0 "
+           "in the environment to get back here."),
+        "prefer_discrete_gpu", _L("(Requires restart)"));
+    g_sizer->Add(item_discrete_gpu);
 #endif
 
     //auto item_hints            = create_item_checkbox(_L("Show \"Daily Tips\" after start"), page, _L("If enabled, useful hints are displayed at startup."), "show_daily_tips");
@@ -1908,8 +1992,8 @@ void PreferencesDialog::create_items()
     g_sizer->Add(create_item_title(_L("Project")), 1, wxEXPAND);
 
     std::vector<wxString> projectLoadSettingsBehaviourOptions = {_L("Load All"), _L("Ask When Relevant"), _L("Always Ask"), _L("Load Geometry Only")};
-    std::vector<string>   projectLoadSettingsConfigOptions    = { OPTION_PROJECT_LOAD_BEHAVIOUR_LOAD_ALL, OPTION_PROJECT_LOAD_BEHAVIOUR_ASK_WHEN_RELEVANT, OPTION_PROJECT_LOAD_BEHAVIOUR_ALWAYS_ASK, OPTION_PROJECT_LOAD_BEHAVIOUR_LOAD_GEOMETRY };
-    auto item_project_load     = create_item_combobox(_L("Load behaviour"), _L("Should printer/filament/process settings be loaded when opening a 3MF file?"), SETTING_PROJECT_LOAD_BEHAVIOUR, projectLoadSettingsBehaviourOptions, projectLoadSettingsConfigOptions);
+    std::vector<std::string> projectLoadSettingsConfigOptions    = { OPTION_PROJECT_LOAD_BEHAVIOUR_LOAD_ALL, OPTION_PROJECT_LOAD_BEHAVIOUR_ASK_WHEN_RELEVANT, OPTION_PROJECT_LOAD_BEHAVIOUR_ALWAYS_ASK, OPTION_PROJECT_LOAD_BEHAVIOUR_LOAD_GEOMETRY };
+    auto item_project_load     = create_item_combobox(_L("Load behavior"), _L("Should printer/filament/process settings be loaded when opening a 3MF file?"), SETTING_PROJECT_LOAD_BEHAVIOUR, projectLoadSettingsBehaviourOptions, projectLoadSettingsConfigOptions);
     g_sizer->Add(item_project_load);
 
     auto item_backup           = create_item_backup(_L("Auto backup"), _L("Backup your project periodically to help with restoring from an occasional crash."));
@@ -1987,6 +2071,30 @@ void PreferencesDialog::create_items()
     auto item_multi_machine    = create_item_checkbox(_L("Multi device management"), _L("With this option enabled, you can send a task to multiple devices at the same time and manage multiple devices."), "enable_multi_machine", _L("(Requires restart)"));
     g_sizer->Add(item_multi_machine);
 
+    auto item_speed_dial = create_item_checkbox(_L("Open the Speed Dial from the keyboard"),
+        _L("When enabled, the Speed Dial keyboard shortcut (Space by default) opens the action search from any page."),
+        "enable_speed_dial");
+    g_sizer->Add(item_speed_dial);
+
+    auto item_speed_dial_recents = create_item_spinctrl(
+        _L("Recent actions"),
+        "",
+        // TRN Unit shown after the number of recent actions, as in "5 actions".
+        _L("actions"),
+        _L("How many recently launched actions to show at the top of the Speed Dial. Set to 0 to hide recent actions."),
+        SETTING_SPEED_DIAL_RECENT_COUNT,
+        SPEED_DIAL_RECENT_COUNT_MIN,
+        SPEED_DIAL_RECENT_COUNT_MAX);
+    g_sizer->Add(item_speed_dial_recents);
+
+#ifdef SLIC3R_CAD
+    auto item_cad_feature      = create_item_checkbox(_L("CAD feature (experimental)"),
+        _L("With this option enabled, the Design tab is shown, where models can be built and edited "
+           "parametrically. This feature is experimental and still under development."),
+        "enable_cad_feature", _L("(Requires restart)"));
+    g_sizer->Add(item_cad_feature);
+#endif
+
     //// GENERAL > Web application
     // Unlayered: the web-application addresses are under Advanced > "Web apps & services"
     // (create_item_web_services). What else a slot may do through the bridge are fields on its
@@ -2030,7 +2138,7 @@ void PreferencesDialog::create_items()
     /////////////////////////////////////
     //// APPEARANCE TAB
     /////////////////////////////////////
-    m_pref_tabs->AppendItem(_L("Appearance"));
+    m_tab_index[PreferencesTab::Appearance] = m_pref_tabs->AppendItem(_L("Appearance"));
     f_sizers.push_back(new wxFlexGridSizer(1, 1, v_gap, 0));
     g_sizer = f_sizers.back();
     g_sizer->AddGrowableCol(0, 1);
@@ -2366,13 +2474,13 @@ void PreferencesDialog::create_items()
 
     //// CONTROL TAB
     /////////////////////////////////////
-    m_pref_tabs->AppendItem(_L("Control"));
+    m_tab_index[PreferencesTab::Control] = m_pref_tabs->AppendItem(_L("Control"));
     f_sizers.push_back(new wxFlexGridSizer(1, 1, v_gap, 0));
     g_sizer = f_sizers.back();
     g_sizer->AddGrowableCol(0, 1);
 
     //// CONTROL > Behaviour
-    g_sizer->Add(create_item_title(_L("Behaviour")), 1, wxEXPAND);
+    g_sizer->Add(create_item_title(_L("Behavior")), 1, wxEXPAND);
 
     std::vector<wxString> FlushOptionLabels = {_L("All"),_L("Color"),_L("None")};
     std::vector<std::string> FlushOptionValues = { "all","color change","disabled" };
@@ -2381,6 +2489,10 @@ void PreferencesDialog::create_items()
 
     auto item_auto_arrange     = create_item_checkbox(_L("Auto arrange plate after cloning"), "", "auto_arrange");
     g_sizer->Add(item_auto_arrange);
+
+    auto item_primitive_dialog = create_item_checkbox(_L("Show options when adding a primitive"),
+        _L("If enabled, a dialog asks for the dimensions of a primitive shape before it is added."), "enable_primitive_size_dialog");
+    g_sizer->Add(item_primitive_dialog);
 
     //// CONTROL > Slicing
     g_sizer->Add(create_item_title(_L("Slicing")), 1, wxEXPAND);
@@ -2393,7 +2505,10 @@ void PreferencesDialog::create_items()
 
     auto item_mix_print_high_low_temperature = create_item_checkbox(_L("Remove mixed temperature restriction"), _L("With this option enabled, you can print materials with a large temperature difference together."), "enable_high_low_temp_mixed_printing");
     g_sizer->Add(item_mix_print_high_low_temperature);
- 
+
+    auto item_remember_print_action = create_item_checkbox(_L("Remember last print action"), _L("If enabled, Unlayered Slicer will remember the last selected option in the print button's dropdown (e.g. Print, Export plate sliced file, Export G-code file) and use it as the default on next startup."), "remember_print_action");
+    g_sizer->Add(item_remember_print_action);
+
     //// CONTROL > Camera
     g_sizer->Add(create_item_title(_L("Camera")), 1, wxEXPAND);
 
@@ -2413,6 +2528,28 @@ void PreferencesDialog::create_items()
     auto reverse_mouse_zoom    = create_item_checkbox(_L("Reverse mouse zoom"), _L("If enabled, reverses the direction of zoom with mouse wheel."), "reverse_mouse_wheel_zoom");
     g_sizer->Add(reverse_mouse_zoom);
 
+#ifdef SLIC3R_CAD
+    // Design-tab only, so it stays out of the way while the CAD feature is switched off.
+    if (wxGetApp().is_enable_cad_feature()) {
+        auto item_connector_face_glyph = create_item_checkbox(_L("Draw mate connectors as a face"),
+            _L("In the Design tab, draw a mate connector as a small face instead of the conventional "
+               "disc with a roll quadrant. A face shows its orientation at a glance, without learning the disc convention. "
+               "Turn this off for the conventional CAD representation."), "design_connector_face_glyph");
+        g_sizer->Add(item_connector_face_glyph);
+
+        // Saved WITH each design (it decides which loops are closed, i.e. what solid a project
+        // rebuilds into), so it applies to designs started from now on; an open design keeps
+        // the rule it was made with.
+        auto item_auto_close_sketch_loops = create_item_checkbox(_L("Auto-close sketch loops"),
+            _L("Treat sketch endpoints within 0.001 mm as one joint and weld the loop shut. "
+               "Off: only exactly coincident endpoints join, so a loop with a tiny gap is "
+               "shown as open instead of being closed for you. Saved with each design; "
+               "applies to designs started after the change."),
+            "auto_close_sketch_loops");
+        g_sizer->Add(item_auto_close_sketch_loops);
+    }
+#endif
+
     std::vector<wxString> ButtonDragActions = {_L("None"), _L("Pan"), _L("Rotate")};
     auto item_left_mouse_drag  = create_item_combobox(_L("Left Mouse Drag"), _L("Set the action that dragging the left mouse button should perform."), "left_mouse_drag_action", ButtonDragActions);
     g_sizer->Add(item_left_mouse_drag);
@@ -2420,6 +2557,14 @@ void PreferencesDialog::create_items()
     g_sizer->Add(item_middle_mouse_drag);
     auto item_right_mouse_drag  = create_item_combobox(_L("Right Mouse Drag"), _L("Set the action that dragging the right mouse button should perform."), "right_mouse_drag_action", ButtonDragActions);
     g_sizer->Add(item_right_mouse_drag);
+
+    //// CONTROL > Keyboard
+    g_sizer->Add(create_item_title(_L("Keyboard")), 1, wxEXPAND);
+
+    auto item_shortcuts = create_item_button(_L("Keyboard shortcuts"), _L("Edit") + dots, "", _L("Choose the key for each action."), [this]() {
+        wxGetApp().keyboard_shortcuts(ShortcutContext::Global, this);
+    });
+    g_sizer->Add(item_shortcuts);
 
     //// CONTROL > Clear my choice on ...
     g_sizer->Add(create_item_title(_L("Clear my choice on...")), 1, wxEXPAND);
@@ -2445,7 +2590,7 @@ void PreferencesDialog::create_items()
     //////////////////////////
     //// GRAPHICS TAB
     /////////////////////////////////////
-    m_pref_tabs->AppendItem(_L("Graphics"));
+    m_tab_index[PreferencesTab::Graphics] = m_pref_tabs->AppendItem(_L("Graphics"));
     f_sizers.push_back(new wxFlexGridSizer(1, 1, v_gap, 0));
     g_sizer = f_sizers.back();
     g_sizer->AddGrowableCol(0, 1);
@@ -2480,6 +2625,15 @@ void PreferencesDialog::create_items()
     );
     g_sizer->Add(item_realistic_phong);
 
+    auto item_realistic_preview = create_item_checkbox(
+        _L("Enable in Preview"),
+        _L("Also applies realistic view to the Preview canvas, not just Prepare.\n"
+           "Preview draws the full toolpath geometry, so shadows and SSAO cost considerably"
+           " more there than on a plain model."),
+        SETTING_OPENGL_REALISTIC_PREVIEW
+    );
+    g_sizer->Add(item_realistic_preview);
+
     auto item_realistic_ssao = create_item_checkbox(
         _L("SSAO ambient occlusion"),
         _L("Applies SSAO in realistic view."),
@@ -2487,12 +2641,27 @@ void PreferencesDialog::create_items()
     );
     g_sizer->Add(item_realistic_ssao);
 
-    auto item_realistic_shadows = create_item_checkbox(
+    std::vector<wxString> ShadowsLabels = { _L("Off"),
+                                            // TRN Realistic-view shadow mode: the light stays fixed in the scene.
+                                            _L("Static"),
+                                            // TRN Realistic-view shadow mode: the light turns with the camera.
+                                            _L("Orbit") };
+    std::vector<std::string> ShadowsValues = { "off", "static", "orbit" };
+    auto item_realistic_shadows = create_item_combobox(
         _L("Shadows"),
-        _L("Renders cast shadows on the plate, other objects, and each object onto itself in realistic view."),
-        SETTING_OPENGL_PHONG_BASIC_PLATE_SHADOWS
-    );
+        _L("Renders cast shadows on the plate, other objects, and each object onto itself in realistic view.\n"
+           "Static: the light stays fixed in the world, so the shadows are only recomputed when the scene changes.\n"
+           "Orbit: the light turns with the camera, recomputing the shadows every frame the camera moves."),
+        SETTING_OPENGL_REALISTIC_SHADOWS, ShadowsLabels, ShadowsValues);
     g_sizer->Add(item_realistic_shadows);
+
+    auto item_realistic_gloss = create_item_checkbox(
+        _L("Glossy toolpaths"),
+        _L("Highlights the toolpaths in Preview as glossy plastic in realistic view.\n"
+           "Off, a translucent filament is matte and an opaque one keeps the highlight of the plain view."),
+        SETTING_OPENGL_REALISTIC_GLOSS
+    );
+    g_sizer->Add(item_realistic_gloss);
 
     //// GRAPHICS > Anti-aliasing
     g_sizer->Add(create_item_title(_L("Anti-aliasing")), 1, wxEXPAND);
@@ -2534,15 +2703,75 @@ void PreferencesDialog::create_items()
     );
     g_sizer->Add(item_fps_cap);
 
+    auto item_scene_cache = create_item_checkbox(
+        _L("Reuse the 3D scene while idle"),
+        _L("Skips redrawing the 3D scene when only the mouse cursor moves over the viewport,\n"
+           "and reuses the previous frame's scene instead. Reduces GPU load.\n"
+           "Disable it if the viewport shows stale or missing contents.\n\n"
+           "Takes effect immediately."),
+        SETTING_OPENGL_SCENE_CACHE
+    );
+    g_sizer->Add(item_scene_cache);
+
+    auto item_skip_identical_frames = create_item_checkbox(
+        _L("Skip unchanged frames"),
+        _L("Skips drawing a frame altogether when it would be identical to the one already on screen.\n"
+           "Only applies to frames that reuse the 3D scene, so it needs Reuse the 3D scene while idle.\n"
+           "Disable it if a hover highlight, tooltip or animation stops updating.\n\n"
+           "Takes effect immediately."),
+        SETTING_OPENGL_SKIP_IDENTICAL_FRAMES
+    );
+    g_sizer->Add(item_skip_identical_frames);
+    if (m_skip_identical_frames_checkbox) m_skip_identical_frames_checkbox->Enable(app_config->get_bool(SETTING_OPENGL_SCENE_CACHE));
+
     auto item_fps_overlay = create_item_checkbox(
         _L("Show FPS overlay"),
-        _L("Displays current viewport FPS in the top-right corner."),
+        _L("Displays rendering counts in the top-right corner of the viewport.") + "\n" +
+        _L("FPS: frames presented to the screen per second.") + "\n" +
+        _L("3D: frames per second that redrew the 3D scene."),
         SETTING_OPENGL_SHOW_FPS_OVERLAY
     );
     g_sizer->Add(item_fps_overlay);
 
+    auto item_render_timings = create_item_checkbox(
+        _L("Show render timings"),
+        _L("Displays how many milliseconds each part of a frame that redraws the 3D scene takes, in the top-right corner of the viewport.") + "\n" +
+        _L("CPU: time spent issuing the drawing commands.") + "\n" +
+        _L("GPU: time the graphics card spent running them.") + "\n" +
+        _L("Adds a small overhead to each frame while enabled."),
+        SETTING_OPENGL_SHOW_RENDER_TIMINGS
+    );
+    g_sizer->Add(item_render_timings);
+
+    if (wxGetApp().is_editor()) {
+        auto item_benchmark = create_item_button(_L("3D scene benchmark"), _L("Run") + " " + dots, "",
+            _L("Replaces the current project with the OrcaSliced Combo, then measures the frame rate and render timings while the camera turns around it in Prepare and Preview, and while the layer slider moves through the sliced layers."),
+            [this]() {
+                EndModal(wxID_OK);
+                wxGetApp().CallAfter([] { run_scene_benchmark(); });
+            });
+        g_sizer->Add(item_benchmark);
+    }
+
     //// GRAPHICS > G-code Preview
     g_sizer->Add(create_item_title(_L("G-code Preview")), 1, wxEXPAND);
+
+    // ORCA: view type the preview opens with
+    std::vector<wxString>    PreviewViewTypeLabels;
+    std::vector<std::string> PreviewViewTypeValues;
+    for (const auto& [value, label] : GCodeViewer::default_view_type_choices()) {
+        PreviewViewTypeValues.push_back(value);
+        PreviewViewTypeLabels.push_back(from_u8(label));
+    }
+    auto item_preview_view_type = create_item_combobox(
+        _L("Default view type"),
+        _L("The color scheme the sliced preview opens with.\n"
+           "Automatic: Filament for multi material prints, Line Type for single material ones.\n"
+           "Last used: the view type you selected last.\n"
+           "Any other value always opens that view type.\n"
+           "You can still switch the view type in the preview afterwards."),
+        "preview_default_view_type", PreviewViewTypeLabels, PreviewViewTypeValues);
+    g_sizer->Add(item_preview_view_type);
 
     auto item_dim_previous_layers = create_item_checkbox(
         _L("Dim lower layers"),
@@ -2573,13 +2802,20 @@ void PreferencesDialog::create_items()
     );
     g_sizer->Add(item_dim_previous_layers_brightness);
 
+    auto item_translucent_filaments = create_item_checkbox(
+        _L("Translucent filaments"),
+        _L("Draw the toolpaths of filaments whose color is partly transparent as see-through, as the 3D view draws their objects. Turn it off to draw every filament opaque."),
+        "preview_translucent_filaments"
+    );
+    g_sizer->Add(item_translucent_filaments);
+
     g_sizer->AddSpacer(FromDIP(10));
     sizer_page->Add(g_sizer, 0, wxEXPAND);
 
     //////////////////////////
     //// ONLINE TAB
     /////////////////////////////////////
-    m_pref_tabs->AppendItem(_L("Online"));
+    m_tab_index[PreferencesTab::Online] = m_pref_tabs->AppendItem(_L("Online"));
     f_sizers.push_back(new wxFlexGridSizer(1, 1, v_gap, 0));
     g_sizer = f_sizers.back();
     g_sizer->AddGrowableCol(0, 1);
@@ -2851,17 +3087,24 @@ void PreferencesDialog::create_items()
     auto item_show_unsupported = create_item_checkbox(_L("Show unsupported presets"), _L("Show incompatible/unsupported presets in the printer and filament dropdown lists. These presets cannot be selected."), "show_unsupported_presets");
     g_sizer->Add(item_show_unsupported);
 
-    auto item_plugin_printer_agents = create_item_checkbox(
-        _L("(Experimental) Use printer agents instead of print hosts"), _L(
-            "Route print jobs for non-Bambu printers through printer plug-in agents instead of the classic print-host upload flow.\nWhen disabled, Unlayered Slicer uses the legacy print-host behavior."),
-        "use_printer_agents");
-    g_sizer->Add(item_plugin_printer_agents);
+    auto item_export_statistics = create_item_checkbox(_L("Export statistics with G-code"),
+                                                       _L("If enabled, exporting a G-code file also writes its statistics as JSON next to it, as <name>.statistics.json, "
+                                                          "and an exported sliced 3MF file holds them inside: print time, filament and feature totals, "
+                                                          "and the same per layer and per object."),
+                                                       "export_statistics");
+    g_sizer->Add(item_export_statistics);
 
     //// DEVELOPER > Experimental Features
     g_sizer->Add(create_item_title(_L("Experimental Features")), 1, wxEXPAND);
 
     auto item_keep_painting    = create_item_checkbox(_L("Keep painted feature after mesh change"), _L("Attempt to keep painted features (color/seam/support/fuzzy etc.) after changing the object mesh (such as cut/reload from disk/simplify/fix etc.)\nHighly experimental! Slow and may create artifact."), "keep_painting");
     g_sizer->Add(item_keep_painting);
+
+    auto item_plugin_printer_agents = create_item_checkbox(
+        _L("Use printer agents instead of print hosts"), _L(
+            "Route print jobs for non-Bambu printers through printer plug-in agents instead of the classic print-host upload flow.\nWhen disabled, Unlayered Slicer uses the legacy print-host behavior."),
+        "use_printer_agents");
+    g_sizer->Add(item_plugin_printer_agents);
 
     //// DEVELOPER > Storage
 
@@ -3023,7 +3266,7 @@ wxBoxSizer* PreferencesDialog::create_debug_page()
                 AppConfig* config = GUI::wxGetApp().app_config;
                 std::string country_code = config->get_country_code();
                 if (agent) {
-                    wxGetApp().request_user_logout();
+                    wxGetApp().request_user_logout(ORCA_CLOUD_PROVIDER, /*user_initiated=*/true);
                     agent->set_country_code(country_code);
                 }
                 ConfirmBeforeSendDialog confirm_dlg(this, wxID_ANY, _L("Warning"), ConfirmBeforeSendDialog::VisibleButtons::ONLY_CONFIRM);  // ORCA VisibleButtons instead ButtonStyle 

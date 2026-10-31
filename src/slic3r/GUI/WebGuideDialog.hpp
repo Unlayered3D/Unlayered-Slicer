@@ -6,6 +6,14 @@
 #include "wx/notifmsg.h"
 #include "wx/settings.h"
 #include "wx/webview.h"
+#include <wx/setup.h>
+#include "slic3r/GUI/GUI_Utils.hpp"
+#include <wx/toplevel.h>
+#include <wx/string.h>
+#include <wx/event.h>
+#include <string>
+#include <wx/gdicmn.h>
+#include <boost/filesystem/path.hpp>
 
 #if wxUSE_WEBVIEW_IE
 #include "wx/msw/webview_ie.h"
@@ -26,10 +34,7 @@
 #include <wx/tbarbase.h>
 #include "wx/textctrl.h"
 
-#include "GUI_App.hpp"
-#include "libslic3r/PresetBundle.hpp"
-#include "slic3r/Utils/PresetUpdater.hpp"
-#include "PrivacySetupDialog.hpp"
+#include "PrivacySetupDialog.hpp" // PrivacyFlow, held by value in m_privacy
 
 #include <atomic>
 #include <memory>
@@ -38,6 +43,16 @@
 #include <set>
 
 #include <nlohmann/json.hpp>
+#include "libslic3r/AppConfig.hpp"
+
+class wxCommandEvent;
+class wxIdleEvent;
+class wxWebView;
+class wxWebViewEvent;
+namespace Slic3r { class PresetBundle; }
+namespace Slic3r { class PresetUpdater; }
+namespace Slic3r::GUI { class GUI_App; }
+namespace boost { class thread; }
 
 namespace Slic3r { namespace GUI {
 
@@ -46,6 +61,8 @@ struct OtherSlicersFound;
 class GuideFrame : public DPIDialog
 {
 public:
+    using json = nlohmann::json;
+
     GuideFrame(GUI_App *pGUI, long style = wxCAPTION | wxCLOSE_BOX | wxSYSTEM_MENU);
     virtual ~GuideFrame();
 
@@ -95,6 +112,8 @@ public:
     void ApplyInstalledFilamentSelection();
     // Merges stage-2 data into m_ProfileJson. UI thread, idempotent; false if not ready yet.
     bool MergeDetailData();
+    // Sends userguide_profile_load_finish once the profile data and the loading page are both ready.
+    void notify_profile_loaded();
     int SaveProfile();
     int GetFilamentInfo( std::string VendorDirectory,json & pFilaList, std::string filepath, std::string &sVendor, std::string &sType);
 
@@ -124,7 +143,6 @@ private:
     AppConfig m_appconfig_new;
 
     wxWebView *m_browser;
-    wxButton * m_TestBtn;
 
     wxString m_SectionName;
 
@@ -135,6 +153,10 @@ private:
     //First Load
     bool bFirstComplete{false};
     bool m_destroy{false};
+    // The loading page gets userguide_profile_load_finish once both are true;
+    // every instance of it reports in, so the flag is never reset.
+    bool m_profile_ready{false};
+    bool m_page_ready{false};
     boost::thread* m_load_task{ nullptr };
 
     // Unlayered 0.1.7, the "Settings from other slicers" step (guide 5import) between the privacy

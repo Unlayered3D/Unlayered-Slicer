@@ -81,7 +81,7 @@ std::string slice_segmented_cube(const Vec3d &plane_normal, const std::string &a
     cp.normal = plane_normal.normalized();
     stack.planes.push_back(cp);
     object->cut_planes  = stack;
-    instance->auto_drop = true;
+    object->auto_drop = true;
     object->ensure_on_bed();
 
     DynamicPrintConfig config = DynamicPrintConfig::full_print_config();

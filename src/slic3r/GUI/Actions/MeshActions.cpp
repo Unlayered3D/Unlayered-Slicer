@@ -27,6 +27,7 @@
 #include "libslic3r/AABBMesh.hpp"
 #include "libslic3r/CutUtils.hpp"
 #include "libslic3r/MeshBoolean.hpp"
+#include "libslic3r/MeshRepair.hpp"
 #include "libslic3r/Model.hpp"
 #include "libslic3r/QuadricEdgeCollapse.hpp"
 #include "libslic3r/SkeletonBuild.hpp"
@@ -239,15 +240,17 @@ InvokeResult run_part_fix(InvokeContext& ctx)
 {
     const auto targets = mesh_targets(ctx);
     return start_mesh_job(ctx, "Repairing model object", targets, [](const TriangleMesh& src, std::string& error) -> std::optional<TriangleMesh> {
-        // Only meshes with open edges need the CGAL repair (FixModelByCgal does the same check).
-        if (its_num_open_edges(src.its) == 0)
-            return std::nullopt;
-        TriangleMesh mesh = src;
-        std::string  err;
-        if (!MeshBoolean::cgal::repair(mesh, nullptr, &err)) {
+        // The same repair as Fix Model (FixModelByCgal): nothing to do when the mesh already is a closed,
+        // consistently oriented solid without self-intersections.
+        TriangleMesh    mesh = src;
+        MeshRepairStats stats;
+        std::string     err;
+        if (!repair_mesh(mesh, &stats, &err)) {
             error = err.empty() ? "repair failed" : err;
             return std::nullopt;
         }
+        if (!stats.modified)
+            return std::nullopt;
         return mesh;
     });
 }

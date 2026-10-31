@@ -421,7 +421,7 @@ TEST_CASE("Wave overhangs do not fire along a sloped cut-plane floor", "[WaveOve
     cp.has_build_normal = true;
     stack.planes.push_back(cp);
     object->cut_planes = stack;
-    instance->auto_drop = true;
+    object->auto_drop = true;
     object->ensure_on_bed();
 
     DynamicPrintConfig config = wave_config(true);
@@ -502,7 +502,7 @@ TEST_CASE("Wave overhang G-code uses the wave speeds, dwells, temperature and fa
         cp.normal = Vec3d(std::sin(Geometry::deg2rad(10.)), 0., std::cos(Geometry::deg2rad(10.)));
         stack.planes.push_back(cp);
         object->cut_planes = stack;
-        instance->auto_drop = true;
+        object->auto_drop = true;
         object->ensure_on_bed();
         print.apply(model, config);
         REQUIRE(print.objects().size() == 2);

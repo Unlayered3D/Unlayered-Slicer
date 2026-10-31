@@ -3,11 +3,26 @@
 #include "libslic3r/Utils.hpp"
 #include "Label.hpp"
 #include "StaticBox.hpp"
+#include <wx/font.h>
+#include <string>
+#include <wx/dlimpexp.h>
+#include <wx/dc.h>
+#include <wx/arrstr.h>
+#include <wx/dynarray.h>
+#include <cstddef>
+#include <algorithm>
+#include <wx/chartype.h>
+#include <wx/gdicmn.h>
+#include <wx/event.h>
+#include <wx/colour.h>
 #include <wx/intl.h> // For wxLocale
 #include <wx/dcclient.h>
+#include <wx/language.h>
 #include <wx/settings.h>
 #include <wx/fontenum.h>
 #include <boost/log/trivial.hpp>
+#include <wx/string.h>
+#include <wx/stattext.h>
 #ifdef __linux__
 #include <fontconfig/fontconfig.h>
 #include <pango/pangocairo.h>
@@ -344,7 +359,7 @@ Label::Label(wxWindow *parent, wxFont const &font, wxString const &text, long st
     SetBackgroundColour(StaticBox::GetParentBackgroundColor(parent));
     SetForegroundColour("#262E30");
     if (style & LB_PROPAGATE_MOUSE_EVENT) {
-        for (auto evt : { wxEVT_LEFT_UP, wxEVT_LEFT_DOWN })
+        for (auto evt : { wxEVT_LEFT_UP, wxEVT_LEFT_DOWN, wxEVT_LEFT_DCLICK}) // ORCA also propagete LEFT_DCLICK event that used on sidebar titlebars
             Bind(evt, [this] (auto & e) { GetParent()->GetEventHandler()->ProcessEventLocally(e); });
     };
     if (style & LB_AUTO_WRAP) {

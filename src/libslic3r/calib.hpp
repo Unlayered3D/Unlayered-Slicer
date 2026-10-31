@@ -1,6 +1,13 @@
 #pragma once
 #include <memory>
+#include "Point.hpp"
+#include <math.h>
+#include <cmath>
+#include <cstddef>
 #include <string>
+#include <vector>
+#include <utility>
+#include <memory>
 #define calib_pressure_advance_dd
 
 #include "GCodeWriter.hpp"
@@ -192,6 +199,7 @@ struct DrawBoxOptArgs
     double height;
     double line_width;
     double speed;
+    double e_per_mm{0.}; // 0: extrude with the first filament's settings
 };
 class CalibPressureAdvance
 {
@@ -230,8 +238,13 @@ protected:
                             double                              speed,
                             GCodeWriter                        &writer);
 
-    std::string draw_line(
-        GCodeWriter &writer, Vec2d to_pt, double line_width, double layer_height, double speed, const std::string &comment = std::string());
+    std::string draw_line(GCodeWriter       &writer,
+                          Vec2d              to_pt,
+                          double             line_width,
+                          double             layer_height,
+                          double             speed,
+                          const std::string &comment  = std::string(),
+                          double             e_per_mm = 0.);
     std::string draw_box(GCodeWriter &writer, double min_x, double min_y, double size_x, double size_y, DrawBoxOptArgs opt_args);
 
     double to_radians(double degrees) const { return degrees * M_PI / 180; };

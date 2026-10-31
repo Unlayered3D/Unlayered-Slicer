@@ -892,8 +892,8 @@ static NonplanarTopStats np_build(PrintObject &object, const sla::IndexedMesh &m
         const InfillPattern top_pattern   = line_pattern(cfg.top_surface_pattern.value);
         const InfillPattern solid_pattern = line_pattern(cfg.internal_solid_infill_pattern.value);
         double top_flow_scale = 1.;
-        if (cfg.nonplanar_top_surface_flow_ratio_enable.value && cfg.top_solid_infill_flow_ratio.value > EPSILON)
-            top_flow_scale = cfg.nonplanar_top_surface_flow_ratio.value / cfg.top_solid_infill_flow_ratio.value;
+        if (cfg.nonplanar_top_surface_flow_ratio_enable.value && cfg.top_solid_infill_flow_ratio.get_at(0) > EPSILON)
+            top_flow_scale = cfg.nonplanar_top_surface_flow_ratio.value / cfg.top_solid_infill_flow_ratio.get_at(0);
 
         // 2D toolpaths of every curved layer, in print order. Only the outermost curved layer is the top
         // surface (top pattern, speed and flow); the ones under it are internal solid infill, alternating

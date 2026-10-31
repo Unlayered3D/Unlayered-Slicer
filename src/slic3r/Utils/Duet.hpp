@@ -5,6 +5,7 @@
 #include <wx/string.h>
 
 #include "PrintHost.hpp"
+#include "libslic3r/enum_bitmask.hpp"
 
 namespace Slic3r {
 
@@ -44,7 +45,6 @@ private:
 	ConnectionType connect(wxString &msg) const;
 	void disconnect(ConnectionType connectionType) const;
 	bool start_print(wxString &msg, const std::string &filename, ConnectionType connectionType, bool simulationMode) const;
-	int get_err_code_from_body(const std::string &body) const;
 };
 
 // A Duet board running Unlayered firmware. The wire protocol is identical -- RepRapFirmware's

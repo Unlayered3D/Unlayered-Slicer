@@ -1,6 +1,6 @@
 name: Nightly dev build
 
-# Every night, if main has a commit that isn't on unlayered3d.com's /software/beta yet, start
+# Every night, if main has a commit that isn't on unlayered3d.com's dev channel yet, start
 # Build all on main with `publish` on. Nights with nothing new cost a minute of Linux runner time
 # instead of a full build. See .github/publish/README.md.
 

@@ -1,13 +1,24 @@
 #ifndef slic3r_PerimeterGenerator_hpp_
 #define slic3r_PerimeterGenerator_hpp_
 
+#include "Point.hpp"
+#include "Surface.hpp"
 #include "libslic3r.h"
+#include <functional>
+#include <cstddef>
+#include <boost/container_hash/hash.hpp>
+#include <optional>
+#include <utility>
 #include <vector>
 #include "Layer.hpp"
 #include "Flow.hpp"
 #include "Polygon.hpp"
 #include "PrintConfig.hpp"
-#include "SurfaceCollection.hpp"
+#include "Config.hpp"
+#include "ExPolygon.hpp"
+
+namespace Slic3r { class ExtrusionEntityCollection; }
+namespace Slic3r { class SurfaceCollection; }
 
 namespace Slic3r {
 struct FuzzySkinConfig
@@ -121,6 +132,8 @@ public:
     // Layer::wave_overhang_covered_polygons for the support pipeline to
     // subtract when support_remaining_areas_after_wave_overhangs is on.
     Polygons                                        out_wave_overhang_covered_polygons;
+    // Area resting on the layer below, where fuzzy skin is allowed. Unset means no restriction.
+    std::optional<ExPolygons>                       fuzzy_supported_area;
     
     PerimeterGenerator(
         // Input:
@@ -165,6 +178,10 @@ public:
     //BBS
     double      smaller_width_ext_mm3_per_mm()   const { return m_ext_mm3_per_mm_smaller_width; }
     Polygons    lower_slices_polygons() const { return m_lower_slices_polygons; }
+    // ORCA: the slices less the slivers the wall generator prints nothing for, so they never count as support.
+    ExPolygons  printable_slices(const ExPolygons &slices) const;
+    // ORCA: whether this layer prints its outer walls first for the brim, see brim_puts_outer_walls_first().
+    bool        outer_walls_first_for_brim() const;
 
 private:
     std::vector<Polygons>     generate_lower_polygons_series(float width);
@@ -183,6 +200,10 @@ private:
     double      m_ext_mm3_per_mm_smaller_width;
     Polygons    m_lower_slices_polygons;
 };
+
+// ORCA: a brim against the outer walls makes the first layer print them first, whatever the wall sequence, so the
+// brim runs straight on into the outer wall. Auto, ear and painted brims may leave the outer walls bare.
+bool brim_puts_outer_walls_first(BrimType brim_type, double brim_width);
 
 }
 
