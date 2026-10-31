@@ -164,7 +164,13 @@ void LayerRegion::make_perimeters(const SurfaceCollection &slices, const LayerRe
     // Cumulative sum of polygons over all the regions, less what the lower layer could not print.
     ExPolygons lower_slices;
     if (this->layer()->lower_layer != nullptr) {
-        lower_slices   = g.printable_slices(this->layer()->lower_layer->lslices);
+        // UNLAYERED_MOD: nonplanar layers -- a held-back feature's first layer after its top's host stands on the held
+        // stack printed with the shell, which the clipped layer below does not show (set by NonplanarTop.cpp).
+        // On a tilted floor the member holds the belt band of an earlier pass instead, rebuilt below.
+        const PrintObject *floor_object = this->layer()->object();
+        const bool held_floor = ! this->layer()->lslices_with_floor.empty() &&
+                                ! (floor_object != nullptr && floor_object->support_floor_is_tilted());
+        lower_slices   = g.printable_slices(held_floor ? this->layer()->lslices_with_floor : this->layer()->lower_layer->lslices);
         g.lower_slices = &lower_slices;
         // BELT_MOD -- on a tilted floor the strip resting on the belt (or the cut face) has nothing
         // below it in the layer stack, yet it is supported: add the floor's band through this slab

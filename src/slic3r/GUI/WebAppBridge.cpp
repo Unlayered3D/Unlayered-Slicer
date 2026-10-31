@@ -47,6 +47,7 @@
 #include "libslic3r/GCode/ThumbnailData.hpp" // ThumbnailData
 #include "slic3r/Utils/Http.hpp"
 #include "libslic3r/AppConfig.hpp"
+#include "slic3r/GUI/PlatePrintability.hpp"
 #include "libslic3r/Config.hpp"
 #include "libslic3r/Model.hpp"
 #include "libslic3r/Preset.hpp"
@@ -427,6 +428,7 @@ struct WebAppBridge::Impl : public std::enable_shared_from_this<WebAppBridge::Im
     // The page asks for the plate itself (e.g. a side panel, before it acts on the plate).
     void handle_request_handoff(const std::string& id, const json& params);
     void handle_slice(const std::string& id, const json& params);
+    bool refuse_nothing_printable(const std::string& id, const char* method, int plate);
     void handle_get_slice_modes(const std::string& id);
     void handle_set_slice_mode(const std::string& id, const json& params);
     json slice_modes_json() const;
@@ -3681,6 +3683,20 @@ void WebAppBridge::Impl::handle_fill_bed(const std::string& id, const json& para
     });
 }
 
+// The plate (or every plate, plate < 0) has nothing that would be printed, by the same fresh test
+// slicer.getPlate reports: refuse the request with the reason. Returns true when it refused.
+bool WebAppBridge::Impl::refuse_nothing_printable(const std::string& id, const char* method, int plate)
+{
+    Plater*     plater = wxGetApp().plater();
+    std::string reason, why;
+    if (!explain_nothing_printable(assess_plate_printability(plater->get_partplate_list(), plater->model()), plate, reason, why))
+        return false;
+    // data.reason stays "nothing_printable" for every cause; data.cause says which.
+    send_response(id, method, WAB_NOT_FOUND, "the plate has no printable object: " + why,
+                  {{"reason", "nothing_printable"}, {"cause", reason}});
+    return true;
+}
+
 void WebAppBridge::Impl::handle_get_plate(const std::string& id)
 {
     static const char* METHOD = "slicer.getPlate";
@@ -3696,20 +3712,42 @@ void WebAppBridge::Impl::handle_get_plate(const std::string& id)
     const Model&   model   = plater->model();
     const int      current = plates.get_curr_plate_index();
 
+    int    width = 0, depth = 0;
+    double height = 0.;
+    plates.get_plate_size(width, depth, height);
+
+    // Per-instance placement: the single verdict the slice / export / send refusals also use
+    // (assess_plate_printability: real bed shape, exclude areas, bed bottom, printable flags),
+    // computed fresh on every call. Nothing in the model is modified.
+    const PlatePrintability assessment  = assess_plate_printability(plates, model);
+    const int               plate_count = int(assessment.plates.size());
+    int                     outside_count = 0;
+
     json plate_list = json::array();
-    for (int i = 0; i < plates.get_plate_count(); ++i) {
+    for (int i = 0; i < plate_count; ++i) {
         PartPlate* plate = plates.get_plate(i);
         if (plate == nullptr)
             continue;
+        const PlateCounts& counts = assessment.plates[size_t(i)];
+        outside_count += counts.outside_bed + counts.exclude_area;
         plate_list.push_back({{"index", i},
                               {"isCurrent", i == current},
                               {"name", plate->get_plate_name()},
-                              {"hasPrintableInstances", plate->has_printable_instances()},
-                              {"sliceResultValid", plate->is_slice_result_valid()}});
+                              {"hasPrintableInstances", counts.printable > 0},
+                              {"sliceResultValid", plate->is_slice_result_valid()},
+                              {"printableCount", counts.printable},
+                              {"outsideCount", counts.outside_bed + counts.exclude_area},
+                              {"excludeAreaCount", counts.exclude_area},
+                              {"notPrintableCount", counts.disabled},
+                              // The plate list's own cached flag (rectangular bounds, updated on
+                              // instance moves), for diagnostics only.
+                              {"plateListHasPrintable", plate->has_printable_instances()}});
     }
+    outside_count += assessment.off_plate_count;
 
-    constexpr size_t max_objects = 100;
-    json             objects     = json::array();
+    constexpr size_t max_objects   = 100;
+    constexpr size_t max_instances = 200; // per object, in instanceStates
+    json             objects       = json::array();
     for (size_t obj_idx = 0; obj_idx < model.objects.size() && objects.size() < max_objects; ++obj_idx) {
         const ModelObject* object   = model.objects[obj_idx];
         int                on_plate = -1;
@@ -3728,27 +3766,53 @@ void WebAppBridge::Impl::handle_get_plate(const std::string& id)
                                {"max", {bb.max.x(), bb.max.y(), bb.max.z()}},
                                {"size", {size.x(), size.y(), size.z()}}};
         }
+        const std::vector<InstancePrintability>& inst_states   = assessment.instances[obj_idx];
+        json                                     states        = json::array();
+        int                                      obj_outside   = 0;
+        bool                                     any_printable = false;
+        for (size_t inst_idx = 0; inst_idx < inst_states.size(); ++inst_idx) {
+            const InstancePrintability& st      = inst_states[inst_idx];
+            const bool                  outside = !st.printable() && st.placement != InstancePlacement::Disabled;
+            if (outside)
+                ++obj_outside;
+            any_printable = any_printable || st.printable();
+            if (inst_idx < max_instances)
+                states.push_back({{"index", inst_idx},
+                                  {"plate", st.plate},
+                                  {"placement", instance_placement_name(st.placement)},
+                                  {"volumeState", st.plate >= 0 ? print_volume_state_name(st.state) : "fullyOutside"},
+                                  {"outside", outside},
+                                  {"printable", st.printable()}});
+        }
+        entry["instanceStates"]          = std::move(states);
+        entry["instanceStatesTruncated"] = inst_states.size() > max_instances;
+        entry["outsideCount"]            = obj_outside;
+        entry["anyPrintable"]            = any_printable;
         // Multiplanar cut planes, when the object has any (world frame; see Actions::cut_planes_json).
         if (!object->cut_planes.planes.empty())
             entry["cutPlanes"] = Actions::cut_planes_json(*object);
         objects.push_back(entry);
     }
 
-    int    width = 0, depth = 0;
-    double height = 0.;
-    plates.get_plate_size(width, depth, height);
-
-    send_response(id, METHOD, WAB_OK, "success",
-                  {{"printerTechnology", plater->printer_technology() == ptSLA ? "SLA" : "FFF"},
-                   {"projectName", std::string(plater->get_project_name().ToUTF8().data())},
-                   {"projectDirty", plater->is_project_dirty()},
-                   {"isEmpty", model.objects.empty()},
-                   {"currentPlate", current},
-                   {"plateCount", plates.get_plate_count()},
-                   {"bedMm", {{"width", width}, {"depth", depth}, {"height", height}}},
-                   {"plates", plate_list},
-                   {"objects", objects},
-                   {"objectsTruncated", model.objects.size() > max_objects}});
+    json response = {{"printerTechnology", plater->printer_technology() == ptSLA ? "SLA" : "FFF"},
+                     {"projectName", std::string(plater->get_project_name().ToUTF8().data())},
+                     {"projectDirty", plater->is_project_dirty()},
+                     {"isEmpty", model.objects.empty()},
+                     {"currentPlate", current},
+                     {"plateCount", plates.get_plate_count()},
+                     {"bedMm", {{"width", width}, {"depth", depth}, {"height", height}}},
+                     {"plates", plate_list},
+                     {"objects", objects},
+                     {"objectsTruncated", model.objects.size() > max_objects},
+                     {"hasPrintableInstances", assessment.plate_has_printable(current)},
+                     {"instanceCount", assessment.instance_count},
+                     {"printableCount", assessment.printable_count},
+                     {"outsideCount", outside_count},
+                     {"offPlateCount", assessment.off_plate_count}};
+    // Why the current plate has nothing to print, in the words the slice / export refusals use.
+    if (std::string reason, why; !model.objects.empty() && explain_nothing_printable(assessment, current, reason, why))
+        response["nothingPrintable"] = {{"reason", reason}, {"message", why}};
+    send_response(id, METHOD, WAB_OK, "success", response);
 }
 
 // How much of an export the page may pull in one call. Base64 inflates by a third and the whole
@@ -4298,10 +4362,12 @@ void WebAppBridge::Impl::handle_slice(const std::string& id, const json& params)
             plater->select_plate(plate);
     }
     PartPlate* plate = plates.get_curr_plate();
-    if (plate == nullptr || !plate->has_printable_instances()) {
-        send_response(id, METHOD, WAB_NOT_FOUND, "the plate has no printable object");
+    if (plate == nullptr) {
+        send_response(id, METHOD, WAB_NOT_FOUND, "the plate has no printable object", {{"reason", "nothing_printable"}});
         return;
     }
+    if (refuse_nothing_printable(id, METHOD, plates.get_curr_plate_index()))
+        return;
 
     // Plater::reslice() is the Slice button: it validates, may leave a notification instead of
     // starting, and reports nothing back. The outcome arrives as slicer.sliceStarted /
@@ -4964,6 +5030,8 @@ void WebAppBridge::Impl::handle_export_gcode(const std::string& id, const json& 
         send_response(id, METHOD, WAB_BAD_PARAMS, "no valid slice on the current plate; call slicer.slice first");
         return;
     }
+    if (refuse_nothing_printable(id, METHOD, which == "all" ? -1 : plates.get_curr_plate_index()))
+        return;
     if (which == "all") {
         json unsliced = json::array();
         for (int i = 0; i < plates.get_plate_count(); ++i)
@@ -4990,9 +5058,16 @@ void WebAppBridge::Impl::handle_export_gcode(const std::string& id, const json& 
         const bool saved = plater->gcode_exports_started() > before;
         if (auto self = weak.lock()) {
             json data = {{"ok", saved}, {"format", format}, {"plate", which}};
+            std::string reason, why;
             if (saved)
                 data["path"] = plater->last_gcode_export_path();
-            else
+            else if (explain_nothing_printable(assess_plate_printability(plater->get_partplate_list(), plater->model()),
+                                               which == "all" ? -1 : plater->get_partplate_list().get_curr_plate_index(), reason, why)) {
+                // The plate changed after the request was accepted; the export refused it.
+                data["reason"]  = "nothing_printable";
+                data["cause"]   = reason;
+                data["message"] = why;
+            } else
                 data["cancelled"] = true;
             self->send_event(id, "slicer.exportFinished", data);
         }
@@ -5010,6 +5085,8 @@ bool WebAppBridge::Impl::check_print_plate(const std::string& id, const char* me
     }
     all                   = plate == "all";
     PartPlateList& plates = wxGetApp().plater()->get_partplate_list();
+    if (refuse_nothing_printable(id, method, all ? -1 : plates.get_curr_plate_index()))
+        return false;
     if (all) {
         if (!plates.is_all_slice_results_ready_for_print()) {
             send_response(id, method, WAB_BAD_PARAMS, "not every plate has a slice ready to print; slice all plates first (slicer.slice)");

@@ -676,6 +676,15 @@ bool ConfigBase::set_deserialize_raw(const t_config_option_key &opt_key_src, con
 
     ConfigOption *opt = this->option(opt_key, true);
     assert(opt != nullptr);
+    // UNLAYERED_MOD: options cloned from a StaticPrintConfig (DynamicPrintConfig::full_print_config(), the test harness)
+    // carry no enum map (their default was built from an initializer list). Bind the definition's map before a name is
+    // deserialized into them; it was a null dereference (Spiral / Auto Lift set by name in fff_print_tests).
+    if (optdef->enum_keys_map != nullptr) {
+        if (auto *e = dynamic_cast<ConfigOptionEnumsGeneric*>(opt); e != nullptr && e->keys_map == nullptr)
+            e->keys_map = optdef->enum_keys_map;
+        else if (auto *g = dynamic_cast<ConfigOptionEnumGeneric*>(opt); g != nullptr && g->keys_map == nullptr)
+            g->keys_map = optdef->enum_keys_map;
+    }
     bool success     = false;
     bool substituted = false;
     if (optdef->type == coBools && substitutions_ctxt.rule != ForwardCompatibilitySubstitutionRule::Disable) {

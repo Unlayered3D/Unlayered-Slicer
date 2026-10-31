@@ -636,6 +636,8 @@ public:
 
 private:
     bool m_is_dark = false;
+    // Unlayered: set first thing in the destructor; teardown posts no notifications (see _set_warning_notification).
+    bool m_destroying = false;
     wxGLCanvas* m_canvas;
     wxGLContext* m_context;
     SceneRaycaster m_scene_raycaster;

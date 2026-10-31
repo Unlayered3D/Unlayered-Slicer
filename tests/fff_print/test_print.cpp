@@ -608,6 +608,53 @@ TEST_CASE("{printing_filament_types} lists the filament types really printed", "
     }
 }
 
+TEST_CASE("Print: {input_filename_base} resolves when no instance is printable", "[Print]")
+{
+    // Every instance outside the bed (e.g. after switching to a printer with a smaller or round bed):
+    // the file name must still be formed instead of the template failing with "Not a variable name".
+    Model model;
+    auto  put_outside = [](ModelObject* obj) {
+        for (ModelInstance* inst : obj->instances)
+            inst->print_volume_state = ModelInstancePVS_Fully_Outside;
+    };
+
+    SECTION("falls back to the first object's name") {
+        put_outside(add_named_cube(model, "FirstPart"));
+        put_outside(add_named_cube(model, "SecondPart"));
+        CHECK_NOTHROW(resolved_output_name(model, "{input_filename_base}_{layer_height}mm"));
+        CHECK(resolved_output_name(model, "{input_filename_base}") == "FirstPart.gcode");
+        CHECK(resolved_output_name(model, "{input_filename}") == "FirstPart.gcode");
+    }
+
+    SECTION("prefers the project (model) name") {
+        put_outside(add_named_cube(model, "FirstPart"));
+        model.model_info             = std::make_shared<ModelInfo>();
+        model.model_info->model_name = "MyProject";
+        CHECK(resolved_output_name(model, "{input_filename_base}") == "MyProject.gcode");
+    }
+
+    SECTION("uses a fixed name when nothing is named") {
+        put_outside(add_named_cube(model, ""));
+        CHECK(resolved_output_name(model, "{input_filename_base}") == "plate.gcode");
+    }
+
+    SECTION("an empty filename_format still names the file") {
+        put_outside(add_named_cube(model, "FirstPart"));
+        CHECK(resolved_output_name(model, "") == "FirstPart.gcode");
+    }
+}
+
+TEST_CASE("Print: {input_filename_base} still names a printable object first", "[Print]")
+{
+    // The fallback applies only when nothing is printable: a printable object keeps naming the file.
+    Model model;
+    add_named_cube(model, "OtherPlatePart")->instances.front()->print_volume_state = ModelInstancePVS_Fully_Outside;
+    add_named_cube(model, "OnPlatePart");
+    model.model_info             = std::make_shared<ModelInfo>();
+    model.model_info->model_name = "MyProject";
+    CHECK(resolved_output_name(model, "{input_filename_base}") == "OnPlatePart.gcode");
+}
+
 TEST_CASE("Print::validate stacks independent warnings", "[Print][validate]")
 {
     // Two unrelated checks (region precise-wall + machine acceleration) must each

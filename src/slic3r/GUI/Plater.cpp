@@ -227,6 +227,7 @@
 #include "UVEditorCanvas.hpp"
 #include "3DBed.hpp"
 #include "PartPlate.hpp"
+#include "PlatePrintability.hpp"
 #include "BeltPurgeTower.hpp"   // BELT_MOD
 #include "IMEXFilamentPickerPopover.hpp"
 #include "Camera.hpp"
@@ -15882,6 +15883,10 @@ void Plater::priv::set_bed_shape(const Pointfs       &shape,
 
     Pointfs prev_exclude_areas = partplate_list.get_exclude_area();
     Pointfs prev_wrapping_exclude_areas = partplate_list.get_wrapping_exclude_area();
+    // What may change what lies inside the bed: the outline / printable height (set_shape above,
+    // also the wrapping exclude areas) or the exclude areas. Clearance heights alone change nothing.
+    const bool outline_changed = new_shape || (prev_wrapping_exclude_areas != wrapping_exclude_areas);
+    const bool exclude_changed = prev_exclude_areas != exclude_areas;
     new_shape |= (height_to_lid != prev_height_lid) || (height_to_rod != prev_height_rod) || (prev_exclude_areas != exclude_areas)
         || (prev_wrapping_exclude_areas != wrapping_exclude_areas);
     if (!new_shape && partplate_list.get_logo_texture_filename() != custom_texture) {
@@ -15897,8 +15902,38 @@ void Plater::priv::set_bed_shape(const Pointfs       &shape,
         Vec3d min = bed.printable_bounding_box().min;
         double z = config->opt_float("printable_height");
 
+        int    prev_plate_width = 0, prev_plate_depth = 0;
+        double prev_plate_height = 0.;
+        partplate_list.get_plate_size(prev_plate_width, prev_plate_depth, prev_plate_height);
         partplate_list.reset_size(max.x() - min.x() - Bed3D::Axes::DefaultTipRadius, max.y() - min.y() - Bed3D::Axes::DefaultTipRadius, z);
+        int    plate_width = 0, plate_depth = 0;
+        double plate_height = 0.;
+        partplate_list.get_plate_size(plate_width, plate_depth, plate_height);
+        const bool size_changed = plate_width != prev_plate_width || plate_depth != prev_plate_depth || plate_height != prev_plate_height;
         partplate_list.set_shapes(shape, exclude_areas, wrapping_exclude_areas, extruder_areas, extruder_heights, custom_texture, height_to_lid, height_to_rod);
+        // Which plate holds each instance, and whether it is outside, is otherwise only recomputed when
+        // an instance moves; reset_size() re-files instances against the old outline (before
+        // set_shapes) and not at all when the bounding size is unchanged (a square bed swapped for a
+        // round one of the same width).
+        //  - Outline, printable height or plate size changed: re-file every instance against the new
+        //    bed, which also drops every plate's slice result (PartPlate::clear). A result sliced for
+        //    the old bed must not stay exportable.
+        //  - Only the exclude areas changed: update the outside status in place; only plates where it
+        //    changed lose their slice result.
+        //  - Clearance heights only: nothing to re-file.
+        if (!model.objects.empty() && (outline_changed || size_changed || exclude_changed)) {
+            bool refiled = false;
+            if (outline_changed || size_changed) {
+                partplate_list.reload_all_objects();
+                refiled = true;
+            } else
+                refiled = !refresh_plate_outside_status(partplate_list, model).empty();
+            if (refiled) {
+                if (ObjectList* obj_list = wxGetApp().obj_list(); obj_list != nullptr)
+                    obj_list->update_plate_values_for_items();
+                q->mark_plate_toolbar_image_dirty();
+            }
+        }
 
         Vec2d new_shape_position = partplate_list.get_current_shape_position();
         if (shape_position != new_shape_position)
@@ -20723,6 +20758,22 @@ void Plater::apply_cut_object_to_model(size_t obj_idx, const ModelObjectPtrs& ne
     // w.wait_for_idle();
 }
 
+// Exporting or sending a plate with nothing printable on it: say why plainly (outside the bed, in an
+// exclude area, set not printable), rather than letting the export go on to fail somewhere less
+// obvious (an empty G-code file, or an output file name that cannot be formed). Uses the same fresh
+// per-instance test as the web-app bridge's getPlate, not the plate list's cached outside set.
+// plate_idx < 0 means the current plate, all_plates every plate. Returns true when the export must stop.
+static bool refuse_export_of_empty_plate(Plater* plater, PartPlateList& plates, int plate_idx, bool all_plates)
+{
+    const int   plate = all_plates ? -1 : plate_idx < 0 ? plates.get_curr_plate_index() : plate_idx;
+    std::string reason, why;
+    if (!explain_nothing_printable(assess_plate_printability(plates, plater->model()), plate, reason, why))
+        return false;
+    BOOST_LOG_TRIVIAL(warning) << "export refused (" << reason << "): " << why;
+    show_error(plater, _L("Nothing to export.") + "\n" + from_u8(why));
+    return true;
+}
+
 void Plater::export_gcode(bool prefer_removable)
 {
     if (p->model.objects.empty())
@@ -20732,6 +20783,9 @@ void Plater::export_gcode(bool prefer_removable)
     //    return;
 
     if (p->process_completed_with_error == p->partplate_list.get_curr_plate_index())
+        return;
+
+    if (refuse_export_of_empty_plate(this, p->partplate_list, PLATE_CURRENT_IDX, false))
         return;
 
     UsageTelemetry::record("export", {{"kind", "gcode"}, {"removable", prefer_removable}});
@@ -20838,6 +20892,9 @@ void Plater::export_gcode_3mf(bool export_all)
         return;
 
     if (p->process_completed_with_error == p->partplate_list.get_curr_plate_index())
+        return;
+
+    if (refuse_export_of_empty_plate(this, p->partplate_list, PLATE_CURRENT_IDX, export_all))
         return;
 
     UsageTelemetry::record("export", {{"kind", "gcode_3mf"}, {"all_plates", export_all}});
@@ -23109,6 +23166,9 @@ void Plater::send_gcode_legacy(int plate_idx, Export3mfProgressFn proFn)
     // A page's upload options (slicer.print), for this upload only.
     const nlohmann::json automation = std::exchange(p->next_print_dialog_options, nlohmann::json::object()).value("upload", nlohmann::json::object());
 
+    if (refuse_export_of_empty_plate(this, get_partplate_list(), plate_idx, plate_idx == PLATE_ALL_IDX))
+        return;
+
     UsageTelemetry::record("export", {{"kind", "send"}, {"host_type", physical_printer_config->opt_serialize("host_type")}});
     usage_remember_print("send");
 
@@ -23313,6 +23373,8 @@ void Plater::send_gcode_legacy(int plate_idx, Export3mfProgressFn proFn)
 int Plater::send_gcode(int plate_idx, Export3mfProgressFn proFn)
 {
     int result = 0;
+    if (refuse_export_of_empty_plate(this, get_partplate_list(), plate_idx, plate_idx == PLATE_ALL_IDX))
+        return -1;
     /* generate 3mf */
     set_print_job_plate_idx(plate_idx);
 

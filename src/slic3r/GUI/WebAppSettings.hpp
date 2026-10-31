@@ -19,6 +19,7 @@
 namespace Slic3r {
 
 class ConfigBase;
+class Print;
 
 namespace GUI {
 
@@ -95,8 +96,12 @@ nlohmann::json variants_json(Tab& tab, const DynamicPrintConfig& cfg);
 std::string variant_value_text(const ConfigOption* opt, int index, int stride);
 
 // What a page wants to know after a slice, from the plate's G-code result and its Print's
-// statistics. Null JSON when the plate has no valid slice result.
+// statistics, plus its current slicing warnings (`warnings`). Null JSON when the plate has no
+// valid slice result.
 nlohmann::json slice_summary_json(PartPlate* plate);
+// [{message, level: "critical"|"warning", object?}] for every current warning of the Print's and
+// its objects' steps; `object` names the model object for object-step warnings.
+nlohmann::json print_warnings_json(const Print& print);
 
 } // namespace WebAppSettings
 

@@ -1691,6 +1691,7 @@ GLCanvas3D::GLCanvas3D(wxGLCanvas* canvas, Bed3D &bed)
 
 GLCanvas3D::~GLCanvas3D()
 {
+    m_destroying = true;
     if (_set_current()) {
         m_scene_cache.reset();
         m_frame_profiler.reset();
@@ -7843,7 +7844,7 @@ void GLCanvas3D::update_shortcut_tooltips()
 {
     const ShortcutRegistry& shortcuts = wxGetApp().shortcuts();
     m_main_toolbar.set_tooltip(m_main_toolbar.get_item_id("add"), shortcuts.with_key(_u8L("Add"), Shortcut::ImportModel));
-    m_main_toolbar.set_tooltip(m_main_toolbar.get_item_id("orient"), shortcuts.with_key(_u8L("Auto orient all/selected objects"), Shortcut::Orient) + "\n" + shortcuts.with_key(_u8L("Auto orient all objects on current plate"), Shortcut::OrientPlate));
+    m_main_toolbar.set_tooltip(m_main_toolbar.get_item_id("orient"), shortcuts.with_key(_u8L("Auto orient selected objects, or the current plate"), Shortcut::Orient) + "\n" + shortcuts.with_key(_u8L("Auto orient all objects on current plate"), Shortcut::OrientPlate));
     m_main_toolbar.set_tooltip(m_main_toolbar.get_item_id("arrange"), shortcuts.with_key(_u8L("Arrange all objects"), Shortcut::Arrange) + "\n" + shortcuts.with_key(_u8L("Arrange objects on selected plates"), Shortcut::ArrangePlate));
     m_main_toolbar.set_tooltip(m_main_toolbar.get_item_id("more"), shortcuts.with_key(_u8L("Add instance"), Shortcut::AddInstance));
     m_main_toolbar.set_tooltip(m_main_toolbar.get_item_id("fewer"), shortcuts.with_key(_u8L("Remove instance"), Shortcut::RemoveInstance));
@@ -12946,6 +12947,10 @@ void GLCanvas3D::_set_warning_notification(EWarning warning, bool state)
 {
     // Skip on shutdown: Plater's pImpl is already freed, so get_notification_manager() would use-after-free.
     if (wxGetApp().is_closing())
+        return;
+    // Unlayered: nor while this canvas is being destroyed. The main window can be torn down without the closing
+    // flag (a crash report: ~GLCanvas3D -> reset_volumes -> here, with the Plater's internals already freed).
+    if (m_destroying)
         return;
     using NotificationLevel = NotificationManager::NotificationLevel;
     enum ErrorType{

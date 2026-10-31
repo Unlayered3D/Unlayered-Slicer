@@ -33,7 +33,7 @@
         <color type="primary" scheme_preference="dark">#2b2b2b</color>
     </branding>
     <releases>
-        <release version="0.1.8" date="2026-10-24" type="stable">
+        <release version="0.1.9" date="2026-10-30" type="stable">
             <url type="details">https://github.com/Unlayered3D/Unlayered-Slicer/releases</url>
             <description>
                 <p>See the release page for the changelog.</p>

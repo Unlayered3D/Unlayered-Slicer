@@ -751,9 +751,11 @@ body.cloud-mode #LeftBoard
 	min-width: 0;
 }
 
-.FileItem:hover .FileNamePack, 
-.FileItem:hover .FileDate {
-	display: none; 
+/* Unlayered: a card always shows its action buttons in place of the name and date (the path is the
+   card's tooltip), not only on hover. */
+.FileItem .FileNamePack,
+.FileItem .FileDate {
+	display: none;
 }
 
 .FilePublishedBadge
@@ -799,7 +801,7 @@ body.cloud-mode #LeftBoard
 .CT_Item:hover
 {
 	cursor: pointer;
-	background-color:var(--main-color); /*ORCA color*/
+	background-color:var(--main-color); (ORCA color; no nested comment here, it ended this commented-out block early)
 	border-radius: 4px;
 	color: #fff;
 }
@@ -857,15 +859,11 @@ body.cloud-mode #LeftBoard
 /*ORCA Hide filename and date on hover and show action buttons*/
 .FileActions {
 	position: relative; /* Allows mouse events for child elements and blocks parent evemts*/
-	display: none;
+	display: flex;
+	min-height: 40px;
+	justify-content: space-between;
 	width: 100%;
 	margin-top: 5px;
-}
-
-.FileItem:hover .FileActions {
-	display: flex;
- 	min-height: 40px;
-	justify-content: space-between;
 }
 
 .FileActionsReveal,

@@ -1592,7 +1592,7 @@ static std::vector<std::string> s_Preset_print_options{
     "zaa_min_z",
     "ironing_expansion",
     // UNLAYERED_MOD: nonplanar layers
-    "nonplanar_layers", "nonplanar_max_angle", "nonplanar_max_height", "nonplanar_layer_count",
+    "nonplanar_layers", "nonplanar_max_angle", "nonplanar_max_height", "nonplanar_layer_count", "nonplanar_hold_back", "nonplanar_nozzle_tip_diameter", "nonplanar_top_surface_tip_lift",
     "nonplanar_top_surface_direction_enable", "nonplanar_top_surface_direction",
     "nonplanar_top_surface_flow_ratio_enable", "nonplanar_top_surface_flow_ratio",
     // Multi-Axis

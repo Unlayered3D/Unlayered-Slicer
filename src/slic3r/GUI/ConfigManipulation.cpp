@@ -1180,7 +1180,7 @@ void ConfigManipulation::toggle_print_fff_options(DynamicPrintConfig *config, in
     // UNLAYERED_MOD: nonplanar layers
     if (config->has("nonplanar_layers")) {
         const bool has_np = config->opt_bool("nonplanar_layers");
-        for (auto el : {"nonplanar_max_angle", "nonplanar_max_height", "nonplanar_layer_count",
+        for (auto el : {"nonplanar_max_angle", "nonplanar_max_height", "nonplanar_layer_count", "nonplanar_hold_back",
                         "nonplanar_top_surface_direction_enable", "nonplanar_top_surface_flow_ratio_enable"})
             toggle_line(el, has_np);
         toggle_line("nonplanar_top_surface_direction", has_np && config->opt_bool("nonplanar_top_surface_direction_enable"));

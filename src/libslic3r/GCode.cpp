@@ -44,6 +44,7 @@
 #include "GCode/WipeTower2.hpp"
 #include "GCode/BeltKinematics.hpp"
 #include "GCode/MultiplanarBaseC.hpp"
+#include "GCode/StartGCodeTemperature.hpp"
 #include "BeltTransform.hpp"
 #include "ShortestPath.hpp"
 #include "GCode/OrderingStrategies.hpp"
@@ -253,6 +254,19 @@ size_t np_curved_layers(const Layer &layer)
             if (np_is_shell(e))
                 n = std::max(n, static_cast<const ExtrusionEntityCollection *>(e)->entities.size());
     return n;
+}
+
+// Whether a layer prints anything besides curved shells (walls, planar fills, ironing).
+bool np_layer_has_planar(const Layer &layer)
+{
+    for (const LayerRegion *lr : layer.regions()) {
+        if (! lr->perimeters.entities.empty())
+            return true;
+        for (const ExtrusionEntity *e : lr->fills.entities)
+            if (! np_is_shell(e))
+                return true;
+    }
+    return false;
 }
 
 // The cooling buffer slows a layer down by its own time: a curved layer is cooled as its own layer.
@@ -3842,6 +3856,14 @@ void GCode::_do_export(Print& print, GCodeOutputStream &file, ThumbnailsGenerato
     // (a plate that only holds a sliced file) crashed here with an access violation.
     if (print.objects().empty())
         throw Slic3r::SlicingError(_(L("Nothing to slice: the plate has no objects.")));
+    // UNLAYERED_MOD -- the "; printing object <name> id:N" labels read PrintObject::get_id(), which only
+    // set_object_info() assigns (some flavors, exclude-object on); otherwise it was uninitialised memory (random ids
+    // on some hosts). Number the objects by index first, exactly as set_object_info() does.
+    {
+        size_t object_id = 0;
+        for (PrintObject *object : print.objects())
+            object->set_id(object_id++);
+    }
 
     m_print = &print;
     m_timelapse_pos_picker.init(&print,m_writer.get_xy_offset().cast<coord_t>());
@@ -3998,12 +4020,9 @@ void GCode::_do_export(Print& print, GCodeOutputStream &file, ThumbnailsGenerato
                 np_any_shell |= np_curved_layers(*layer) > 0;
     if (np_any_shell && print.config().print_sequence != PrintSequence::ByGroup) {
         // The planar layers a shell replaced completely print nothing and are skipped: count only layers with
-        // extrusions (audit: header 23 vs 20 layer tags).
-        auto has_ext = [](const Layer *l) {
-            for (const LayerRegion *lr : l->regions())
-                if (! lr->perimeters.entities.empty() || ! lr->fills.entities.empty()) return true;
-            return false;
-        };
+        // extrusions (audit: header 23 vs 20 layer tags). A layer with nothing but shells is not a layer of its own
+        // either: its first curved layer prints under its header (see np_shell_only in process_layer).
+        auto has_ext = [](const Layer *l) { return np_layer_has_planar(*l); };
         auto count = [](std::vector<coordf_t> &zs) {
             std::sort(zs.begin(), zs.end());
             unsigned int n = 0;
@@ -5037,6 +5056,50 @@ void GCode::_do_export(Print& print, GCodeOutputStream &file, ThumbnailsGenerato
     }
 
     std::string machine_start_gcode = this->placeholder_parser_process("machine_start_gcode", print.config().machine_start_gcode.value, initial_extruder_id);
+    // A start G-code that sets the nozzle or bed temperature suppresses the slicer's own
+    // heat-up, so a hard-coded value (e.g. "M109 S205") silently overrides the filament's
+    // first layer temperature until the slicer next changes it. Warn, but keep slicing.
+    {
+        const std::string &start_template = print.config().machine_start_gcode.value;
+        const size_t       filament_idx   = get_filament_config_index((int) initial_extruder_id);
+        const bool         sequential     = print.config().print_sequence == PrintSequence::ByObject ||
+                                            print.config().print_sequence == PrintSequence::ByGroup;
+        const TemperatureCommandFamily nozzle_family = nozzle_temperature_commands(print.config().gcode_flavor == gcfRepRapFirmware);
+
+        // The first filament's start G-code runs before the first extrusion (right after the
+        // machine start G-code, or at the first filament load). If it sets the nozzle
+        // temperature itself, the machine start G-code's value is not what prints.
+        const auto filament_start_sets_nozzle_temp = [&](unsigned int filament_id) {
+            const auto &values = print.config().filament_start_gcode.values;
+            return filament_id < values.size() && gcode_template_sets_temperature(values[filament_id], nozzle_family);
+        };
+        const bool filament_start_heats = filament_start_sets_nozzle_temp(initial_extruder_id) ||
+                                          filament_start_sets_nozzle_temp(initial_non_support_extruder_id);
+
+        const int expected_nozzle = print.config().nozzle_temperature_initial_layer.get_at(filament_idx);
+        if (std::optional<int> literal = filament_start_heats ? std::optional<int>() :
+                start_gcode_literal_temperature_mismatch(start_template, machine_start_gcode, nozzle_family, expected_nozzle)) {
+            std::string filament_name;
+            if (const auto *ids = print.full_print_config().option<ConfigOptionStrings>("filament_settings_id");
+                ids != nullptr && filament_idx < ids->values.size())
+                filament_name = ids->values[filament_idx];
+            if (filament_name.empty() && filament_idx < print.config().filament_type.values.size())
+                filament_name = print.config().filament_type.values[filament_idx];
+            if (filament_name.empty())
+                filament_name = _(L("the first filament"));
+            print.active_step_add_warning(PrintStateBase::WarningLevel::NON_CRITICAL,
+                start_gcode_nozzle_temperature_warning(*literal, expected_nozzle, filament_name, sequential));
+        }
+
+        // Same expected value as _print_first_layer_bed_temperature() would emit.
+        const int expected_bed = m_config.bed_temperature_formula.value == BedTempFormula::btfHighestTemp ?
+                                     get_highest_bed_temperature(true, print) :
+                                     get_bed_temperature(initial_extruder_id, true, print.config().curr_bed_type);
+        if (std::optional<int> literal = start_gcode_literal_temperature_mismatch(
+                start_template, machine_start_gcode, bed_temperature_commands(), expected_bed))
+            print.active_step_add_warning(PrintStateBase::WarningLevel::NON_CRITICAL,
+                start_gcode_bed_temperature_warning(*literal, expected_bed));
+    }
     if (print.config().gcode_flavor != gcfKlipper) {
         // Set bed temperature if the start G-code does not contain any bed temp control G-codes.
         // Waits for the bed (M190) as upstream does; a fork experiment had turned this into a no-wait M140.
@@ -7422,6 +7485,22 @@ LayerResult GCode::process_layer(
     //interface layer id is 0.
     bool                 first_layer   = (layer.id() == 0 && abs(layer.bottom_z()) < EPSILON);
     m_writer.set_is_first_layer(first_layer);
+    // UNLAYERED_MOD: nonplanar layers -- a layer whose object layers carry nothing but curved shells (the shell
+    // replaced all of its planar material) has no G-code layer of its own: its first curved layer is printed under
+    // this layer's header, so no layer change goes out without extrusions (see np_is_shell, np_layer_has_planar).
+    bool np_shell_only = false;
+    if (m_np_enabled && ! first_layer) {
+        bool shells = false, planar = false;
+        for (const LayerToPrint &l : layers) {
+            if (l.support_layer != nullptr || l.belt_brim_band != nullptr)
+                planar = true;
+            if (l.object_layer != nullptr) {
+                planar |= np_layer_has_planar(*l.object_layer);
+                shells |= np_curved_layers(*l.object_layer) > 0;
+            }
+        }
+        np_shell_only = shells && ! planar;
+    }
     unsigned int         first_extruder_id = layer_tools.extruders.front();
 
     // Initialize config with the 1st object to be printed at this layer.
@@ -8951,20 +9030,24 @@ LayerResult GCode::process_layer(
             // Layers stay monotonic and distinct: each curved layer is tagged at its own highest point, or just above
             // the layer before it (a few um per curved layer, well under the next planar layer).
             tag_z = std::max(tag_z + std::min(0.01, 0.5 * height / double(std::max<size_t>(1, n_curved))), zmax);
-            gcode += kNpCoolingSplit;
-            gcode += ";" + GCodeProcessor::reserved_tag(GCodeProcessor::ETags::Layer_Change) + "\n";
-            char nbuf[80];
-            sprintf(nbuf, print.is_BBL_printer() ? "; Z_HEIGHT: %g\n" : ";Z:%g\n", tag_z);
-            gcode += nbuf;
-            sprintf(nbuf, ";%s%g\n", GCodeProcessor::reserved_tag(GCodeProcessor::ETags::Height).c_str(), float(height));
-            gcode += nbuf;
-            if (! m_config.before_layer_change_gcode.value.empty()) {
-                DynamicConfig config;
-                config.set_key_value("layer_num",   new ConfigOptionInt(m_layer_index + 1));
-                config.set_key_value("layer_z",     new ConfigOptionFloat(tag_z));
-                config.set_key_value("max_layer_z", new ConfigOptionFloat(max_layer_z_for_templates()));
-                gcode += this->placeholder_parser_process("before_layer_change_gcode",
-                    print.config().before_layer_change_gcode.value, m_writer.filament()->id(), &config) + "\n";
+            // A layer with nothing but shells prints its first curved layer under its own header (np_shell_only).
+            const bool merged = k == 0 && np_shell_only;
+            if (! merged) {
+                gcode += kNpCoolingSplit;
+                gcode += ";" + GCodeProcessor::reserved_tag(GCodeProcessor::ETags::Layer_Change) + "\n";
+                char nbuf[80];
+                sprintf(nbuf, print.is_BBL_printer() ? "; Z_HEIGHT: %g\n" : ";Z:%g\n", tag_z);
+                gcode += nbuf;
+                sprintf(nbuf, ";%s%g\n", GCodeProcessor::reserved_tag(GCodeProcessor::ETags::Height).c_str(), float(height));
+                gcode += nbuf;
+                if (! m_config.before_layer_change_gcode.value.empty()) {
+                    DynamicConfig config;
+                    config.set_key_value("layer_num",   new ConfigOptionInt(m_layer_index + 1));
+                    config.set_key_value("layer_z",     new ConfigOptionFloat(tag_z));
+                    config.set_key_value("max_layer_z", new ConfigOptionFloat(max_layer_z_for_templates()));
+                    gcode += this->placeholder_parser_process("before_layer_change_gcode",
+                        print.config().before_layer_change_gcode.value, m_writer.filament()->id(), &config) + "\n";
+                }
             }
             // No wipe along the curved bead, and straight to the guard height (audit: the wipe climbed to the tag Z).
             m_wipe.reset_path();
@@ -8973,18 +9056,20 @@ LayerResult GCode::process_layer(
                 const double safe = std::max(m_writer.get_position().z(), m_np_guard ? m_np_safe_z : print_z);
                 gcode += m_writer.travel_to_z(safe, "nonplanar layer change");
             }
-            if (m_layer_count > 0)
-                gcode += m_writer.update_progress(++ m_layer_index, m_layer_count);
-            // Upstream's shared placeholder sets (#16680): the timelapse config and the layer change
-            // G-code, which also counts the curved layer in the running printed mass.
-            if (! m_config.time_lapse_gcode.value.empty() && ! is_BBL_Printer()) {
-                const DynamicConfig config = timelapse_gcode_config(print, tag_z, most_used_extruder, &m_printed_objects, false);
-                gcode += this->placeholder_parser_process("time_lapse_gcode",
-                    print.config().time_lapse_gcode.value, m_writer.filament()->id(), &config) + "\n";
+            if (! merged) {
+                if (m_layer_count > 0)
+                    gcode += m_writer.update_progress(++ m_layer_index, m_layer_count);
+                // Upstream's shared placeholder sets (#16680): the timelapse config and the layer change
+                // G-code, which also counts the curved layer in the running printed mass.
+                if (! m_config.time_lapse_gcode.value.empty() && ! is_BBL_Printer()) {
+                    const DynamicConfig config = timelapse_gcode_config(print, tag_z, most_used_extruder, &m_printed_objects, false);
+                    gcode += this->placeholder_parser_process("time_lapse_gcode",
+                        print.config().time_lapse_gcode.value, m_writer.filament()->id(), &config) + "\n";
+                }
+                if (! m_config.layer_change_gcode.value.empty())
+                    gcode += this->process_layer_change_gcode(print, tag_z, most_used_extruder, has_wipe_tower);
+                gcode += ";_SET_FAN_SPEED_CHANGING_LAYER\n";
             }
-            if (! m_config.layer_change_gcode.value.empty())
-                gcode += this->process_layer_change_gcode(print, tag_z, most_used_extruder, has_wipe_tower);
-            gcode += ";_SET_FAN_SPEED_CHANGING_LAYER\n";
             for (const NpDeferredShell &d : deferred) {
                 if (k >= d.shell->entities.size())
                     continue;
@@ -10480,7 +10565,9 @@ std::string GCode::_extrude(const ExtrusionPath &path, const std::string &path_d
         coord_t top = path.polyline.points.front().z();
         for (const Point3 &pt : path.polyline.points)
             top = std::max(top, pt.z());
-        const double safe = m_nominal_z + unscale_(top) + std::max(0.2, double(path.height)) + 0.2;
+        // At least just over the host layer: a shell far below its host (a lower band's strip handed over to a later
+        // top) left the guard off, and the next layer's first travel climbed diagonally through the slope from there.
+        const double safe = std::max(m_nominal_z + 0.01, m_nominal_z + unscale_(top) + std::max(0.2, double(path.height)) + 0.2);
         m_np_safe_z = m_np_guard ? std::max(m_np_safe_z, safe) : safe;
         m_np_guard  = true;
     }

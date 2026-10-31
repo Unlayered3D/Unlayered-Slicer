@@ -2048,26 +2048,50 @@ int GuideFrame::LoadProfileFamily(std::string strVendor, std::string strFilePath
         json pmachine = jLocal["machine_list"];
         nsize         = pmachine.size();
         BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(",  got %1% machines") % nsize;
+        // A machine may inherit printer_model / nozzle_diameter instead of setting them (Prusa's
+        // MMU3 and UltiMaker's 2+ profiles): look them up its inherits chain in this list.
+        std::map<std::string, std::string> machine_paths;
+        for (const json& m : pmachine)
+            if (m.contains("name") && m["name"].is_string() && m.contains("sub_path") && m["sub_path"].is_string())
+                machine_paths[m["name"].get<std::string>()] = m["sub_path"].get<std::string>();
+        auto load_machine = [&](const std::string& sub) -> json {
+            boost::filesystem::path p = boost::filesystem::absolute(vendor_dir / sub).make_preferred();
+            if (!boost::filesystem::exists(p))
+                return json();
+            std::string text;
+            LoadFile(p.string(), text);
+            return json::parse(text);
+        };
         for (int n = 0; n < nsize; n++) {
             json OneMachine = pmachine.at(n);
 
             std::string s1 = OneMachine["name"];
             std::string s2 = OneMachine["sub_path"];
 
-            // wxString ModelFilePath = wxString::Format("%s\\%s\\%s", strFolder, strVendor, s2);
-            boost::filesystem::path sub_path = boost::filesystem::absolute(vendor_dir / s2).make_preferred();
-            if (!boost::filesystem::exists(sub_path)) continue;
+            json pm = load_machine(s2);
+            if (!pm.is_object()) continue;
 
-            std::string             sub_file = sub_path.string();
-            LoadFile(sub_file, contents);
-            json pm = json::parse(contents);
-
-            std::string strInstant = pm["instantiation"];
-            if (strInstant.compare("true") == 0) {
-                OneMachine["model"] = pm["printer_model"];
-                OneMachine["nozzle"] = pm["nozzle_diameter"][0];
-
-                out["machine"][s1]=OneMachine;
+            if (pm.value("instantiation", std::string()) == "true") {
+                json model  = pm.contains("printer_model") ? pm["printer_model"] : json();
+                json nozzle = pm.contains("nozzle_diameter") ? pm["nozzle_diameter"] : json();
+                json parent = pm.contains("inherits") ? pm["inherits"] : json();
+                for (int depth = 0; depth < 16 && (!model.is_string() || !nozzle.is_array()) && parent.is_string(); ++depth) {
+                    const auto it = machine_paths.find(parent.get<std::string>());
+                    const json up = it == machine_paths.end() ? json() : load_machine(it->second);
+                    if (!up.is_object())
+                        break;
+                    if (!model.is_string() && up.contains("printer_model"))
+                        model = up["printer_model"];
+                    if (!nozzle.is_array() && up.contains("nozzle_diameter"))
+                        nozzle = up["nozzle_diameter"];
+                    parent = up.contains("inherits") ? up["inherits"] : json();
+                }
+                if (model.is_string() && nozzle.is_array() && !nozzle.empty() && nozzle[0].is_string()) {
+                    OneMachine["model"]  = model;
+                    OneMachine["nozzle"] = nozzle[0];
+                    out["machine"][s1]   = OneMachine;
+                } else
+                    BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << ": " << s1 << " has no printer_model or nozzle_diameter, left out";
             }
         }
 
@@ -2129,7 +2153,8 @@ int GuideFrame::LoadProfileFamily(std::string strVendor, std::string strFilePath
                     for (int i = 0; i < nPrinter; i++)
                     {
                         std::string sP = pPrinters.at(i);
-                        if (out["machine"].contains(sP))
+                        if (out["machine"].contains(sP) && out["machine"][sP]["model"].is_string() &&
+                            out["machine"][sP]["nozzle"].is_string())
                         {
                             std::string mModel = out["machine"][sP]["model"];
                             std::string mNozzle = out["machine"][sP]["nozzle"];

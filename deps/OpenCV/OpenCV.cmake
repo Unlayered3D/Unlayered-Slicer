@@ -85,6 +85,9 @@ orcaslicer_add_cmake_project(OpenCV
        -DINSTALL_TESTS=OFF
        -DINSTALL_C_EXAMPLES=OFF
        -DINSTALL_PYTHON_EXAMPLES=OFF
+       # No Python bindings are built; detection alone fails when the first Python found is the wrong
+       # version (OpenCVDetectPython then asks find_package for version "OFF").
+       -DOPENCV_PYTHON_SKIP_DETECTION=ON
        -DOPENCV_GENERATE_SETUPVARS=OFF
        -DOPENCV_INSTALL_FFMPEG_DOWNLOAD_SCRIPT=OFF
        -DBUILD_opencv_python2=OFF

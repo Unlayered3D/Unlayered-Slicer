@@ -307,6 +307,8 @@ set(lisbslic3r_sources
     GCode/SpiralVase.hpp
     GCode/WipePathHelpers.cpp
     GCode/WipePathHelpers.hpp
+    GCode/StartGCodeTemperature.cpp
+    GCode/StartGCodeTemperature.hpp
     GCode/ThumbnailData.cpp
     GCode/ThumbnailData.hpp
     GCode/Thumbnails.cpp

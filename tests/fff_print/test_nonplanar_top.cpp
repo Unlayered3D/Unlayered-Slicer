@@ -141,7 +141,7 @@ struct LayerScan
 };
 
 // Walks every extrusion of the object. `core(x, y)` selects points well inside the patch.
-LayerScan scan_layers(const PrintObject &obj, const HeightFn &f, const std::function<bool(double, double)> &core, double T)
+LayerScan scan_layers(const PrintObject &obj, const HeightFn &f, const std::function<bool(double, double)> &core, double T, double zcap = 1e9)
 {
     LayerScan r;
     // slice frame -> mesh frame: the object is centred on its bounding box.
@@ -174,6 +174,7 @@ LayerScan scan_layers(const PrintObject &obj, const HeightFn &f, const std::func
                     continue;
                 const double s = f(x, y);
                 const double z = layer->print_z + pt.z();
+                if (z > zcap) continue; // material of another top over this one
                 r.max_above = std::max(r.max_above, z - s);
                 if (p->nonplanar_shell) {
                     if (z > s - 0.5 * kH) { // the visible (last) curved layer
@@ -788,7 +789,9 @@ TEST_CASE("Nonplanar layers: every curved layer is a layer of its own in the G-c
     // The planar layers the shell replaces completely have nothing left to print and are skipped.
     INFO("layer changes on " << n_on << ", off " << n_off << ", curved " << curved << ", header " << total);
     CHECK(curved == 4); // 4 curved layers (top_shell_layers 4)
-    CHECK(n_on > n_off);
+    // (A host layer left with nothing but the shell prints its first curved layer under its own header: one layer of
+    // the planar top becomes one curved layer, so on and off can have the same count.)
+    CHECK(n_on >= n_off);
     CHECK(total == int(n_on));
     // Layer Z tags never go down.
     std::istringstream in(on.gcode);
@@ -801,6 +804,31 @@ TEST_CASE("Nonplanar layers: every curved layer is a layer of its own in the G-c
             last = z;
         }
     CHECK(worst >= -1e-6);
+    // No layer change goes out without at least one extrusion after it (the host layer of a shell that replaced all of
+    // its planar material printed an empty layer before the curved ones).
+    for (const std::string *g : { &on.gcode, &off.gcode }) {
+        std::istringstream gin(*g);
+        const std::regex   num(R"(([XYZE])(-?\d*\.?\d+))");
+        size_t blocks = 0, empty = 0;
+        bool   in_block = false, extruded = false;
+        while (std::getline(gin, line)) {
+            if (line.rfind(";LAYER_CHANGE", 0) == 0) {
+                if (in_block && ! extruded) ++ empty;
+                in_block = true; extruded = false; ++ blocks;
+            } else if (in_block && ! extruded && line.rfind("G1 ", 0) == 0) {
+                const std::string code = line.substr(0, line.find(';'));
+                bool xy = false; double e = 0.;
+                for (std::sregex_iterator it(code.begin(), code.end(), num), end; it != end; ++ it) {
+                    const char a = (*it)[1].str()[0];
+                    if (a == 'X' || a == 'Y') xy = true; else if (a == 'E') e = std::stod((*it)[2].str());
+                }
+                extruded = xy && e > 0.;
+            }
+        }
+        if (in_block && ! extruded) ++ empty;
+        INFO((g == &on.gcode ? "on" : "off") << ": layer blocks " << blocks << ", without extrusions " << empty);
+        CHECK(empty == 0);
+    }
 }
 
 TEST_CASE("Nonplanar layers: ironing follows the curved top", "[NonplanarTop]")
@@ -808,6 +836,8 @@ TEST_CASE("Nonplanar layers: ironing follows the curved top", "[NonplanarTop]")
     const HeightFn wedge = [](double x, double) { return 6. + (x + 12.5) * kTan8; };
     DynamicPrintConfig cfg = base_config(true);
     cfg.set_deserialize_strict({ { "ironing_type", "top" } });
+    // Curved ironing follows the surface (no tip lift).
+    const double lift = 0.;
     Sliced s, s_off;
     slice(s, heightfield_block(12.5, 10., 25, 4, wedge), cfg);
     slice(s_off, heightfield_block(12.5, 10., 25, 4, wedge), base_config(true));
@@ -823,11 +853,11 @@ TEST_CASE("Nonplanar layers: ironing follows the curved top", "[NonplanarTop]")
         if (! p.nonplanar_shell) { ++ planar_ironing; return; }
         for (const Point3 &pt : p.polyline.points) {
             const double x = unscale<double>(pt.x()) - c.x(), y = unscale<double>(pt.y()) - c.y();
-            worst = std::max(worst, std::abs(layer.print_z + unscale<double>(pt.z()) - wedge(x, y)));
+            worst = std::max(worst, std::abs(layer.print_z + unscale<double>(pt.z()) - (wedge(x, y) + lift)));
             ++ samples;
         }
     });
-    INFO("curved ironing samples " << samples << ", worst |z - S| " << worst << ", planar ironing paths " << planar_ironing);
+    INFO("curved ironing samples " << samples << ", worst |z - (S + lift)| " << worst << ", planar ironing paths " << planar_ironing);
     CHECK(samples > 100);
     CHECK(worst < 0.02);
     // The shell is the top: nothing irons the planar part under it; only the outermost curved layer is ironed.
@@ -835,7 +865,7 @@ TEST_CASE("Nonplanar layers: ironing follows the curved top", "[NonplanarTop]")
     size_t off_ironing = 0;
     visit_paths(*s_off.print.objects().front(), [&](const ExtrusionPath &p, const Layer &) { off_ironing += p.role() == erIroning; });
     CHECK(off_ironing == 0);
-    CHECK(max_extrusion_z(s.gcode) < wedge(12.5, 0.) + 0.05);
+    CHECK(max_extrusion_z(s.gcode) < wedge(12.5, 0.) + lift + 0.05);
 }
 
 // ---- single top surface, uniform offset (requirement: "all the printing before that must be the same as if
@@ -1010,34 +1040,6 @@ TEST_CASE("Nonplanar layers: the planar layers under the shell have closed walls
     CHECK(wrong_count == 0);
 }
 
-TEST_CASE("Nonplanar layers: a top with something over it prints planar", "[NonplanarTop]")
-{
-    // A shelf hanging over part of the slope (second volume of the same object).
-    auto two_volumes = [](Sliced &s, const DynamicPrintConfig &cfg_in) {
-        const HeightFn wedge = [](double x, double) { return 6. + (x + 12.5) * kTan8; };
-        DynamicPrintConfig config = DynamicPrintConfig::full_print_config();
-        config.apply(cfg_in);
-        ModelObject *o = s.model.add_object();
-        o->name = "shelf.stl";
-        o->add_volume(heightfield_block(12.5, 10., 25, 4, wedge));
-        TriangleMesh shelf(its_make_cube(12., 20., 1.5));
-        shelf.translate(0.5f, -10.f, 11.f);
-        o->add_volume(std::move(shelf));
-        o->add_instance();
-        o->ensure_on_bed();
-        s.print.auto_assign_extruders(o);
-        s.print.apply(s.model, config);
-        s.print.validate();
-        s.print.set_status_silent();
-        s.print.process();
-        s.gcode = Test::gcode(s.print);
-    };
-    Sliced s_on, s_off;
-    two_volumes(s_on, base_config(true));
-    two_volumes(s_off, base_config(false));
-    CHECK(strip_np_config(s_on.gcode) == strip_np_config(s_off.gcode));
-}
-
 TEST_CASE("Nonplanar layers: several tops, two slopes either side of a flat-topped tower", "[NonplanarTop]")
 {
     // Left section falling toward the tower, a flat-topped tower, a right section rising away from it.
@@ -1088,6 +1090,337 @@ TEST_CASE("Nonplanar layers: several tops, two slopes either side of a flat-topp
     // The tower is planar to its flat top.
     CHECK(max_extrusion_z(on.gcode) <= 14. + 0.01);
     CHECK(max_extrusion_z(on.gcode) >= 14. - 0.01);
+
+    SECTION("nonplanar_hold_back: the tower is held back and printed after the left top's shell") {
+        DynamicPrintConfig held_cfg = base_config(true);
+        held_cfg.set_deserialize_strict({ { "nonplanar_hold_back", 1 } });
+        Sliced held;
+        slice(held, heightfield_block(20., 8., 160, 16, sketch), held_cfg);
+        const PrintObject &hpo = *held.print.objects().front();
+        // The tower at x 0 is a separate island next to the left top at that height, so it is not in the layer's slices
+        // any more; the wedge's partial layer is as before.
+        bool held_partial = false;
+        for (const Layer *l : hpo.layers())
+            if (std::abs(l->print_z - 9.) < 0.11 && has(*l, -18.) && ! has(*l, 0.) && ! has(*l, -7.)) held_partial = true;
+        CHECK(held_partial);
+        CHECK(max_extrusion_z(held.gcode) <= 14. + 0.01);
+        CHECK(max_extrusion_z(held.gcode) >= 14. - 0.01);
+    }
+}
+
+namespace {
+
+// A heightfield block over [cx-a, cx+a] x [cy-b, cy+b] with its bottom at zb and its top at f(x, y) (world x, y).
+TriangleMesh block_at(double cx, double cy, double zb, double a, double b, int n, int m, const HeightFn &f)
+{
+    TriangleMesh mesh = heightfield_block(a, b, n, m, [&](double x, double y) { return f(x + cx, y + cy) - zb; });
+    mesh.translate(float(cx), float(cy), float(zb));
+    return mesh;
+}
+
+// Several volumes, one object (overlapping volumes print as their union).
+void slice_volumes(Sliced &s, const std::vector<TriangleMesh> &meshes, const DynamicPrintConfig &cfg_in)
+{
+    DynamicPrintConfig config = DynamicPrintConfig::full_print_config();
+    config.apply(cfg_in);
+    ModelObject *o = s.model.add_object();
+    o->name = "parts.stl";
+    for (const TriangleMesh &m : meshes) o->add_volume(m);
+    o->add_instance();
+    o->ensure_on_bed();
+    s.print.auto_assign_extruders(o);
+    s.print.apply(s.model, config);
+    s.print.validate();
+    s.print.set_status_silent();
+    s.print.process();
+    s.gcode = Test::gcode(s.print);
+}
+
+// The nozzle tip against everything extruded before, from the G-code alone: a 0.1 mm height map of the beads laid so
+// far (0.4 mm wide, top at the move's Z); every move (travel or extrusion) is checked at 0.05 mm steps before its own
+// bead is added. Returns the deepest dip of the tip under printed material beyond `tol`, and its line.
+struct Collision { double depth = 0.; size_t line = 0; size_t count = 0; };
+// tol: the clearance analysis accepts up to h/2 + 0.05 of contact with a stair corner (a ramp by design).
+Collision gcode_collisions(const std::string &gcode, double tol = 0.5 * kH + 0.05)
+{
+    const double cell = 0.1, x0 = -50., y0 = -50.;
+    const int    nx = 3000, ny = 3000;
+    std::vector<float> hmap(size_t(nx) * ny, -1e9f);
+    auto idx = [&](double x, double y) -> long {
+        const int i = int(std::floor((x - x0) / cell)), j = int(std::floor((y - y0) / cell));
+        return (i < 0 || j < 0 || i >= nx || j >= ny) ? -1 : long(j) * nx + i;
+    };
+    Collision r;
+    std::istringstream in(gcode);
+    std::string line;
+    double x = 0, y = 0, z = 0;
+    size_t ln = 0;
+    const std::regex num(R"(([XYZE])(-?\d*\.?\d+))");
+    while (std::getline(in, line)) {
+        ++ ln;
+        if (line.rfind("G1 ", 0) != 0 && line.rfind("G0 ", 0) != 0) continue;
+        const std::string code = line.substr(0, line.find(';'));
+        double nxp = x, nyp = y, nzp = z, e = 0.;
+        for (std::sregex_iterator it(code.begin(), code.end(), num), end; it != end; ++ it) {
+            const char a = (*it)[1].str()[0]; const double v = std::stod((*it)[2].str());
+            if (a == 'X') nxp = v; else if (a == 'Y') nyp = v; else if (a == 'Z') nzp = v; else e = v;
+        }
+        const double len = std::hypot(nxp - x, nyp - y);
+        const int    ns  = std::max(1, int(std::ceil(len / 0.05)));
+        std::vector<Vec3d> samples;
+        for (int k = 1; k <= ns; ++ k) samples.emplace_back(x + (nxp - x) * k / ns, y + (nyp - y) * k / ns, z + (nzp - z) * k / ns);
+        for (const Vec3d &q : samples) {
+            const long i = idx(q.x(), q.y());
+            if (i < 0) continue;
+            const double d = double(hmap[i]) - q.z();
+            if (d > tol) { ++ r.count; if (d > r.depth) { r.depth = d; r.line = ln; } }
+        }
+        if (e > 0. && len > 0.)
+            for (const Vec3d &q : samples)
+                for (int dj = -2; dj <= 2; ++ dj)
+                    for (int di = -2; di <= 2; ++ di) {
+                        if (di * di + dj * dj > 4) continue;
+                        const long i = idx(q.x() + di * cell, q.y() + dj * cell);
+                        if (i >= 0) hmap[i] = std::max(hmap[i], float(q.z()));
+                    }
+        x = nxp; y = nyp; z = nzp;
+    }
+    return r;
+}
+
+// Layers (by print_z, um) that carry shell paths.
+std::set<long> shell_layers(const PrintObject &obj)
+{
+    std::set<long> out;
+    visit_paths(obj, [&](const ExtrusionPath &p, const Layer &l) { if (p.nonplanar_shell) out.insert(std::lround(l.print_z * 1000.)); });
+    return out;
+}
+
+// Area (mm2) of a layer's slices inside a box (object frame, centred like scan_layers).
+double lslice_area_in(const PrintObject &obj, const Layer &l, double xa, double xb, double ya, double yb)
+{
+    BoundingBox bb;
+    for (const ExPolygon &ex : obj.layers().front()->lslices) bb.merge(get_extents(ex.contour));
+    const Vec2d c = unscale(bb.center());
+    Polygon box({ Point::new_scale(xa + c.x(), ya + c.y()), Point::new_scale(xb + c.x(), ya + c.y()), Point::new_scale(xb + c.x(), yb + c.y()), Point::new_scale(xa + c.x(), yb + c.y()) });
+    double a = 0;
+    for (const ExPolygon &ex : intersection_ex(l.lslices, ExPolygons{ ExPolygon(box) })) a += ex.area();
+    return a * SCALING_FACTOR * SCALING_FACTOR;
+}
+
+} // namespace
+
+TEST_CASE("Nonplanar layers: a slope under a shelf is curved, the clearance decides", "[NonplanarTop]")
+{
+    // A shelf hanging over part of the slope (second volume of the same object), 1.5 mm above its highest point. The
+    // shelf prints later and higher, so the slope under it is curved like the rest (0.1.9: no "nothing over it" rule).
+    const HeightFn wedge = [](double x, double) { return 6. + (x + 12.5) * kTan8; };
+    auto meshes = [&] {
+        std::vector<TriangleMesh> m{ heightfield_block(12.5, 10., 25, 4, wedge) };
+        TriangleMesh shelf(its_make_cube(12., 20., 1.5));
+        shelf.translate(0.5f, -10.f, 11.f);
+        m.push_back(std::move(shelf));
+        return m;
+    };
+    Sliced on, off;
+    slice_volumes(on, meshes(), base_config(true));
+    slice_volumes(off, meshes(), base_config(false));
+    dump("shelf_on", on.gcode);
+    const PrintObject &po = *on.print.objects().front();
+    const PrintObject &pf = *off.print.objects().front();
+    const LayerScan s = scan_layers(po, wedge, [](double x, double y) { return x > 3. && x < 10. && std::abs(y) < 6.5; }, 4 * kH, 10.9);
+    INFO("shell paths " << s.shell_paths << " top samples " << s.top_samples << " err " << s.max_shell_err << " stair " << s.max_stair_excess);
+    CHECK(s.top_samples > 50);
+    CHECK(s.max_shell_err < 0.05);
+    CHECK(s.max_stair_excess < 0.03);
+    const Collision col = gcode_collisions(on.gcode);
+    INFO("collision " << col.depth << " at line " << col.line << " (" << col.count << ")");
+    CHECK(col.depth < 0.5 * kH + 0.05 + 1e-3);
+    // The shelf is untouched.
+    for (size_t l = 0; l < po.layers().size() && l < pf.layers().size(); ++ l)
+        if (po.layers()[l]->print_z > 11.05)
+            CHECK(std::abs(lslice_area_in(po, *po.layers()[l], -30, 30, -30, 30) - lslice_area_in(pf, *pf.layers()[l], -30, 30, -30, 30)) < 0.01);
+}
+
+TEST_CASE("Nonplanar layers: a gentle deck under a gentle roof, both curved", "[NonplanarTop]")
+{
+    // Deck: 8 deg slope 6..9.5 mm. Roof: an 8 deg plate 1.5 mm thick from z 12, over x -4..10, carried by a pillar.
+    // The deck under the roof is the second top of its columns: one patch with the open deck, printed long before
+    // the roof; the roof prints at its own host; the roof's clip must not cut the deck under it.
+    const HeightFn deck = [](double x, double) { return 6. + (x + 12.5) * kTan8; };
+    const HeightFn roof = [](double x, double) { return 13.5 + (x + 4.) * kTan8; };
+    auto meshes = [&] {
+        std::vector<TriangleMesh> m{ heightfield_block(12.5, 10., 25, 4, deck) };
+        m.push_back(block_at(3., 0., 12., 7., 8., 28, 4, roof));
+        TriangleMesh pillar(its_make_cube(3., 3., 13.));
+        pillar.translate(1.5f, -1.5f, 0.f);
+        m.push_back(std::move(pillar));
+        return m;
+    };
+    Sliced on, off;
+    slice_volumes(on, meshes(), base_config(true));
+    slice_volumes(off, meshes(), base_config(false));
+    dump("deckroof_on", on.gcode);
+    const PrintObject &po = *on.print.objects().front();
+    const PrintObject &pf = *off.print.objects().front();
+    const double T = 4 * kH;
+    {   // deck under the roof (x 6..9, clear of the pillar)
+        const LayerScan s = scan_layers(po, deck, [](double x, double y) { return x > 6. && x < 9. && std::abs(y) < 6.; }, T, 11.9);
+        INFO("deck: shell paths " << s.shell_paths << " top samples " << s.top_samples << " err " << s.max_shell_err << " stair " << s.max_stair_excess);
+        CHECK(s.top_samples > 20);
+        CHECK(s.max_shell_err < 0.05);
+    }
+    {   // the roof
+        const LayerScan s = scan_layers(po, roof, [](double x, double y) { return x > -2. && x < 8. && std::abs(y) > 2.5 && std::abs(y) < 6.5; }, T);
+        INFO("roof: top samples " << s.top_samples << " err " << s.max_shell_err);
+        CHECK(s.top_samples > 50);
+        CHECK(s.max_shell_err < 0.05);
+    }
+    // Deck layers well under its band are the same as planar (the roof's clip did not reach them).
+    for (size_t l = 0; l < po.layers().size() && l < pf.layers().size(); ++ l)
+        if (po.layers()[l]->print_z < 5.)
+            CHECK(std::abs(lslice_area_in(po, *po.layers()[l], -30, 30, -30, 30) - lslice_area_in(pf, *pf.layers()[l], -30, 30, -30, 30)) < 0.01);
+    CHECK(shell_layers(po).size() >= 2);
+    const Collision col = gcode_collisions(on.gcode);
+    INFO("collision " << col.depth << " at line " << col.line << " (" << col.count << ")");
+    CHECK(col.depth < 0.5 * kH + 0.05 + 1e-3);
+}
+
+TEST_CASE("Nonplanar layers: a top taller than the max height prints in height bands", "[NonplanarTop]")
+{
+    // 8 deg over 80 mm: 11.2 mm of rise, max height 5. Bands, each at its own host layer, curved end to end.
+    const HeightFn wedge = [](double x, double) { return 4. + (x + 40.) * kTan8; };
+    Sliced on;
+    slice(on, heightfield_block(40., 8., 80, 4, wedge), base_config(true));
+    dump("bands_on", on.gcode);
+    const PrintObject &po = *on.print.objects().front();
+    const LayerScan s = scan_layers(po, wedge, [](double x, double y) { return std::abs(x) < 38. && std::abs(y) < 6.; }, 4 * kH);
+    INFO("top samples " << s.top_samples << " err " << s.max_shell_err);
+    CHECK(s.max_shell_err < 0.05);
+    // the top curved layer covers the whole length: every 4 mm of x has curved top samples
+    for (double xa = -38.; xa < 38.; xa += 4.) {
+        const LayerScan b = scan_layers(po, wedge, [xa](double x, double y) { return x >= xa && x < xa + 4. && std::abs(y) < 6.; }, 4 * kH);
+        INFO("x " << xa);
+        CHECK(b.top_samples > 10);
+    }
+    CHECK(shell_layers(po).size() >= 3); // at least 3 hosts
+    // Band seams are shingled: the earlier band hands its upper curved layers over to the later one across a strip,
+    // so every column along the top, seams included, carries all the curved layers.
+    {
+        int    min_layers = 1 << 20, max_layers = 0;
+        double min_at = 0.;
+        for (double x = -36.; x <= 36.; x += 0.25) {
+            const int c = curved_layers_at(po, wedge, x, 0.);
+            if (c < min_layers) { min_layers = c; min_at = x; }
+            max_layers = std::max(max_layers, c);
+        }
+        INFO("curved layers per column: min " << min_layers << " at x " << min_at << ", max " << max_layers);
+        CHECK(min_layers == 4);
+        CHECK(max_layers == 4);
+    }
+    const Collision col = gcode_collisions(on.gcode);
+    INFO("collision " << col.depth << " at line " << col.line << " (" << col.count << ")");
+    CHECK(col.depth < 0.5 * kH + 0.05 + 1e-3);
+}
+
+TEST_CASE("Nonplanar layers: a thin sloped wall top is curved with the walls that fit", "[NonplanarTop]")
+{
+    // A 1.2 mm wide wall, 8 deg along its length: one or two loops fit, no fill. It must be curved, covered, and clear.
+    const HeightFn ridge = [](double x, double) { return 6. + (x + 15.) * kTan8; };
+    Sliced on;
+    slice(on, heightfield_block(15., 0.6, 60, 2, ridge), base_config(true));
+    dump("thin_on", on.gcode);
+    const PrintObject &po = *on.print.objects().front();
+    const LayerScan s = scan_layers(po, ridge, [](double x, double y) { return std::abs(x) < 13. && std::abs(y) < 0.3; }, 4 * kH);
+    INFO("top samples " << s.top_samples << " err " << s.max_shell_err << " above " << s.max_above);
+    CHECK(s.top_samples > 50);
+    CHECK(s.max_shell_err < 0.05);
+    CHECK(s.max_above < 0.02);
+    const Collision col = gcode_collisions(on.gcode);
+    INFO("collision " << col.depth << " at line " << col.line << " (" << col.count << ")");
+    CHECK(col.depth < 0.5 * kH + 0.05 + 1e-3);
+}
+
+TEST_CASE("Nonplanar layers: a Benchy-like hull, rim curved stern to bow, roof curved, deck planar", "[NonplanarTop]")
+{
+    // Hull 40 x 16 mm, flat deck at 7, 1.2 mm rim walls whose top rises 6 deg from stern (x -20, z 9) to bow (z 13.2):
+    // taller than the max height, so it prints in bands. A cabin (x -8..2) to 15 with an 8 deg roof overhanging it by
+    // 1 mm all round (the deck under the overhang is a second top of its columns; it is flat and stays planar).
+    const double tan6 = std::tan(6. * M_PI / 180.);
+    const HeightFn sheer  = [tan6](double x, double) { return 9. + (x + 20.) * tan6; };
+    const HeightFn roof   = [](double x, double) { return 15.5 + (x + 9.) * kTan8; };
+    const HeightFn flat7  = [](double, double) { return 7.; };
+    const HeightFn flat15 = [](double, double) { return 15.; };
+    auto meshes = [&] {
+        std::vector<TriangleMesh> m;
+        m.push_back(block_at(0., 0., 0., 20., 8., 4, 4, flat7));     // hull + deck
+        m.push_back(block_at(0., 7.4, 0., 20., 0.6, 80, 2, sheer));  // port rim
+        m.push_back(block_at(0., -7.4, 0., 20., 0.6, 80, 2, sheer)); // starboard rim
+        m.push_back(block_at(-19.4, 0., 0., 0.6, 8., 2, 16, sheer)); // stern rim
+        m.push_back(block_at(19.4, 0., 0., 0.6, 8., 2, 16, sheer));  // bow rim
+        m.push_back(block_at(-3., 0., 0., 5., 5., 4, 4, flat15));    // cabin
+        m.push_back(block_at(-3., 0., 14., 6., 6., 24, 4, roof));    // roof, 1 mm overhang
+        return m;
+    };
+    Sliced on, off;
+    slice_volumes(on, meshes(), base_config(true));
+    slice_volumes(off, meshes(), base_config(false));
+    dump("benchylike_on", on.gcode);
+    const PrintObject &po = *on.print.objects().front();
+    const double T = 4 * kH;
+    // Rim, port side: curved top samples in every 4 mm of its length, on the surface.
+    for (double xa = -18.; xa < 18.; xa += 4.) {
+        const LayerScan b = scan_layers(po, sheer, [xa](double x, double y) { return x >= xa && x < xa + 4. && y > 7.1 && y < 7.7; }, T);
+        INFO("rim x " << xa << " samples " << b.top_samples << " err " << b.max_shell_err);
+        CHECK(b.top_samples > 5);
+        CHECK(b.max_shell_err < 0.05);
+    }
+    {
+        const LayerScan s = scan_layers(po, roof, [](double x, double y) { return x > -8. && x < 2. && std::abs(y) < 5.; }, T);
+        INFO("roof samples " << s.top_samples << " err " << s.max_shell_err);
+        CHECK(s.top_samples > 100);
+        CHECK(s.max_shell_err < 0.05);
+    }
+    {   // the flat deck is planar and exact
+        const LayerScan s = scan_layers(po, flat7, [](double x, double y) { return x > 4. && x < 17. && std::abs(y) < 6.; }, T);
+        CHECK(s.top_samples == 0);
+        CHECK(s.max_above < 0.02);
+    }
+    const Collision col = gcode_collisions(on.gcode);
+    INFO("collision " << col.depth << " at line " << col.line << " (" << col.count << ")");
+    CHECK(col.depth < 0.5 * kH + 0.05 + 1e-3);
+    const Collision coff = gcode_collisions(off.gcode);
+    INFO("planar control collision " << coff.depth << " at line " << coff.line);
+    CHECK(coff.depth < 0.5 * kH + 0.05 + 1e-3);
+}
+
+TEST_CASE("Nonplanar layers: no spiral (G2/G3) lift while the travel guard is on; lift type set by name", "[NonplanarTop]")
+{
+    // Spiral lifts are arcs; an arc cannot follow a curved layer. The traditional timelapse path forces an eager lift.
+    // Setting z_hop_types by NAME used to crash the harness (null enum map in full_print_config()).
+    const HeightFn wedge = [](double x, double) { return 6. + (x + 12.5) * kTan8; };
+    for (const char *lift : { "Spiral Lift", "Auto Lift" }) {
+        auto cfg = [lift](bool on) {
+            DynamicPrintConfig c = base_config(on);
+            c.set_deserialize_strict({ { "enable_arc_fitting", 1 }, { "printer_structure", "i3" }, { "time_lapse_gcode", ";TL" },
+                                       { "retract_when_changing_layer", "1" }, { "z_hop_types", lift } });
+            return c;
+        };
+        Sliced on, off;
+        slice(on, heightfield_block(12.5, 10., 25, 4, wedge), cfg(true));
+        slice(off, heightfield_block(12.5, 10., 25, 4, wedge), cfg(false));
+        auto arcs_after = [](const std::string &g, size_t from) {
+            size_t n = 0; std::istringstream in(g.substr(from)); std::string l;
+            while (std::getline(in, l)) if (l.rfind("G2 ", 0) == 0 || l.rfind("G3 ", 0) == 0) ++ n;
+            return n;
+        };
+        const size_t first_np = on.gcode.find("; nonplanar layer change");
+        INFO(lift);
+        REQUIRE(first_np != std::string::npos);
+        if (std::string(lift) == "Spiral Lift")
+            CHECK(arcs_after(off.gcode, 0) > 0); // control: the spiral path is exercised
+        CHECK(arcs_after(on.gcode, first_np) == 0);
+    }
 }
 
 TEST_CASE("Nonplanar layers: solid layers under the shell make up a curved count lower than the top shell count", "[NonplanarTop]")

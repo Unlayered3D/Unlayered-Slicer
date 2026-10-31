@@ -516,6 +516,8 @@ set(SLIC3R_GUI_SOURCES
     GUI/PartPlate.hpp
     GUI/BeltPurgeTower.cpp
     GUI/BeltPurgeTower.hpp
+    GUI/PlatePrintability.cpp
+    GUI/PlatePrintability.hpp
     GUI/FilamentGroupPopup.hpp
     GUI/FilamentGroupPopup.cpp
     GUI/PhysicalPrinterDialog.cpp

@@ -4511,10 +4511,13 @@ bool PartPlate::check_outside(int obj_id, int instance_id, BoundingBoxf3* boundi
 		// Orca: For sinking object, we use a more expensive algorithm so part below build plate won't be considered
 		// m_height mirrors the printer's printable height and is set in CLI mode too, unlike m_plater.
 		if (plate_box.intersects(instance_box)) {
-			// TODO: FIXME: this does not take exclusion area into account
 			const BuildVolume build_volume(get_shape(), m_height, m_extruder_areas, m_extruder_heights);
 			const auto state = instance->calc_print_volume_state(build_volume);
 			outside = state == ModelInstancePVS_Partly_Outside;
+			// A sinking instance over an exclude area is refused by slicing too (Print::validate).
+			for (size_t index = 0; !outside && index < m_exclude_bounding_box.size(); ++index)
+				if (!intersection({ m_exclude_bounding_box[index].polygon(true) }, { get_instance_hull() }).empty())
+					outside = true;
 		}
 	}
 	else
@@ -4920,7 +4923,8 @@ int PartPlate::printable_instance_size()
         ModelObject *  object   = m_model->objects[obj_id];
         ModelInstance *instance = object->instances[instance_id];
 
-        if ((instance->printable) && (instance_outside_set.find(std::pair(obj_id, instance_id)) == instance_outside_set.end())) {
+        // Same test as has_printable_instances().
+        if (object->printable && (instance->printable) && (instance_outside_set.find(std::pair(obj_id, instance_id)) == instance_outside_set.end())) {
             size++;
         }
     }
@@ -4943,7 +4947,8 @@ bool PartPlate::has_printable_instances()
 		ModelObject* object = m_model->objects[obj_id];
 		ModelInstance* instance = object->instances[instance_id];
 
-		if ((instance->printable)&&(instance_outside_set.find(std::pair(obj_id, instance_id)) == instance_outside_set.end()))
+		// An object set not printable prints none of its instances (ModelInstance::is_printable()).
+		if (object->printable && (instance->printable)&&(instance_outside_set.find(std::pair(obj_id, instance_id)) == instance_outside_set.end()))
 		{
 			result = true;
 			break;
@@ -4967,7 +4972,8 @@ bool PartPlate::is_all_instances_unprintable()
         ModelObject *  object   = m_model->objects[obj_id];
         ModelInstance *instance = object->instances[instance_id];
 
-        if ((instance->printable)) {
+        // An object set not printable prints none of its instances, as in has_printable_instances().
+        if (object->printable && (instance->printable)) {
             result = false;
             break;
         }

@@ -3618,6 +3618,33 @@ namespace {
 // CreateCoreWebView2EnvironmentWithOptions reads in place of the folder wxWidgets passes. A slot
 // keeps its folder (and its sign-ins) for the next window that gets the same slot.
 //
+// The bundled pages (home page, setup wizard) load from file:// and WebView2 keeps their files in its
+// HTTP cache for hours, so right after an update a window showed the new markup with the previous
+// build's stylesheet (0.1.8 -> 0.1.9: the recent-project cards lost their layout). The first time a
+// build uses a folder, before any WebView does, its HTTP and code caches go; sign-ins and storage stay.
+void clear_webview2_cache_after_update(const boost::filesystem::path& user_data_folder)
+{
+    namespace fs = boost::filesystem;
+    const fs::path    ebwebview = user_data_folder / "EBWebView";
+    const fs::path    marker    = ebwebview / "unlayered-build.txt";
+    const std::string build     = std::string(UNLAYERED_VERSION) + " " + build_commit_label;
+    std::string       last;
+    if (boost::nowide::ifstream in(marker.string()); in)
+        std::getline(in, last);
+    if (last == build)
+        return;
+    boost::system::error_code ec;
+    for (const char* cache : {"Cache", "Code Cache"}) {
+        fs::remove_all(ebwebview / "Default" / cache, ec);
+        if (ec)
+            BOOST_LOG_TRIVIAL(warning) << "WebView2 folder: could not clear " << cache << ": " << ec.message();
+    }
+    fs::create_directories(ebwebview, ec);
+    if (boost::nowide::ofstream out(marker.string()); out)
+        out << build << '\n';
+    BOOST_LOG_TRIVIAL(info) << "WebView2 folder: first start of " << build << " (was \"" << last << "\"), cleared its caches";
+}
+
 // "Who is first" and "which slot is free" are named mutexes: an object exists while a process holds
 // a handle to it, and Windows closes the handles of a process that exits or crashes, so a slot frees
 // itself. The handle a window keeps is deliberately never closed. Must run before the first WebView
@@ -3648,6 +3675,7 @@ void choose_webview2_user_data_folder()
         }
     } else if (::GetLastError() != ERROR_ALREADY_EXISTS) {
         BOOST_LOG_TRIVIAL(info) << "WebView2 folder: first window, default user-data folder";
+        clear_webview2_cache_after_update(boost::filesystem::path(wxStandardPaths::Get().GetUserLocalDataDir().ToStdWstring()));
         return; // the first window: keep the handle (and the default folder) for the process lifetime
     } else {
         // Another window is the first. Do not keep its object alive: once it exits, the next
@@ -3674,6 +3702,7 @@ void choose_webview2_user_data_folder()
         }
         BOOST_LOG_TRIVIAL(info) << "WebView2 folder: another window is running, this one uses slot " << slot << ": "
                                 << folder.ToUTF8().data();
+        clear_webview2_cache_after_update(boost::filesystem::path(folder.ToStdWstring()));
         return;
     }
     BOOST_LOG_TRIVIAL(warning) << "WebView2 folder: all " << MAX_SLOTS << " slots are in use; keeping the default folder";

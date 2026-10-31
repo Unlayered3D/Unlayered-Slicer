@@ -4398,7 +4398,8 @@ void MainFrame::init_menubar_as_editor()
         m_topbar->GetTopMenu(), Shortcut::Preferences, true, _L("Preferences"), "",
         [](wxCommandEvent &) {
             // Orca: Use GUI_App::open_preferences instead of direct call so windows associations are updated on exit
-            wxGetApp().open_preferences();
+            // Unlayered: after the top bar's menu has closed: Preferences can rebuild the main window, top bar included.
+            wxGetApp().CallAfter([]() { wxGetApp().open_preferences(); });
         },
         "", nullptr, []() { return true; }, this);
 

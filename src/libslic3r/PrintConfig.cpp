@@ -5728,6 +5728,36 @@ void PrintConfigDef::init_fff_params()
     def->mode     = comSimple;
     def->set_default_value(new ConfigOptionInt(0));
 
+    def = this->add("nonplanar_hold_back", coBool);
+    def->label    = L("Print features on curved tops afterwards");
+    def->category = L("Quality");
+    def->tooltip  = L("A feature that stands on or right next to a curved top (a chimney on a roof, a cabin on a deck) "
+                      "pauses below the top and prints flat on top of its curved layers afterwards, so the curved top "
+                      "runs under it instead of stopping in a flat ring around it. Experimental: check the preview.");
+    def->mode     = comSimple;
+    def->set_default_value(new ConfigOptionBool(false));
+
+    def = this->add("nonplanar_nozzle_tip_diameter", coFloat);
+    def->label    = L("Nozzle tip diameter");
+    def->category = L("Quality");
+    def->tooltip  = L("Diameter of the flat face at the end of the nozzle, around the hole. On a slope this face "
+                      "touches the surface at its uphill edge, so curved ironing is raised to match and curved "
+                      "layers keep clear of it. 0 = automatic (2.5 x nozzle diameter).");
+    def->sidetext = L("mm");	// millimeters, CIS languages need translation
+    def->min      = 0;
+    def->max      = 10;
+    def->mode     = comSimple;
+    def->set_default_value(new ConfigOptionFloat(0));
+
+    def = this->add("nonplanar_top_surface_tip_lift", coBool);
+    def->label    = L("Raise curved top surface and ironing on slopes");
+    def->category = L("Quality");
+    def->tooltip  = L("Raise the top surface lines and the ironing of curved tops on slopes: the nozzle's flat tip "
+                      "touches the surface with its uphill edge, so they run that much higher (tip radius x tan of "
+                      "the slope). Uses the slope's steepness only, not its direction.");
+    def->mode     = comAdvanced;
+    def->set_default_value(new ConfigOptionBool(false));
+
     def = this->add("nonplanar_top_surface_direction_enable", coBool);
     def->label    = L("Set nonplanar top surface direction");
     def->category = L("Quality");

@@ -72,6 +72,7 @@ add_executable(${_TEST_NAME}_tests
     test_actions_parts.cpp
     test_actions_objectsettings.cpp
     test_actions_plates.cpp
+    test_plate_printability.cpp
     test_actions_paint.cpp
     test_actions_presets.cpp
     test_actions_filament.cpp
@@ -79,6 +80,8 @@ add_executable(${_TEST_NAME}_tests
     test_actions_printers.cpp
     test_printer_update_check.cpp
     test_firmware_bundle.cpp
+    test_slice_warnings.cpp
+    test_orient_scope.cpp
     ../fff_print/test_helpers.cpp
     )
 

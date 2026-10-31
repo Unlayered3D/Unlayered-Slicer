@@ -1552,6 +1552,10 @@ PRINT_CONFIG_CLASS_DEFINE(
     // Serialized as compact "phys:slot,phys:slot" (1-based filament slots, matches UI).
     // Empty string means "use first_filament_for_physical_head defaults everywhere".
     ((ConfigOptionString,              imex_head_filament_map))
+    // UNLAYERED_MOD: nonplanar layers (NonplanarTop.cpp), shown with the region's nonplanar options: the
+    // region class is at the preprocessor's nesting limit (C1009 with one more option).
+    ((ConfigOptionFloat,               nonplanar_nozzle_tip_diameter))
+    ((ConfigOptionBool,                nonplanar_top_surface_tip_lift))
 )
 
 // This object is mapped to Perl as Slic3r::Config::PrintRegion.
@@ -1801,6 +1805,7 @@ PRINT_CONFIG_CLASS_DEFINE(
     ((ConfigOptionFloat, nonplanar_max_angle))
     ((ConfigOptionFloat, nonplanar_max_height))
     ((ConfigOptionInt,   nonplanar_layer_count))
+    ((ConfigOptionBool,  nonplanar_hold_back))
     ((ConfigOptionBool,  nonplanar_top_surface_direction_enable))
     ((ConfigOptionFloat, nonplanar_top_surface_direction))
     ((ConfigOptionBool,  nonplanar_top_surface_flow_ratio_enable))

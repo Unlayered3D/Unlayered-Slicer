@@ -2,6 +2,7 @@
 #include "wx/artprov.h"
 #include "wx/aui/framemanager.h"
 #include "wx/display.h"
+#include <wx/weakref.h>
 #include <wx/gdicmn.h>
 #include <wx/event.h>
 #include <wx/dcbuffer.h>
@@ -673,7 +674,12 @@ void BBLTopbar::PopupToolMenu(int tool_id, wxMenu* menu, bool& skip_popup)
     if (!skip_popup) {
         const wxRect rec = GetToolRect(tool_id);
         m_popup_open     = true;
+        // A menu item can rebuild the main window (and this bar with it) before PopupMenu returns:
+        // reported crashes in SetToolSticky after a theme or language change from Preferences.
+        wxWeakRef<BBLTopbar> alive(this);
         GetParent()->PopupMenu(menu, wxPoint(rec.GetLeft(), GetSize().GetHeight() - 2));
+        if (!alive)
+            return;
         m_popup_open = false;
     }
     else {
