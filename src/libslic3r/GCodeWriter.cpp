@@ -954,12 +954,12 @@ std::string GCodeWriter::lazy_lift(LiftType lift_type, bool spiral_vase)
     double target_lift = 0;
     {
         //BBS
-        int extruder_id = filament()->extruder_id();
-        int filament_id = filament()->id();
-        double above = this->config.retract_lift_above.get_at(extruder_id);
-        double below = this->config.retract_lift_below.get_at(extruder_id);
+        // The filament's column, like Extruder::z_hop(): a filament can override the printer's lift limits.
+        const int config_index = filament()->config_index();
+        double above = this->config.retract_lift_above.get_at(config_index);
+        double below = this->config.retract_lift_below.get_at(config_index);
         if (m_pos.z() >= above && (m_pos.z() <= below || below == 0.))
-            target_lift = this->config.z_hop.get_at(filament_id);
+            target_lift = this->config.z_hop.get_at(config_index);
     }
     // BBS
     if (m_lifted == 0 && m_to_lift == 0 && target_lift > 0) {
@@ -989,12 +989,12 @@ std::string GCodeWriter::eager_lift(const LiftType type) {
     double target_lift = 0;
     {
         //BBS
-        int extruder_id = filament()->extruder_id();
-        int filament_id = filament()->id();
-        double above = this->config.retract_lift_above.get_at(extruder_id);
-        double below = this->config.retract_lift_below.get_at(extruder_id);
+        // The filament's column, like Extruder::z_hop(): a filament can override the printer's lift limits.
+        const int config_index = filament()->config_index();
+        double above = this->config.retract_lift_above.get_at(config_index);
+        double below = this->config.retract_lift_below.get_at(config_index);
         if (m_pos.z() >= above && (m_pos.z() <= below || below == 0.))
-            target_lift = this->config.z_hop.get_at(filament_id);
+            target_lift = this->config.z_hop.get_at(config_index);
     }
 
     // BBS: spiral lift only safe with known position
@@ -1152,7 +1152,7 @@ std::string GCodeWriter::travel_to_xyz(const Vec3d &point, const std::string &co
     if (! trafo.linear().isApprox(Eigen::Matrix3d::Identity())) {
         double hop = 0.;
         if (const Extruder *e = this->filament(); e != nullptr)
-            hop = this->config.z_hop.get_at(e->id());
+            hop = this->config.z_hop.get_at(e->config_index()); // the filament's column, as lazy_lift() reads it
         if (hop > EPSILON)
             approach_vec = trafo.rotation() * Vec3d(0., 0., hop);
     }
