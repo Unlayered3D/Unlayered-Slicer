@@ -5508,10 +5508,24 @@ void PrintObject::update_slicing_parameters()
         // UNLAYERED_MOD -- the object is sliced in its rotated frame, so its printable height is the
         // height of the ROTATED bounding box. Same matrix the slicer uses (layer_rotation_trafo()).
         const Transform3d tempTrafo = layer_rotation_trafo(this->print()->config(), this->config()); // BELT_MOD: belt tilt included
-        object_max_z = (float) this->model_object()->mesh().transformed_bounding_box(tempTrafo).size().z();
-        // BELT_MOD -- the frame is raised by the belt schedule offset, so the schedule must reach that
-        // much further; the leading layers below the object's own material are empty and skipped.
-        object_max_z += (float) m_belt_schedule_offset;
+        const Vec3d       shrinkage_compensation = this->print()->shrinkage_compensation();
+        if (! tempTrafo.linear().isIdentity(1e-12) && shrinkage_compensation != Vec3d::Ones()) {
+            // The rotated frame is cut from the instance with the shrinkage compensation applied (in the
+            // bed frame, see trafo()), and create_from_config() multiplies the height it is given by the Z
+            // compensation. Under a rotation the compensated height is the height of the compensated mesh,
+            // not the rotated height times the Z compensation, and the belt schedule offset is measured in
+            // the compensated frame already. So both are measured there and handed over divided by the Z
+            // compensation, as OrcaSlicer does for its belt height (#16490). Before, the top of the part
+            // was left unsliced wherever that product came out short: a Z shrinkage above 100 %, or XY
+            // compensated more than Z.
+            object_max_z = (float) ((this->model_object()->mesh().transformed_bounding_box(tempTrafo * Geometry::scale_transform(shrinkage_compensation)).size().z()
+                                     + m_belt_schedule_offset) / shrinkage_compensation.z());
+        } else {
+            object_max_z = (float) this->model_object()->mesh().transformed_bounding_box(tempTrafo).size().z();
+            // BELT_MOD -- the frame is raised by the belt schedule offset, so the schedule must reach that
+            // much further; the leading layers below the object's own material are empty and skipped.
+            object_max_z += (float) m_belt_schedule_offset;
+        }
         // UNLAYERED_MOD -- a plain object lifted off the bed keeps its lift in the slice frame
         // (update_slice_frame()), so the layers must reach from the bed to its top, not only its height.
         if (! this->print()->config().belt_printer.value && tempTrafo.linear().isIdentity(1e-12)) {
