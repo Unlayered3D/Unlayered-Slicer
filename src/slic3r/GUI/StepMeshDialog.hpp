@@ -7,12 +7,15 @@
 #include "GUI_Utils.hpp"
 #include "libslic3r/Format/STEP.hpp"
 #include "Widgets/Button.hpp"
+#include "GeometryImportDialog.hpp"
 class Button;
+class RadioGroup;
 
 class StepMeshDialog : public Slic3r::GUI::DPIDialog
 {
 public:
-    StepMeshDialog(wxWindow* parent, Slic3r::Step& file, double linear_init, double angle_init);
+    StepMeshDialog(wxWindow* parent, Slic3r::Step& file, double linear_init, double angle_init,
+                   Slic3r::GUI::GeometryImportOptions* import_options = nullptr);
     ~StepMeshDialog() override;
     void on_dpi_changed(const wxRect& suggested_rect) override;
     inline double get_linear_deflection() {
@@ -32,13 +35,19 @@ public:
         }
     }
     inline bool get_split_compound_value() {
-        return m_split_compound_checkbox->GetValue();
+        return m_split_compound_checkbox.GetValue();
     }
 private:
+    // A non-null context defers all preference writes until the whole import is ready.
+    Slic3r::GUI::GeometryImportOptions* m_import_options = nullptr;
+    Slic3r::GUI::ImportCheckBox m_keep_names_checkbox;
+    Slic3r::GUI::ImportCheckBox m_sort_names_checkbox;
+    // Item 0 loads as an assembly, item 1 as a single object.
+    RadioGroup* m_load_mode = nullptr;
     Slic3r::Step& m_file;
-    wxCheckBox* m_checkbox = nullptr;
-    wxCheckBox* m_split_compound_checkbox = nullptr;
-    wxCheckBox* m_save_default_checkbox = nullptr;
+    Slic3r::GUI::ImportCheckBox m_checkbox;
+    Slic3r::GUI::ImportCheckBox m_split_compound_checkbox;
+    Slic3r::GUI::ImportCheckBox m_save_default_checkbox;
     wxString m_linear_last;
     wxString m_angle_last;
     wxStaticText* mesh_face_number_text;
@@ -57,6 +66,8 @@ namespace Slic3r { namespace GUI {
 // Automated loads (the web bridge's model imports) cannot answer the STEP meshing dialog or the
 // non-UTF-8 name warning. While one of these is alive, STEP imports mesh with the Preferences values,
 // as they do when "Show options when importing STEP file" is off, and the warning is only logged.
+// The geometry import dialogs of Plater::load_files() (AMF/3MF options, name cleanup, the assemblies
+// notice) are skipped the same way, as for a LoadStrategy::Silence load.
 class NoStepImportDialogs
 {
 public:

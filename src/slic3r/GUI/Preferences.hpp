@@ -47,7 +47,7 @@ namespace Slic3r { namespace GUI {
 #define PREFERENCES_INPUT_SIZE wxSize(PREFERENCES_FONT_SCALED(120), -1)
 
 // The tabs other dialogs open Preferences on.
-enum class PreferencesTab { General, Appearance, Control, Graphics, Online };   // Appearance: Unlayered
+enum class PreferencesTab { General, Appearance, Files, Behaviour, Control, Graphics, Online };   // Appearance: Unlayered
 
 class PreferencesDialog : public DPIDialog
 {

@@ -63,6 +63,9 @@ enum class ObjectOrder { Name, Filament, Height, Size };
 // Stable sort by natural name order, filament, top Z, or bounding box volume of the first instance.
 void sort_objects(std::vector<ModelObject*>& objects, ObjectOrder order, bool descending = false);
 
+// Set import-only presentation ranks without changing part order used by slicing.
+void set_import_volume_order(ModelObject& object, bool sort_names);
+
 class PartPlate;
 
 wxDECLARE_EVENT(EVT_OBJ_LIST_OBJECT_SELECT, SimpleEvent);
@@ -543,7 +546,11 @@ private:
     // reorder within their own type group, and the first slot is reserved for a model part.
     bool can_move_volume(int obj_idx, int from_vol_idx, int to_vol_idx) const;
     // Move part `from_vol_idx` to `to_vol_idx` (model + list), no snapshot; shared by drop and menu.
+    // For a part list with an import display order the part also takes the target's place in it.
     void move_volume(int obj_idx, int from_vol_idx, int to_vol_idx);
+    // The part indices of object `obj_idx` in the order the list shows them: model order, or the
+    // display order a geometry import with body names sets (ModelVolume::import_display_order).
+    std::vector<int> displayed_volume_ids(int obj_idx) const;
     // Index the selected object/part would move to for `move`, or -1 when it cannot move.
     int  order_target(OrderMove move, int& obj_idx, int& vol_idx) const;
     // Turn a drop event into the index the dragged row moves to (object index or part index),

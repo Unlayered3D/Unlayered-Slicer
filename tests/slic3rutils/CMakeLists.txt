@@ -83,6 +83,7 @@ add_executable(${_TEST_NAME}_tests
     test_firmware_bundle.cpp
     test_slice_warnings.cpp
     test_orient_scope.cpp
+    test_geometry_import.cpp
     ../fff_print/test_helpers.cpp
     )
 
