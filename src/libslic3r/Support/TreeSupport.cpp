@@ -2137,7 +2137,8 @@ void TreeSupport::extend_below_segment_floor()
     // per-index side tables (layer_heights, contact_nodes), so inserting layers before either pass
     // shifts those indices and reads out of bounds -- which is exactly what it did.
     // BELT_MOD: also for an object on a belt, whose floor (the belt) is tilted in the slice frame.
-    if (! m_object->support_floor_is_tilted())
+    // UNLAYERED_MOD -- and a root lifted off the plate, whose plate lies below its own zero everywhere.
+    if (! m_object->support_floor_is_tilted() && ! m_object->root_floats_above_plate())
         return;
     const SegmentSupportBounds bounds(*m_object, m_slicing_params.first_print_layer_height);
     if (! bounds.is_active())

@@ -15,6 +15,7 @@
 #include "libslic3r/CustomGCode.hpp"
 #include <wx/event.h>
 #include <algorithm>
+#include <limits>
 #include <cstdlib>
 #include <cassert>
 #include "libslic3r/PrintConfig.hpp"
@@ -463,11 +464,13 @@ void Preview::check_layers_slider_values(std::vector<CustomGCode::Item>& ticks_f
     // TODO: this should be placed into more appropriate part of code,
     // this function is e.g. not called when the last object is deleted
     unsigned int old_size = ticks_from_model.size();
+    // UNLAYERED_MOD: against the highest layer rather than by a binary search, which needs sorted Zs;
+    // a print by object repeats them per object. The same test for sorted ones.
+    const double z_max = layers_z.empty() ? -std::numeric_limits<double>::max() : *std::max_element(layers_z.begin(), layers_z.end());
     ticks_from_model.erase(std::remove_if(ticks_from_model.begin(), ticks_from_model.end(),
-                     [layers_z](CustomGCode::Item val)
+                     [z_max](CustomGCode::Item val)
         {
-            auto it = std::lower_bound(layers_z.begin(), layers_z.end(), val.print_z - epsilon());
-            return it == layers_z.end();
+            return z_max < val.print_z - epsilon();
         }),
         ticks_from_model.end());
     if (ticks_from_model.size() != old_size)
@@ -611,14 +614,15 @@ void Preview::update_layers_slider(const std::vector<double>& layers_z, bool kee
     auto curr_print_seq = curr_plate->get_real_print_seq();
     bool sequential_print = (curr_print_seq == PrintSequence::ByObject);
     m_layers_slider->SetDrawMode(sequential_print);
+    // UNLAYERED_MOD: tell the slider which layers are horizontal, so tilted ones do not advertise an
+    // exact Z. Empty for an ordinary print, which keeps the labels exactly as they were. Before the
+    // ticks: in a print by object they need it too (IMSlider::sequential_codes_allowed()).
+    m_layers_slider->SetLayersPlanar(m_canvas->get_gcode_layers_planar());
     
     m_layers_slider->SetTicksValues(ticks_info_from_curr_plate);
 
     auto print_mode_stat = m_gcode_result->print_statistics.modes.front();
     m_layers_slider->SetLayersTimes(m_canvas->get_gcode_layers_times_cache(), print_mode_stat.time);
-    // UNLAYERED_MOD: tell the slider which layers are horizontal, so tilted ones do not advertise an
-    // exact Z. Empty for an ordinary print, which keeps the labels exactly as they were.
-    m_layers_slider->SetLayersPlanar(m_canvas->get_gcode_layers_planar());
 
     // Suggest the auto color change, if model looks like sign
     if (m_layers_slider->IsNewPrint()) {

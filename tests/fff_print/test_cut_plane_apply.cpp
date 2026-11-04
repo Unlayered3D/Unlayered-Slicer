@@ -37,6 +37,7 @@ static DynamicPrintConfig cut_plane_config()
     DynamicPrintConfig config = DynamicPrintConfig::full_print_config();
     config.set_deserialize_strict({
         { "enable_nonplanar",   "1" },
+        { "axis_selection",     "bc" },  // these checks read the rotary (B/C) output
         { "print_sequence",     "by group" },
         // Unrelated validate() requirement of the stock test config (relative E addressing).
         { "layer_change_gcode", "G92 E0" },
@@ -648,5 +649,49 @@ SCENARIO("Section tags scope the toolpaths they belong to", "[cutplanes]") {
             for (const GCodeProcessorResult::MoveVertex &move : result.moves)
                 CHECK(move.cut_segment_id == -1);
         }
+    }
+}
+
+// A cut-plane segment can reach the G-code export with no layers at all: slicing keeps an empty
+// segment so the rest of the partition finishes (PrintObjectSlice.cpp, "keep it as an empty
+// segment"), and the trailing empty layers are then trimmed off, every one of them if the segment
+// holds no material. The export took the largest print_z over every object's layers, and reading
+// the largest of an empty list took the app down on 0.1.9 (Windows access violation in
+// GCode::_do_export, cut planes with nonplanar printing). The field route needs a particular
+// geometry, so this test empties the upper segment's layers after slicing and exports: no crash,
+// and the plate's height comes from the segment that prints.
+TEST_CASE("A cut-plane segment without layers still exports", "[cutplanes][Regression]")
+{
+    {
+        Slic3r::Print print;
+        Model         model;
+        make_cut_cube_model(model, mid_plane_stack(10.));
+        DynamicPrintConfig config = cut_plane_config();
+        // Cut planes print by group (validate() refuses any other sequence)
+        config.set_deserialize_strict({ { "skirt_loops", 0 },
+                                        { "brim_type", "no_brim" },
+                                        { "enable_prime_tower", 0 } });
+        print.apply(model, config);
+        const auto validation = print.validate();
+        INFO("validate: " << validation.string);
+        REQUIRE(validation.string.empty());
+        print.set_status_silent();
+        print.process();
+        REQUIRE(print.objects().size() == 2);
+        PrintObject *upper = print.get_object(1);
+        upper->clear_support_layers();
+        upper->clear_layers();
+        REQUIRE(upper->layers().empty());
+
+        const std::string gcode = Test::gcode(print);
+        CHECK_FALSE(gcode.empty());
+        // The header's height is the lower segment's: the cube is cut at Z 10, and a segment slices a
+        // little past its own material (segment_slice_top()), so somewhat above 10 but nowhere near the
+        // 20 mm cube, and not -1
+        const size_t at = gcode.find("; max_z_height: ");
+        REQUIRE(at != std::string::npos);
+        const double max_z = std::stod(gcode.substr(at + 16));
+        CHECK(max_z > 9.);
+        CHECK(max_z < 15.);
     }
 }

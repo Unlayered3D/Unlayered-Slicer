@@ -426,9 +426,17 @@ void NonplanarSliceJob::finalize(bool canceled, std::exception_ptr &e)
         return;
     }
 
+    // A service whose own safety check failed but did not refuse the job says so in a warning
+    // starting "SAFETY CHECK FAILED": shown as an error, so it is not read as a passing note.
+    bool safety_failed = false;
+    for (const std::string& w : m_warnings) {
+        BOOST_LOG_TRIVIAL(warning) << "NonplanarSliceJob: service warning: " << w;
+        safety_failed |= boost::algorithm::istarts_with(w, "SAFETY CHECK FAILED");
+    }
     if (notify != nullptr && ! m_warnings.empty())
         notify->push_notification(NotificationType::CustomNotification,
-                                  NotificationManager::NotificationLevel::WarningNotificationLevel,
+                                  safety_failed ? NotificationManager::NotificationLevel::ErrorNotificationLevel
+                                                : NotificationManager::NotificationLevel::WarningNotificationLevel,
                                   _u8L("Slicing service") + ": " +
                                       boost::algorithm::join(m_warnings, " · "));
 

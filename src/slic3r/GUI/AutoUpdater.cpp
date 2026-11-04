@@ -1,4 +1,5 @@
 #include "AutoUpdater.hpp"
+#include "slic3r/GUI/SliceServiceOptionsDialog.hpp"
 
 #include <cctype>
 #include <chrono>
@@ -53,6 +54,9 @@ void refresh_app_title()
 {
     if (Plater *plater = wxGetApp().plater())
         plater->update_title_dirty_status();
+    // Who is signed in decides whether this build offers the slicing service (staff accounts only
+    // in a customer build): fetch its form now, so the Slice dropdown has the modes.
+    SliceService::refresh_schema_async();
 }
 
 namespace {
@@ -146,7 +150,9 @@ public:
         m_reopen      = new wxButton(this, wxID_ANY, _L("Open the browser again"));
         m_reopen->Disable();
         m_reopen->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) {
-            if (!m_browser_url.empty())
+            if (m_retry)
+                run(); // a new handoff: the old one failed or expired
+            else if (!m_browser_url.empty())
                 wxLaunchDefaultBrowser(wxString::FromUTF8(m_browser_url));
         });
         auto *cancel = new wxButton(this, wxID_CANCEL, _L("Cancel"));
@@ -172,6 +178,19 @@ protected:
 private:
     void run()
     {
+        // A retry: the previous attempt's thread, if it is still polling, stops touching the dialog.
+        const bool retrying = m_retry;
+        *m_alive = false;
+        m_alive  = std::make_shared<std::atomic<bool>>(true);
+        m_error.clear();
+        m_browser_url.clear();
+        m_retry = false;
+        m_reopen->SetLabel(_L("Open the browser again"));
+        m_reopen->Disable();
+        m_status->SetLabel(retrying ? _L("Trying again...") : _L("Starting..."));
+        m_status->UnsetToolTip();
+        Fit();
+
         auto               alive   = m_alive;
         auto               account = m_account;
         SignInDialog      *self    = this; // only dereferenced on the GUI thread, after an alive check
@@ -184,10 +203,19 @@ private:
                 });
             };
 
+            const auto                started = std::chrono::steady_clock::now();
             UnlayeredAccount::Handoff handoff;
             std::string               error;
             if (!account->start_handoff(handoff, error)) {
-                on_gui([error](SignInDialog *d) { d->fail(error); });
+                // A DNS failure comes back in ~15 ms, so "Trying again..." never showed and the button
+                // looked dead (11/02). Keep it on screen for a second before the failure.
+                std::this_thread::sleep_until(started + std::chrono::seconds(1));
+                on_gui([error, unreachable = handoff.unreachable](SignInDialog *d) {
+                    // Offline, DNS or a firewall: say that, not libcurl's text (which stays in the
+                    // log and the tooltip).
+                    d->fail(error, unreachable ? _L("Couldn't reach Unlayered. Check your internet connection, then try again.")
+                                               : wxString());
+                });
                 return;
             }
             on_gui([url = handoff.browser_url](SignInDialog *d) {
@@ -210,23 +238,30 @@ private:
                     return;
                 case UnlayeredAccount::CollectResult::Failed:
                     // collect() already turns "no answer" into Pending; this is the site refusing.
-                    on_gui([error](SignInDialog *d) { d->fail(error); });
+                    on_gui([error](SignInDialog *d) { d->fail(error, wxString()); });
                     return;
                 case UnlayeredAccount::CollectResult::Pending: break;
                 }
             }
             on_gui([](SignInDialog *d) {
-                d->fail(_u8L("The sign-in request expired. Close this window and try again."));
+                d->fail("the sign-in request expired", _L("The sign-in request expired. Try again to start a new one."));
             });
         }).detach();
     }
 
-    void fail(const std::string &error)
+    // `message` is what the person reads; empty shows `error` itself. Either way the button becomes
+    // "Try again", which starts a new handoff (a retry never reopens a dead browser link).
+    void fail(const std::string &error, const wxString &message)
     {
         m_error = error;
-        m_status->SetLabel(wxString::Format(_L("Sign-in did not complete: %s"), wxString::FromUTF8(error)));
+        BOOST_LOG_TRIVIAL(warning) << "account: sign-in dialog: " << error;
+        m_status->SetLabel(message.empty() ? wxString::Format(_L("Sign-in did not complete: %s"), wxString::FromUTF8(error))
+                                           : message);
+        m_status->SetToolTip(wxString::FromUTF8(error));
         m_status->Wrap(FromDIP(420));
-        m_reopen->Disable();
+        m_retry = true;
+        m_reopen->SetLabel(_L("Try again"));
+        m_reopen->Enable();
         Fit();
     }
 
@@ -236,6 +271,7 @@ private:
     wxButton                          *m_reopen{nullptr};
     std::string                        m_browser_url;
     std::string                        m_error;
+    bool                               m_retry{false}; // the button is "Try again", not "Open the browser again"
 };
 
 // After an update, while the slicer is not signed in (ask_sign_in_after_update).

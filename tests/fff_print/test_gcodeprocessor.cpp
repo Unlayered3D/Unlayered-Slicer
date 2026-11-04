@@ -883,3 +883,53 @@ TEST_CASE("A cube on the 64th nozzle of a 64-nozzle printer slices, and fails th
     REQUIRE(result.limit_filament_maps.size() == 1);
     CHECK(result.limit_filament_maps[0] == uint64_t(expected) << (nozzles - 1));
 }
+
+// The layer slider of a print by object (IMSlider::sequential_object_of_tick) tells the objects
+// apart by where the layer heights stop rising: each object's layers go up, and the next object
+// starts again at the first layer. That holds for the layers the preview builds from these moves
+// (one per layer id, at the height of its last extrusion), so a pause it places on one object's
+// layer is the layer the export pauses (CustomGCode::Item::sequential_object).
+TEST_CASE("A print by object lists each object's layers in turn, from the first layer up", "[GCodeProcessor]")
+{
+    Slic3r::Print print;
+    Slic3r::Model model;
+    // Two 20 mm cubes, 0.2 mm layers: 100 layers each.
+    Test::place_two_cubes_apart(60., { { "print_sequence", "by object" },
+                                       { "layer_height", 0.2 },
+                                       { "initial_layer_print_height", 0.2 },
+                                       { "skirt_loops", 0 },
+                                       { "brim_type", "no_brim" },
+                                       { "enable_prime_tower", 0 } },
+                                print, model);
+    GCodeProcessorResult result;
+    Test::gcode(print, &result);
+
+    // The preview's layers: a new one where the layer id changes; its Z is its last extrusion's
+    // (0 for a layer without one)
+    std::vector<double> zs;
+    unsigned int        last_id = 0;
+    for (const GCodeProcessorResult::MoveVertex& move : result.moves) {
+        if (zs.empty() || move.layer_id != last_id) {
+            last_id = move.layer_id;
+            zs.push_back(0.);
+        }
+        if (move.type == EMoveType::Extrude)
+            zs.back() = move.position.z();
+    }
+    // Split where the height does not rise, as the slider does
+    std::vector<std::vector<double>> objects(1);
+    for (size_t i = 0; i < zs.size(); ++i) {
+        if (i > 0 && zs[i] <= zs[i - 1] + EPSILON)
+            objects.emplace_back();
+        objects.back().push_back(zs[i]);
+    }
+    // A layer before the first one without an extrusion (the start G-code) is not an object
+    if (!objects.front().empty() && objects.front().front() == 0.)
+        objects.front().erase(objects.front().begin());
+    REQUIRE(objects.size() == 2);
+    for (const std::vector<double>& layers : objects) {
+        CHECK(layers.size() == 100);
+        CHECK_THAT(layers.front(), Catch::Matchers::WithinAbs(0.2, 1e-3));
+        CHECK_THAT(layers.back(), Catch::Matchers::WithinAbs(20.0, 1e-3));
+    }
+}

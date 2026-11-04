@@ -427,6 +427,7 @@ TEST_CASE("Wave overhangs do not fire along a sloped cut-plane floor", "[WaveOve
     DynamicPrintConfig config = wave_config(true);
     config.set_deserialize_strict({
         { "enable_nonplanar", "1" },
+        { "axis_selection",   "bc" },  // the tilted case checks the B words
         { "print_sequence",   "by group" },
         { "wave_overhangs_instead_of_bridges", "1" }, // the most eager setting: no bridge escape hatch
     });
@@ -488,7 +489,7 @@ TEST_CASE("Wave overhang G-code uses the wave speeds, dwells, temperature and fa
     Print print;
     std::string gcode;
     if (tilted) {
-        config.set_deserialize_strict({ { "enable_nonplanar", "1" }, { "print_sequence", "by group" } });
+        config.set_deserialize_strict({ { "enable_nonplanar", "1" }, { "axis_selection", "bc" }, { "print_sequence", "by group" } });
         Model model;
         ModelObject *object = model.add_object();
         object->name = "tilted_shelf";

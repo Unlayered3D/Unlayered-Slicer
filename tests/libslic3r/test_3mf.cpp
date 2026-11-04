@@ -2882,3 +2882,43 @@ TEST_CASE("Auto drop stored on a build item still applies to the object", "[3mf]
     REQUIRE(model.objects.size() == 1);
     CHECK(model.objects.front()->auto_drop == item_auto_drop);
 }
+
+// A pause added in a print by object names its object (CustomGCode::Item::sequential_object); the
+// project keeps it. One without (print by layer) is written as before, with no such attribute.
+TEST_CASE("A project keeps the object a print-by-object pause belongs to", "[3mf]")
+{
+    Model        model;
+    ModelObject* object = model.add_object();
+    object->add_volume(make_cube(10., 10., 10.));
+    object->add_instance();
+    CustomGCode::Item by_object{ 5.0, CustomGCode::PausePrint, 1, "", "" };
+    by_object.sequential_object = 1;
+    const CustomGCode::Item by_layer{ 7.0, CustomGCode::PausePrint, 1, "", "" };
+    model.plates_custom_gcodes[0].gcodes = { by_object, by_layer };
+
+    ScopedTemporaryDir backup_dir("orca_pause_src");
+    model.set_backup_path(backup_dir.string());
+    // The custom G-code file names each pause's G-code, which it reads from the printer settings.
+    DynamicPrintConfig cfg = DynamicPrintConfig::full_print_config();
+    PlateData          plate;
+    plate.plate_index = 0;
+    ScopedTemporaryFile file(".3mf");
+    const std::string   path = file.string();
+    StoreParams         sp;
+    sp.path     = path.c_str();
+    sp.model    = &model;
+    sp.config   = &cfg;
+    sp.strategy = SaveStrategy::Zip64 | SaveStrategy::Silence;
+    sp.plate_data_list.push_back(&plate);
+    REQUIRE(store_bbs_3mf(sp));
+
+    Model              loaded;
+    ScopedTemporaryDir load_dir("orca_pause_dst");
+    REQUIRE(load_project(path, loaded, load_dir));
+    REQUIRE(loaded.plates_custom_gcodes.count(0) == 1);
+    const std::vector<CustomGCode::Item>& gcodes = loaded.plates_custom_gcodes[0].gcodes;
+    REQUIRE(gcodes.size() == 2);
+    CHECK(gcodes[0] == by_object);
+    CHECK(gcodes[1] == by_layer);
+    CHECK(gcodes[1].sequential_object == -1);
+}

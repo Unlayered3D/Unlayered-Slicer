@@ -150,7 +150,10 @@ static bool contour_extrusion_path(LayerRegion *region, const ContourZSurface &s
 
             // UNLAYERED_MOD: nonplanar layers -- under a curved band printed with or after this layer the surface to follow
             // is the band's bottom (S - T): lower onto it, as a top surface is contoured; never raise.
-            if (double band_z = 0.; surface.np != nullptr && surface.np->band_bottom(layer->id(), x, y, band_z)) {
+            // (Only a band reaching this layer: one wholly above it -- a Benchy cabin roof 30 mm over the deck -- would only
+            // block the normal contouring below, leaving the deck under the roof 0.1 mm higher than beside it.)
+            if (double band_z = 0.; surface.np != nullptr && surface.np->band_bottom(layer->id(), x, y, band_z) &&
+                                    band_z < layer->print_z - EPSILON) {
                 double d = std::min(0., band_z - layer->print_z);
                 d        = std::max(d, -(height - min_z));
                 if (std::abs(d) > EPSILON)
@@ -163,8 +166,22 @@ static bool contour_extrusion_path(LayerRegion *region, const ContourZSurface &s
                 continue;
             }
 
-			ContourZSurface::Hit hit_up = surface.query_up({x, y, mesh_slice_z});
+			// UNLAYERED_MOD -- from a hair under the slice plane: a top lying exactly on the plane (a Benchy's deck at the
+			// 8.6 layer's slice z 8.5) was missed wherever floating point put the origin on or just above its face, and the
+			// ray found the next surface up instead (the cabin roof's underside), so the deck printed 0.1 mm higher under
+			// the roof than beside it: the roof and chimney outlines showed as steps in the deck's top and ironing.
+			ContourZSurface::Hit hit_up = surface.query_up({x, y, mesh_slice_z - 1e-3});
+			if (hit_up.is_hit)
+				hit_up.distance -= 1e-3;
             //BOOST_LOG_TRIVIAL(info) << "contour_extrusion_path: hit=" << hit_up.is_hit << " distance=" << hit_up.distance;
+
+            // UNLAYERED_MOD -- a top surface or ironing follows only an exit through an UPWARD-facing surface. A mesh whose
+            // parts overlap (a Benchy's cabin and chimney reaching into the deck) has inner faces the ray leaves through at
+            // once: the outlines of geometry far above were pressed 0.1 mm into the deck's top and ironing (2026-11-02).
+            if ((path.role() == erTopSolidInfill || path.role() == erIroning) && (! hit_up.is_hit || hit_up.normal.z() < 0.2)) {
+                add_point({p.x(), p.y(), 0.}, i == 0);
+                continue;
+            }
 
 
 			double d = hit_up.distance - (layer->print_z - layer->slice_z);

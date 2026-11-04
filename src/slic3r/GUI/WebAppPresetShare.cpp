@@ -373,15 +373,28 @@ wxString machine_summary(const DynamicPrintConfig& cfg)
         text += wxString::Format(_L("G-code flavor: %s"), enum_label(cfg, "gcode_flavor")) + "\n";
 
     if (nonplanar) {
-        const double height = opt_float(cfg, "nonplanar_hotend_cone_height");
-        if (height <= 0.) {
-            text += _L("Hotend envelope: off") + "\n";
-        } else {
-            text += wxString::Format(_L("Hotend envelope: +X %s°, -X %s°, +Y %s°, -Y %s°, %s mm tall"),
-                                     num(opt_float(cfg, "nonplanar_hotend_angle_xpos")),
-                                     num(opt_float(cfg, "nonplanar_hotend_angle_xneg")),
-                                     num(opt_float(cfg, "nonplanar_hotend_angle_ypos")),
-                                     num(opt_float(cfg, "nonplanar_hotend_angle_yneg")), num(height)) + "\n";
+        // Per nozzle (the keys are per extruder variant): one line per nozzle when a multi-nozzle
+        // printer's envelopes differ, else the one line it always was.
+        const auto* types   = cfg.option<ConfigOptionEnumsGeneric>("extruder_type");
+        const int   nozzles = types != nullptr ? int(types->values.size()) : 1;
+        std::vector<HotendEnvelope> envs;
+        for (int x = 0; x < std::max(1, nozzles); ++x)
+            envs.push_back(HotendEnvelope::from_config(cfg, nozzles > 1 ? x : -1));
+        const bool same = std::all_of(envs.begin(), envs.end(), [&envs](const HotendEnvelope& e) {
+            return e.height == envs.front().height && e.angle == envs.front().angle;
+        });
+        for (size_t x = 0; x < (same ? size_t(1) : envs.size()); ++x) {
+            const HotendEnvelope& e = envs[x];
+            if (!e.enabled())
+                text += (same ? _L("Hotend envelope: off") : wxString::Format(_L("Hotend envelope, nozzle %d: off"), int(x + 1))) + "\n";
+            else if (same)
+                text += wxString::Format(_L("Hotend envelope: +X %s°, -X %s°, +Y %s°, -Y %s°, %s mm tall"),
+                                         num(e.angle[HotendEnvelope::XPos]), num(e.angle[HotendEnvelope::XNeg]),
+                                         num(e.angle[HotendEnvelope::YPos]), num(e.angle[HotendEnvelope::YNeg]), num(e.height)) + "\n";
+            else
+                text += wxString::Format(_L("Hotend envelope, nozzle %d: +X %s°, -X %s°, +Y %s°, -Y %s°, %s mm tall"), int(x + 1),
+                                         num(e.angle[HotendEnvelope::XPos]), num(e.angle[HotendEnvelope::XNeg]),
+                                         num(e.angle[HotendEnvelope::YPos]), num(e.angle[HotendEnvelope::YNeg]), num(e.height)) + "\n";
         }
         const double gantry = opt_float(cfg, "nonplanar_gantry_height");
         text += (gantry > 0. ? wxString::Format(_L("Gantry height: %s mm"), num(gantry)) : _L("Gantry height: not measured")) + "\n";

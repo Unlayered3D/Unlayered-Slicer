@@ -298,6 +298,11 @@ public:
 	// Ignore color changes, which are performed on a layer and for such an extruder, that the extruder will not be printing above that layer.
 	// If multiple events are planned over a span of a single layer, use the last one.
 	void 				assign_custom_gcodes(const Print &print);
+    // UNLAYERED_MOD: the print-by-object counterpart, for the object instance printed
+    // `sequential_object`-th (0-based): assign the plate's pauses and custom G-codes keyed to that
+    // instance (CustomGCode::Item::sequential_object) to its layers, and clear every other layer's.
+    // Color and tool changes stay unsupported in a print by object.
+    void                assign_custom_gcodes_sequential(const Print &print, int sequential_object);
 
     // Get the first extruder printing, including the extruder priming areas, returns -1 if there is no layer printed.
     unsigned int   		first_extruder() const { return m_first_printing_extruder; }

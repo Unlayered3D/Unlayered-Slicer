@@ -49,8 +49,8 @@ bool key_is_identity(const std::string& key);
 // False for an unknown key, a secret key and -- unless include_code -- a custom-G-code key.
 bool key_readable(const std::string& key, bool include_code);
 
-// False for an unknown key and for every secret, code, identity, *_settings_id, read-only or
-// plugin-backed key. `why` receives a one-line reason fit for the response's rejected[] entry.
+// False for an unknown key, post_process, and every secret, identity, *_settings_id, read-only or
+// plugin-backed key (custom G-code is writable). `why` receives a one-line reason fit for the response's rejected[] entry.
 bool key_writable(const std::string& key, std::string& why);
 
 // "printer" | "print" | "filament" <-> Preset::Type. Nothing else is bridge-visible.

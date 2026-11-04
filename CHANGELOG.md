@@ -2,6 +2,75 @@
 
 All notable changes to Unlayered Slicer are listed here, newest first.
 
+## 0.1.10 — 2026-11-04
+
+### Added
+
+- **Open in Bambu Connect (experimental, Windows and macOS).** With a Bambu Lab printer selected,
+  Print plate > *Open in Bambu Connect* hands the sliced plate to Bambu Connect, so it can be sent
+  with Bambu Handy and the printer's cloud. If Bambu Connect is not installed, it explains where to
+  get it. Preferences > *Open in Bambu Connect (experimental)* hides it.
+- **Pauses and custom G-code in a print by object:** the layer slider can now add a pause, a filament
+  change or custom G-code at a layer of one object when the plate prints object by object.
+- **Crash reports carry the end of that session's log** (at most 256 KB), so a crash can be traced
+  to what the slicer was doing. It goes only with a crash report that is already being sent
+  (usage diagnostics on, or after you choose *Send Crash Report*), once, and it is scrubbed on your
+  computer first: your user and computer name, your home folder, the names of your model and project files, e-mail and network
+  addresses and anything that looks like a credential are removed. *Don't Send* sends nothing.
+- **Unlayered Agent:** when you tell it your printer runs a different firmware (for example
+  RepRapFirmware), it can rewrite the printer's start and end G-code as well as the G-code flavor.
+- **Dual-nozzle printers (H2D, X2D):** each nozzle has its own hotend clearance for non-planar
+  printing, edited with the Main / Auxiliary switch in Printer settings > Motion ability.
+
+### Changed
+
+- **Printer type** (Printer settings > Motion ability > Non-planar Printing) now defaults to
+  *Virtual* for every printer that does not set it. Ordinary 3-axis printers used to default to
+  B/C rotary axes, so turning on non-planar printing wrote rotary moves or failed with "A/C trunnion
+  output failed". Unlayered 5-axis printers keep their own setting. A preset or project that already
+  says B/C keeps it: check it if your printer has no rotary axes.
+- **Nonplanar layers (experimental)** now work on rotated and mirrored parts and on tilted cut-plane
+  chunks (with the angle limits reduced by the tilt), instead of quietly printing them flat.
+- **Z contouring** follows only the part's own top: geometry above it (a Benchy's cabin roof) no
+  longer blocks contouring of the deck below or presses its outline into the deck's top and ironing.
+- The floor that a cut-plane chunk prints on is no longer ironed as if it were a top surface.
+
+### Fixed
+
+- **Slices that failed outright:**
+  - Nonplanar layers: "Voronoi cell source index is out of range!" no longer kills the slice. A
+    curved band that cannot be filled falls back to an ordinary flat top, with a warning.
+  - Arachne walls that fail on one layer fall back to classic walls for that layer instead of
+    failing the slice.
+  - Z contouring: a layer thinner than the *Minimum Z height* (from variable layer height, a cut
+    plane or a curved top) no longer fails with "Bad min Z value"; it is sliced at its middle.
+- **Crashes:**
+  - Exporting a plate with cut planes and nonplanar layers could crash when a cut-plane chunk ended
+    up with no layers.
+  - A slicing error raised from a button (macOS) closed the app; it is now shown as an error.
+  - If the app was killed while it was recording a crash, every later launch crashed until a file
+    was deleted by hand. A damaged crash record is now skipped and removed.
+  - Closing a window that hangs on exit no longer crashes on Windows.
+  - The Skeleton tool could crash when the selection changed while it was open.
+- **Supports under a part lifted off the plate:** a part with cut planes that was raised off the
+  build plate (Auto-Drop off) got no support under it at all, so the print started in mid-air.
+  Support now reaches down to the plate, as it already did for a section floating above its cut.
+- **Virtual 5-axis:**
+  - A tilted object that rests on the plate is clipped at the plate instead of being refused with
+    "the toolpath goes below the build plate" after the whole slice.
+  - A *Max print height (from the bed)* below the top of the part is refused before slicing, with
+    a note that it is a height from the bed, not a clearance above the part.
+  - A printer with a negative *Z offset* no longer has its slices refused as going below the build
+    plate (or over the height limit): both are now measured from the plate.
+- **Sign-in:** when the slicer cannot reach Unlayered (offline, firewall, DNS), it says so in plain
+  words and offers *Try again* instead of a dead end; an expired sign-in starts a fresh one.
+- **macOS:** Cmd+C / V / X / A / Z / Y work in the side panel and other web pages instead of copying
+  or pasting plate objects.
+- **Unlayered Agent:** when a system window (a message box, a file or folder picker) or a progress
+  window blocks the slicer, the Agent is told what it is and can tell you what to close, instead of
+  only "a dialog is open".
+- **Dialogs** show the button labels they were meant to have instead of Yes / No / OK.
+
 ## 0.1.9 — 2026-10-30
 
 ### Changed

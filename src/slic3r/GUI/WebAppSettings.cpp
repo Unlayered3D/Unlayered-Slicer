@@ -111,8 +111,12 @@ bool key_writable(const std::string& key, std::string& why)
         why = "print-host address, credential or upload switch: never exposed over the bridge";
         return false;
     }
-    if (key_is_code(key)) {
-        why = "custom G-code and post-processing scripts are never written over the bridge";
+    // Custom G-code is writable, so the side panel can convert a printer preset to the firmware the
+    // person runs (2026-10-30: "if i say the machine is running rrf, it needs to convert
+    // everything"). It lands in the live preset like any other edit: unsaved and undoable.
+    // Post-processing scripts stay out: they are programs the slicer runs on this computer.
+    if (key == "post_process") {
+        why = "post-processing scripts are never written over the bridge";
         return false;
     }
     if (key_is_identity(key) || boost::algorithm::ends_with(key, "_settings_id")) {

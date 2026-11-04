@@ -394,11 +394,12 @@
   <li>Approximate session duration.</li>
   <li>Exception code or signal.</li>
   <li>Program module and offset.</li>
+  <li>Since version 0.1.10, up to 256 KB of the end of the session log of the session that ended unexpectedly. Your name, folders (your home folder), file names, email addresses, network addresses, computer name and secrets (passwords, keys and tokens) are removed on your device before it is sent, and again on arrival. The log may still contain the names of printers and presets. It is sent to unlayered3d.com/api/slicer/crash-log with a random report identifier that links it to that crash report only, kept up to 90 days, and only Unlayered staff can access it.</li>
 </ul>
 
-<p>Memory dumps and unrestricted application logs are not transmitted through ordinary diagnostics.</p>
+<p>Memory dumps, models, project files and unfiltered application logs are not transmitted.</p>
 
-<p>If you do not share usage diagnostics, this information is sent only if you agree: after an unexpected exit, the next launch asks whether to send a crash report, shows what it contains, and sends it once with a random identifier that is not linked to your installation. If you decline, or close the question, nothing is sent.</p>
+<p>If you do not share usage diagnostics, this information is sent only if you agree: after an unexpected exit, the next launch asks whether to send a crash report, shows what it contains, and sends it once with a random identifier that is not linked to your installation. If you decline, or close the question, nothing is sent, and the log is not read.</p>
 
 <h3 id="s3-7">3.7 Print results and user feedback</h3>
 

@@ -21,6 +21,7 @@ struct Sample
 {
     Vec3d        p;        // bed frame
     unsigned int gcode_id; // originating G-code line
+    int          extruder = -1; // physical extruder of the move (tips only), -1 unknown
 };
 
 struct Episode
@@ -33,13 +34,13 @@ struct Episode
     std::vector<Sample> material;  // extrusions, sampled every 0.5 mm
 };
 
-void sample_segment(const Vec3d &a, const Vec3d &b, double step, unsigned int gcode_id, std::vector<Sample> &out)
+void sample_segment(const Vec3d &a, const Vec3d &b, double step, unsigned int gcode_id, std::vector<Sample> &out, int extruder = -1)
 {
     const Vec3d  d   = b - a;
     const double len = d.norm();
     const int    n   = std::max(2, int(len / step) + 1);
     for (int i = 0; i < n; ++ i)
-        out.push_back({a + d * (double(i) / double(n - 1)), gcode_id});
+        out.push_back({a + d * (double(i) / double(n - 1)), gcode_id, extruder});
 }
 
 // Summed-area table of a 0/1 grid: count() is the number of set cells in an inclusive rectangle
@@ -91,8 +92,14 @@ struct Reach
 
 std::optional<ConflictResult> check_hotend_collisions(const GCodeProcessorResult &result, const HotendCollisionParams &params)
 {
-    const HotendEnvelope &env = params.envelope;
-    if (! env.enabled())
+    // The envelope a move of physical extruder `x` is tested with (see HotendCollisionParams).
+    auto envelope_of = [&params](int x) -> const HotendEnvelope & {
+        return x >= 0 && size_t(x) < params.extruder_envelopes.size() ? params.extruder_envelopes[size_t(x)] : params.envelope;
+    };
+    bool any_enabled = params.envelope.enabled();
+    for (const HotendEnvelope &e : params.extruder_envelopes)
+        any_enabled = any_enabled || e.enabled();
+    if (! any_enabled)
         return std::nullopt;
     if (result.tool_axes.size() <= 1 || result.moves.size() < 2)
         return std::nullopt;   // planar print: nothing above the tip can have been printed yet
@@ -119,7 +126,7 @@ std::optional<ConflictResult> check_hotend_collisions(const GCodeProcessorResult
         const Vec3d b = m.position.cast<double>();
         if ((b - a).norm() < 1e-9)
             continue;
-        sample_segment(a, b, 1.0, m.gcode_id, e.tips);
+        sample_segment(a, b, 1.0, m.gcode_id, e.tips, int(m.physical_extruder_id));
         if (m.type == EMoveType::Extrude && m.delta_extruder > 0.f)
             sample_segment(a, b, 0.5, m.gcode_id, e.material);
     }
@@ -144,18 +151,9 @@ std::optional<ConflictResult> check_hotend_collisions(const GCodeProcessorResult
         }
     }
 
-    const double H    = env.height;
     const double band = 0.2;
-    const double sp[4] = { env.spread(HotendEnvelope::XPos), env.spread(HotendEnvelope::XNeg),
-                           env.spread(HotendEnvelope::YPos), env.spread(HotendEnvelope::YNeg) };
-    auto chord_at = [&](double h) { return std::sqrt(std::max(0., H * H - h * h)); };
-    auto reach_at = [&](double h) -> Reach {
-        const double c = chord_at(h);
-        return { std::min(h * sp[0], c) + params.margin, std::min(h * sp[1], c) + params.margin,
-                 std::min(h * sp[2], c) + params.margin, std::min(h * sp[3], c) + params.margin };
-    };
 
-    struct Hit { double pen = -1.; size_t episode = 0, source = 0; Sample tip; Sample mat; double height = 0.; HotendEnvelope::Side face = HotendEnvelope::XPos; };
+    struct Hit { double pen = -1.; size_t episode = 0, source = 0; Sample tip; Sample mat; double height = 0.; HotendEnvelope::Side face = HotendEnvelope::XPos; HotendEnvelope env; };
     Hit worst;
     size_t total_hits = 0;
 
@@ -164,12 +162,35 @@ std::optional<ConflictResult> check_hotend_collisions(const GCodeProcessorResult
     std::vector<size_t> earlier_episode;
     for (size_t ei = 0; ei < episodes.size(); ++ ei) {
         const Episode &e = episodes[ei];
-        if (ei > 0 && ! earlier.empty() && ! e.tips.empty()) {
+        // An episode may hold moves of more than one nozzle (a tool change inside one chunk): each
+        // nozzle's tips are tested on their own, with that nozzle's envelope.
+        std::vector<int> episode_extruders;
+        for (const Sample &t : e.tips)
+            if (std::find(episode_extruders.begin(), episode_extruders.end(), t.extruder) == episode_extruders.end())
+                episode_extruders.push_back(t.extruder);
+        for (const int tip_extruder : episode_extruders) {
+        const HotendEnvelope &env = envelope_of(tip_extruder);
+        if (! env.enabled())
+            continue;
+        std::vector<size_t> tip_ids; // indices into e.tips of this nozzle's tips
+        for (size_t i = 0; i < e.tips.size(); ++ i)
+            if (e.tips[i].extruder == tip_extruder)
+                tip_ids.push_back(i);
+        const double H     = env.height;
+        const double sp[4] = { env.spread(HotendEnvelope::XPos), env.spread(HotendEnvelope::XNeg),
+                               env.spread(HotendEnvelope::YPos), env.spread(HotendEnvelope::YNeg) };
+        auto chord_at = [&](double h) { return std::sqrt(std::max(0., H * H - h * h)); };
+        auto reach_at = [&](double h) -> Reach {
+            const double c = chord_at(h);
+            return { std::min(h * sp[0], c) + params.margin, std::min(h * sp[1], c) + params.margin,
+                     std::min(h * sp[2], c) + params.margin, std::min(h * sp[3], c) + params.margin };
+        };
+        if (ei > 0 && ! earlier.empty() && ! tip_ids.empty()) {
             // head frame: (u, v, a) = R * p, with u / v along the head's own +X / +Y faces
             const Eigen::Matrix3d R = params.upright ? Eigen::Matrix3d::Identity() :
                                       ! ac_frames.empty() ? ac_frames[ei] : Eigen::Matrix3d(tool_head_frame(e.axis));
-            std::vector<Vec3d> T(e.tips.size()), M(earlier.size());
-            for (size_t i = 0; i < T.size(); ++ i) T[i] = R * e.tips[i].p;
+            std::vector<Vec3d> T(tip_ids.size()), M(earlier.size());
+            for (size_t i = 0; i < T.size(); ++ i) T[i] = R * e.tips[tip_ids[i]].p;
             for (size_t i = 0; i < M.size(); ++ i) M[i] = R * earlier[i].p;
             double umin = 1e300, vmin = 1e300, umax = -1e300, vmax = -1e300;
             for (const Vec3d &p : T) { umin = std::min(umin, p.x()); vmin = std::min(vmin, p.y()); umax = std::max(umax, p.x()); vmax = std::max(vmax, p.y()); }
@@ -263,11 +284,13 @@ std::optional<ConflictResult> check_hotend_collisions(const GCodeProcessorResult
                         const double fill[4] = { best_du / r.xpos, -best_du / r.xneg, best_dv / r.ypos, -best_dv / r.yneg };
                         const HotendEnvelope::Side best_face = HotendEnvelope::Side(std::max_element(fill, fill + 4) - fill);
                         worst.pen = pen; worst.episode = ei; worst.source = earlier_episode[q.sample];
-                        worst.tip = e.tips[best]; worst.mat = earlier[q.sample]; worst.height = h; worst.face = best_face;
+                        worst.tip = e.tips[tip_ids[best]]; worst.mat = earlier[q.sample]; worst.height = h; worst.face = best_face;
+                        worst.env = env;
                     }
                 }
             }
         }
+        } // per nozzle
         for (const Sample &s : e.material) { earlier.push_back(s); earlier_episode.push_back(ei); }
     }
 
@@ -283,6 +306,8 @@ std::optional<ConflictResult> check_hotend_collisions(const GCodeProcessorResult
         return name;
     };
     auto deg = [](double a) { return (boost::format("%.0f") % a).str(); };
+    const HotendEnvelope &env = worst.env; // the envelope of the nozzle that hit
+    const double          H   = env.height;
     ConflictResult res(chunk_name(worst.episode), chunk_name(worst.source), worst.tip.p.z(), nullptr, nullptr);
     res.message = (boost::format(_u8L("Hotend collision: modelled as a pyramid capped by a %1% mm sphere about the tip (sides +X %2%°, -X %3%°, +Y %4%°, -Y %5%° from the bed), "
                                        "the hotend enters material printed earlier while printing %6% (G-code line %7%, tip at X%8% Y%9% Z%10%): "

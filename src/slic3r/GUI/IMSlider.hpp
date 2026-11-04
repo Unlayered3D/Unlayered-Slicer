@@ -174,6 +174,15 @@ private:
     std::string get_label(int tick, LabelType label_type = ltHeightWithLayer);
     double get_double_value(const SelectedSlider& selection);
     int    get_tick_from_value(double value, bool force_lower_bound = false);
+    // UNLAYERED_MOD: a print by object lists every object's layers in print order, so print_z
+    // repeats. An object ends where the next layer is not higher than the last one.
+    // The 0-based object (in print order) whose layer `tick` is, and the tick of `object`'s layer at
+    // print_z (-1: that object has no such layer).
+    int    sequential_object_of_tick(int tick) const;
+    int    tick_in_sequential_object(int object, double print_z) const;
+    // Pauses and custom G-code can be added in a print by object; with horizontal layers only,
+    // where the object boundaries above hold. Color and tool changes stay off there.
+    bool   sequential_codes_allowed() const { return m_draw_mode == dmSequentialFffPrint && m_layers_planar.empty(); }
     float get_pos_from_value(int v_min, int v_max, int value, const ImRect& rect);
     int    get_tick_near_point(int v_min, int v_max, const ImVec2& pt, const ImRect& rect);
 

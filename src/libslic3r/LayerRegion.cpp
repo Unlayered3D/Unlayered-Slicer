@@ -190,9 +190,30 @@ void LayerRegion::make_perimeters(const SurfaceCollection &slices, const LayerRe
             g.lower_floor_support = &this->layer()->lower_layer->segment_floor_support;
     }
 
-    if (this->layer()->object()->config().wall_generator.value == PerimeterGeneratorType::Arachne && !spiral_mode)
-        g.process_arachne();
-    else
+    if (this->layer()->object()->config().wall_generator.value == PerimeterGeneratorType::Arachne && !spiral_mode) {
+        // UNLAYERED_MOD -- a degenerate outline can make Arachne's Voronoi diagram throw ("Voronoi cell
+        // doesn't contain a source segment!") even after Voronoi.cpp's rotate-and-retry, which used to
+        // fail the whole slice. Drop whatever Arachne wrote for this layer and build its walls with the
+        // classic generator instead, and say which layer it was (2026-11-02).
+        const size_t fill_surfaces_size   = fill_surfaces != nullptr ? fill_surfaces->surfaces.size() : 0;
+        const size_t fill_no_overlap_size = fill_no_overlap != nullptr ? fill_no_overlap->size() : 0;
+        try {
+            g.process_arachne();
+        } catch (const std::exception &ex) {
+            BOOST_LOG_TRIVIAL(warning) << "Arachne walls failed on layer " << this->layer()->id() << " (print_z "
+                                       << this->layer()->print_z << ", object \"" << this->layer()->object()->model_object()->name
+                                       << "\"): " << ex.what() << " -- this layer uses classic walls instead";
+            this->perimeters.clear();
+            this->thin_fills.clear();
+            if (fill_surfaces != nullptr)
+                fill_surfaces->surfaces.resize(fill_surfaces_size);
+            if (fill_no_overlap != nullptr)
+                fill_no_overlap->resize(fill_no_overlap_size);
+            g.out_wave_overhang_floor_polygons.clear();
+            g.out_wave_overhang_covered_polygons.clear();
+            g.process_classic();
+        }
+    } else
         g.process_classic();
 
     // Orca: forward wave-overhang footprint to the layer so detect_surfaces_type()

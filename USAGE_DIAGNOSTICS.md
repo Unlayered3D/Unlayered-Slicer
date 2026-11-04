@@ -91,7 +91,7 @@ Each event has a name, a timestamp and the properties below. Nothing else is att
 | `update_applied` | At the first launch after an update was downloaded | The version it was updating from and to; whether this launch is now the new version; how handing over to the installer went when the app closed (started, could not start, or another copy was still open). |
 | `printer_config_update` | When the Config button (or the automatic printer update offer) finishes installing configuration onto a printer | The configuration version installed and the one it replaced (for example `2026.10.21` and `2026.10.12`, or `unknown`); the outcome (`success`, `up_to_date`, `failed`, `cancelled`); how many files were written; whether a failed install was put back; the printer's firmware version. Never the printer's address, name, board id, the file names or any error text. |
 | `account_signin` | When you sign in to Unlayered from the app | Whether it worked, was cancelled or failed, and whether an update or the Help menu asked for it. Never your email address or account. |
-| `crash` | At the next launch after the app closed unexpectedly | The version that crashed, how long it had been running (to the minute), and what it was doing (`startup`, `running`, `slicing` or `closing`). What ended it, when the app could tell: on Windows the error code (for example `0xC0000005`); on macOS and Linux the signal (for example `SIGSEGV`); `terminate` for an unhandled program error; `hang` when the app had stopped responding (which is what a force-quit of a frozen app looks like). Where it happened, on Windows and macOS, as a program file name and offsets into it (for example `UnlayeredSlicer.dll+0x1a2b3c` or `UnlayeredSlicer.arm64+0x2f1a3c>+0x2e1b00`, never a folder or path). A session that ended because the computer logged off or shut down, or on macOS an ordinary Quit, is not reported. |
+| `crash` | At the next launch after the app closed unexpectedly | The version that crashed, how long it had been running (to the minute), and what it was doing (`startup`, `running`, `slicing` or `closing`). What ended it, when the app could tell: on Windows the error code (for example `0xC0000005`); on macOS and Linux the signal (for example `SIGSEGV`); `terminate` for an unhandled program error; `hang` when the app had stopped responding (which is what a force-quit of a frozen app looks like). Where it happened, on Windows and macOS, as a program file name and offsets into it (for example `UnlayeredSlicer.dll+0x1a2b3c` or `UnlayeredSlicer.arm64+0x2f1a3c>+0x2e1b00`, never a folder or path). A session that ended because the computer logged off or shut down, or on macOS an ordinary Quit, is not reported. Since 0.1.10 also a random `report_id`, and the end of that session's log is sent alongside (see Crash logs below). |
 | `session_end` | When the app closes | How long it was open, and counts of what was used during the session: tabs opened (`tab:<name>`), tools opened (`gizmo:<name>`, for example `gizmo:cut_planes`) and files opened by type (`import:stl`, `import:3mf`, ... or `import:other`), and since 0.1.7 how many presets were imported from another slicer (one counter per slicer, for example `import:presets_prusaslicer`, `import:presets_orcaslicer`, `import:presets_bambustudio` or `import:presets_crealityprint`: a number only, never a preset name). |
 
 ## On your computer
@@ -102,9 +102,20 @@ Diagnostics keep a few small files in the `usage` folder of the app's data folde
   doing (`startup`, `running`, `slicing`, `closing`), the time it last sent diagnostics, and whether
   you had chosen to share diagnostics at the time. It is deleted when the app closes normally. One
   left behind means that session crashed, which is reported as a `crash` event, and only if
-  diagnostics were shared during that session.
+  diagnostics were shared during that session. Since 0.1.10 it also names that session's log file.
 - `pending.json`: batches that could not be sent (offline, or the site was down), at most 20. They
   are retried at the next launch, and deleted when diagnostics are switched off.
+
+## Crash logs (0.1.10)
+
+Every crash report that is sent (a `crash` event of a session that shared diagnostics, or one you
+agreed to send in the crash report question) also sends up to 256 KB of the end of that session's
+log to `https://unlayered3d.com/api/slicer/crash-log`, once, with the crash's `report_id`. Before it
+leaves your computer, your home folder, login and computer name, e-mail addresses, passwords, keys
+and tokens, network addresses and the names of model, project, G-code and image files are removed
+(`src/slic3r/Utils/CrashLogScrub.hpp` lists the rules). Printer and preset names can remain. The
+site scrubs it again, keeps it up to 90 days, and only Unlayered staff can read it. When you decline
+the crash report, the log is not read.
 
 ## Sending and storage
 

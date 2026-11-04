@@ -1830,10 +1830,11 @@ TEST_CASE("Multi-planar: copies of a rotated object each land on their own footp
 // the printer's own calibration, so the first tilted layer looked 0.4 mm into the bed.
 TEST_CASE("Multi-planar: a negative Z offset does not make a tilted object very low z", "[Print][multiplanar][z_offset]")
 {
-    auto slice = [](double z_offset, double b) {
+    auto slice = [](double z_offset, double b, const char *axes = "bc") {
         DynamicPrintConfig config = DynamicPrintConfig::full_print_config();
         config.set_deserialize_strict({
             { "enable_nonplanar", 1 },
+            { "axis_selection", axes },
             { "layer_rotation_b", b },
             { "layer_rotation_c", 90 },
             { "layer_height", 0.2 }, { "initial_layer_print_height", 0.2 },
@@ -1855,7 +1856,7 @@ TEST_CASE("Multi-planar: a negative Z offset does not make a tilted object very 
         print.process();
         const boost::filesystem::path temp = boost::filesystem::temp_directory_path() / boost::filesystem::unique_path("mp-zoffset-%%%%-%%%%.gcode");
         GCodeProcessorResult result;
-        INFO("z_offset " << z_offset << " B " << b);
+        INFO("z_offset " << z_offset << " B " << b << " axes " << axes);
         CHECK_NOTHROW(print.export_gcode(temp.string(), &result, nullptr));
         boost::filesystem::remove(temp);
     };
@@ -1863,6 +1864,10 @@ TEST_CASE("Multi-planar: a negative Z offset does not make a tilted object very 
         slice(0., b);
         slice(-0.63, b);
     }
+    // Virtual 5-axis (the default since 0.1.10): the "below the build plate" scan reads the written Z,
+    // which includes the Z offset; a negative offset must not refuse a mild tilt.
+    slice(0., -10., "virtual");
+    slice(-0.63, -10., "virtual");
 }
 
 TEST_CASE("Belt printer: material on the belt is not a floating region", "[Print][belt][overhang]")

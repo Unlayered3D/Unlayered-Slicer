@@ -7725,7 +7725,8 @@ void GCodeProcessor::store_move_vertex(EMoveType type, EMovePathType path_type, 
         m_object_label_id,
         m_print_z,
         m_tool_axis_id,
-        m_cut_segment_id
+        m_cut_segment_id,
+        static_cast<signed char>(get_extruder_id(false))
     });
 
     if (type == EMoveType::Seam) {

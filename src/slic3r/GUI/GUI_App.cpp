@@ -251,6 +251,7 @@
 #include "WebGuideDialog.hpp"
 #include "ReleaseNote.hpp"
 #include "AutoUpdater.hpp"
+#include "slic3r/Utils/UiException.hpp"
 #include "slic3r/Utils/UsageTelemetry.hpp"
 #include "slic3r/Utils/PrivacyConsent.hpp"
 #include "PrivacySetupDialog.hpp"
@@ -877,7 +878,11 @@ static void register_win32_device_notification_event()
 }
 #endif // WIN32
 
-static void generic_exception_handle()
+// true: reported, and the app keeps running (a plain std::exception -- 0.1.9, 11/01: one from the
+// Slice click went rethrow -> wxEvtHandler::WXConsumeException -> wxAbort(), closing the app over an
+// ordinary slicing error). Out of memory and a broken translation still terminate; anything that is
+// not a std::exception is not caught here, so wx aborts on it as before.
+static bool generic_exception_handle()
 {
     // Note: Some wxWidgets APIs use wxLogError() to report errors, eg. wxImage
     // - see https://docs.wxwidgets.org/3.1/classwx_image.html#aa249e657259fe6518d68a5208b9043d0
@@ -927,11 +932,15 @@ static void generic_exception_handle()
         std::terminate();
         //throw;
     } catch (const std::exception& ex) {
-        BOOST_LOG_TRIVIAL(error) << boost::format("Uncaught exception: %1%") % ex.what();
-        flush_logs();
-        wxLogError(format_wxstr(_L("Unlayered Slicer got an unhandled exception: %1%"), ex.what()));
-        throw;
+        return UiException::recover(std::current_exception(), [&ex](const UiException::Info &info) {
+            // first, so a crash that follows still names this (UsageTelemetry::note_exception)
+            UsageTelemetry::note_exception(info.type, info.what);
+            BOOST_LOG_TRIVIAL(error) << boost::format("Uncaught exception (%1%): %2%") % info.type % ex.what();
+            flush_logs();
+            wxLogError(format_wxstr(_L("Unlayered Slicer got an unhandled exception: %1%"), ex.what()));
+        });
     }
+    return false;
 //#endif
 }
 
@@ -1225,7 +1234,12 @@ public:
         line(_L("Error"), "exception");
         line(_L("Where"), "at");
         line(_L("Running for (seconds)"), "uptime_s");
-        details += _L("No models, file names, settings or personal information. Sent once, not linked to this computer.");
+        // 0.1.10: and the end of that session's log, scrubbed on this computer (CrashLogScrub).
+        details += "  " + _L("The end of the slicer's log for that session (up to 256 KB), with your name, home folder, "
+                             "computer name, file names, e-mail addresses, network addresses and passwords or keys removed "
+                             "before it leaves this computer") + "\n";
+        details += _L("No models or project files. The log can still name printers and presets. Sent once, with a random "
+                      "report number, not linked to this computer.");
         auto *list = new wxStaticText(this, wxID_ANY, details);
         list->Wrap(FromDIP(440));
         main->Add(list, 0, wxLEFT | wxRIGHT | wxBOTTOM, FromDIP(16));
@@ -1718,6 +1732,13 @@ void GUI_App::start_exit_watchdog()
             } catch (...) {
                 // A failing log sink must not stop the exit.
             }
+#ifdef _WIN32
+            // 0.1.10: not std::_Exit. On Windows it goes through ExitProcess, which still detaches
+            // UnlayeredSlicer.dll and runs its static destructors (~PluginManager -> Python finalize)
+            // on this thread under the loader lock: the very code that may be stuck. A 0.1.9 close
+            // hung 30 s, reached that path, and then died with 0xC0000005 on the main thread.
+            ::TerminateProcess(::GetCurrentProcess(), EXIT_FAILURE);
+#endif
             std::_Exit(EXIT_FAILURE);
         }).detach();
     } catch (const std::system_error& ex) {
@@ -10475,8 +10496,8 @@ int GUI_App::FilterEvent(wxEvent& event)
 
 bool GUI_App::OnExceptionInMainLoop()
 {
-    generic_exception_handle();
-    return false;
+    // true = carry on with this event loop (wx 3.1 WXConsumeException); false = exit the main loop
+    return generic_exception_handle();
 }
 
 #ifdef __APPLE__

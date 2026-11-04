@@ -209,6 +209,7 @@
 #include "MenuMnemonics.hpp"
 #include "wxExtensions.hpp"
 #include "../Utils/PrintHost.hpp"
+#include "../Utils/UiException.hpp"
 #include "../Utils/UsageTelemetry.hpp"
 #include "libslic3r/BedMesh.hpp"
 #include "../Utils/Moonraker.hpp"
@@ -257,6 +258,7 @@
 #include "../Utils/UndoRedo.hpp"
 #include "../Utils/PresetUpdater.hpp"
 #include "../Utils/Process.hpp"
+#include "../Utils/BambuConnect.hpp"
 #include "RemovableDriveManager.hpp"
 #include "InstanceCheck.hpp"
 #include "NotificationManager.hpp"
@@ -7293,6 +7295,18 @@ struct Plater::priv
     unsigned    print_sends_started   = 0;
     unsigned    send_jobs_finished    = 0;
     std::string last_gcode_export_path;
+    // Unlayered: Plater::open_in_bambu_connect. The last prepared job, reopened instead of exported
+    // again while the same slice of the same plate is current.
+    struct BambuConnectJob
+    {
+        int                     plate_index = -1;
+        std::string             gcode_path;
+        std::time_t             gcode_mtime = 0;
+        boost::uintmax_t        gcode_size  = 0;
+        boost::filesystem::path package;
+        std::string             display_name;
+    } last_bambu_connect_job;
+    bool bambu_connect_preparing = false;
     nlohmann::json next_print_dialog_options = nlohmann::json::object(); // Plater::set_next_print_dialog_options
     SendMultiMachinePage* m_send_multi_dlg = nullptr;
     SendToPrinterDialog* m_send_to_sdcard_dlg = nullptr;
@@ -7784,6 +7798,8 @@ struct Plater::priv
     void on_action_send_gcode(SimpleEvent&);
     void on_action_export_sliced_file(SimpleEvent&);
     void on_action_export_all_sliced_file(SimpleEvent&);
+    // The checks of a sliced-file export, then the default output path; false = do not export.
+    bool prepare_sliced_file_export(bool export_all, boost::filesystem::path& default_output_file);
     void on_action_select_sliced_plate(wxCommandEvent& evt);
     //BBS: change dark/light mode
     void on_change_color_mode(SimpleEvent& evt);
@@ -14561,7 +14577,7 @@ static std::vector<wxString> collect_imex_warnings(PartPlate* plate)
 }
 
 void Plater::priv::on_action_slice_plate(SimpleEvent&)
-{
+try {
     if (q != nullptr) {
         BOOST_LOG_TRIVIAL(debug) << __FUNCTION__ << ":received slice plate event\n" ;
         // IMEX parallel mode warnings (current plate only)
@@ -14601,11 +14617,14 @@ void Plater::priv::on_action_slice_plate(SimpleEvent&)
         q->reslice();
         q->select_view_3D("Preview");
     }
+} catch (const std::exception &) {
+    // a slicing error, not a crash (Plater::show_slice_exception)
+    q->show_slice_exception(std::current_exception());
 }
 
 //BBS: GUI refactor: slice all
 void Plater::priv::on_action_slice_all(SimpleEvent&)
-{
+try {
     if (q != nullptr) {
         BOOST_LOG_TRIVIAL(debug) << __FUNCTION__ << ":received slice project event\n" ;
         // IMEX parallel mode warnings (all plates)
@@ -14655,6 +14674,9 @@ void Plater::priv::on_action_slice_all(SimpleEvent&)
         //BBS: wish to select all plates stats item
         preview->get_canvas3d()->_update_select_plate_toolbar_stats_item(true);
     }
+} catch (const std::exception &) {
+    // a slicing error, not a crash (Plater::show_slice_exception)
+    q->show_slice_exception(std::current_exception());
 }
 
 void Plater::priv::on_action_print_plate(SimpleEvent&)
@@ -19467,7 +19489,7 @@ void Plater::load_gcode(const wxString& filename)
             m_gcode_settings_loaded = true;
         } catch (const std::exception& ex) {
             unload_file_settings();
-            get_notification_manager()->push_notification(NotificationType::CustomNotification,
+            p->notification_manager->push_notification(NotificationType::CustomNotification,
                                                           NotificationManager::NotificationLevel::WarningNotificationLevel,
                                                           GUI::format(_L("Failed loading file \"%1%\". An invalid configuration was found."), path) +
                                                               "\n" + ex.what());
@@ -20886,44 +20908,51 @@ void Plater::send_to_printer(bool isall)
 }
 
 //BBS export gcode 3mf to file
+bool Plater::priv::prepare_sliced_file_export(bool export_all, fs::path& default_output_file)
+{
+    if (model.objects.empty())
+        return false;
+
+    if (process_completed_with_error == partplate_list.get_curr_plate_index())
+        return false;
+
+    if (refuse_export_of_empty_plate(q, partplate_list, PLATE_CURRENT_IDX, export_all))
+        return false;
+
+    //calc default_output_file, get default output file from background process
+    try {
+        // Update the background processing, so that the placeholder parser will get the correct values for the ouput file template.
+        // Also if there is something wrong with the current configuration, a pop-up dialog will be shown and the export will not be performed.
+        unsigned int state = update_restart_background_process(false, false);
+        if (state & priv::UPDATE_BACKGROUND_PROCESS_INVALID)
+            return false;
+        default_output_file = background_process.output_filepath_for_project(into_path(get_project_filename(".3mf")));
+    }
+    catch (const Slic3r::PlaceholderParserError& ex) {
+        // Show the error with monospaced font.
+        show_error(q, ex.what(), true);
+        return false;
+    }
+    catch (const std::exception& ex) {
+        show_error(q, ex.what(), false);
+        return false;
+    }
+    default_output_file.replace_extension(".gcode.3mf");
+    default_output_file = fs::path(Slic3r::fold_utf8_to_ascii(default_output_file.string()));
+    return true;
+}
+
 void Plater::export_gcode_3mf(bool export_all)
 {
-    if (p->model.objects.empty())
-        return;
-
-    if (p->process_completed_with_error == p->partplate_list.get_curr_plate_index())
-        return;
-
-    if (refuse_export_of_empty_plate(this, p->partplate_list, PLATE_CURRENT_IDX, export_all))
+    fs::path default_output_file;
+    if (!p->prepare_sliced_file_export(export_all, default_output_file))
         return;
 
     UsageTelemetry::record("export", {{"kind", "gcode_3mf"}, {"all_plates", export_all}});
     usage_remember_print("export");
 
-    //calc default_output_file, get default output file from background process
-    fs::path default_output_file;
     AppConfig& appconfig = *wxGetApp().app_config;
     std::string start_dir;
-    try {
-        // Update the background processing, so that the placeholder parser will get the correct values for the ouput file template.
-        // Also if there is something wrong with the current configuration, a pop-up dialog will be shown and the export will not be performed.
-        unsigned int state = this->p->update_restart_background_process(false, false);
-        if (state & priv::UPDATE_BACKGROUND_PROCESS_INVALID)
-            return;
-        default_output_file = this->p->background_process.output_filepath_for_project(
-            into_path(this->p->get_project_filename(".3mf")));
-    }
-    catch (const Slic3r::PlaceholderParserError& ex) {
-        // Show the error with monospaced font.
-        show_error(this, ex.what(), true);
-        return;
-    }
-    catch (const std::exception& ex) {
-        show_error(this, ex.what(), false);
-        return;
-    }
-    default_output_file.replace_extension(".gcode.3mf");
-    default_output_file = fs::path(Slic3r::fold_utf8_to_ascii(default_output_file.string()));
 
     //Get a last save path
     start_dir = appconfig.get_last_output_dir(default_output_file.parent_path().string(), false);
@@ -20977,6 +21006,200 @@ void Plater::export_gcode_3mf(bool export_all)
         // update last output dir
         appconfig.update_last_output_dir(output_path.parent_path().string(), false);
         p->notification_manager->push_exporting_finished_notification(output_path.string(), p->last_output_dir_path, on_removable);
+    }
+}
+
+namespace {
+
+// Bambu's page on Connect: where to download it and how it pairs with a printer.
+const char* const BAMBU_CONNECT_PAGE = "https://wiki.bambulab.com/en/software/bambu-connect";
+
+// The whole path from slice to print, in the slicer, because Unlayered only does the first step:
+// Connect submits the job and Handy follows it. Claims stay at "follow in Bambu Handy".
+wxString bambu_connect_guide_text()
+{
+    return _L("Unlayered prepares the print. Bambu Connect sends it to your printer, and Bambu Handy follows it.") + "\n\n" +
+           _L("1. Install Bambu Connect from Bambu Lab.") + "\n" +
+           _L("2. Open Bambu Connect and sign in with the Bambu account your printer is bound to. "
+               "If your printer isn't listed, bind it to that account in the Bambu Handy app first.") + "\n" +
+           _L("3. Keep the printer connected to Bambu Cloud, with LAN Only mode off. Otherwise Bambu Handy cannot reach it.") + "\n" +
+           _L("4. In Unlayered, slice, then choose Print > Open in Bambu Connect.") + "\n" +
+           _L("5. In Bambu Connect, choose the printer, check the plate and filament, and press Print.") + "\n" +
+           _L("6. Follow the progress and the camera, and pause or resume, in the Bambu Handy app.");
+}
+
+// The guide (11/02: only when Connect is missing, never a step every user clicks through).
+// connect_missing: Open in Bambu Connect found no Connect, so nothing was exported; the guide says
+// so and offers the download. Otherwise ("How it works") it is information with OK only.
+void show_bambu_connect_guide(wxWindow* parent, bool connect_missing)
+{
+    if (!connect_missing) {
+        RichMessageDialog dlg(parent, bambu_connect_guide_text(), _L("Printing with Bambu Connect"), wxOK | wxICON_INFORMATION);
+        dlg.ShowModal();
+        return;
+    }
+    RichMessageDialog dlg(parent,
+                          _L("Bambu Connect isn't installed. Unlayered uses it to send prints to your Bambu printer.") + "\n\n" +
+                              bambu_connect_guide_text(),
+                          _L("Printing with Bambu Connect"), wxYES | wxNO | wxICON_INFORMATION);
+    dlg.SetYesNoLabels(_L("Download Bambu Connect"), _L("Cancel"));
+    if (dlg.ShowModal() == wxID_YES)
+        wxLaunchDefaultBrowser(BAMBU_CONNECT_PAGE);
+}
+
+} // namespace
+
+void Plater::open_in_bambu_connect()
+{
+    namespace BC = BambuConnect;
+    if (p->bambu_connect_preparing)
+        return; // one preparation at a time; a second click while exporting does nothing
+    if (!wxGetApp().preset_bundle->is_bbl_vendor() || !BC::is_enabled(wxGetApp().app_config->get(BC::CONFIG_KEY)))
+        return;
+
+    const int plate_idx = get_partplate_list().get_curr_plate_index();
+    PartPlate* plate = get_partplate_list().get_plate(plate_idx);
+    if (plate == nullptr || !plate->is_slice_result_ready_for_export())
+        return;
+
+    // No Connect: explain what to install, before anything is exported. With Connect, no dialog.
+    if (!BC::is_installed()) {
+        show_bambu_connect_guide(this, true);
+        return;
+    }
+
+    // The slice this job would carry: the plate's temporary G-code. A new slice rewrites it, so the same
+    // path, size and mtime mean the last prepared job is still this slice and is opened again as is.
+    auto& last = p->last_bambu_connect_job;
+    const std::string gcode_path = plate->get_tmp_gcode_path();
+    boost::system::error_code ec;
+    const std::time_t      gcode_mtime = fs::last_write_time(gcode_path, ec);
+    const boost::uintmax_t gcode_size  = ec ? 0 : fs::file_size(gcode_path, ec);
+    const bool same_slice = !ec && last.plate_index == plate_idx && last.gcode_path == gcode_path && last.gcode_mtime == gcode_mtime &&
+                            last.gcode_size == gcode_size && fs::exists(last.package, ec);
+
+    fs::path    package;
+    std::string display_name;
+    if (same_slice) {
+        package      = last.package;
+        display_name = last.display_name;
+    } else {
+        fs::path default_output_file;
+        if (!p->prepare_sliced_file_export(false, default_output_file))
+            return;
+
+        UsageTelemetry::record("export", {{"kind", "bambu_connect"}, {"all_plates", false}});
+        usage_remember_print("export");
+
+        p->bambu_connect_preparing = true;
+        ScopeGuard preparing_guard([this]() { p->bambu_connect_preparing = false; });
+
+        fs::path job_dir;
+        try {
+            job_dir = BC::create_job_dir();
+        } catch (const std::exception& ex) {
+            show_error(this, ex.what(), false);
+            return;
+        }
+        package      = job_dir / default_output_file.filename();
+        display_name = default_output_file.filename().string();
+        if (boost::iends_with(display_name, ".gcode.3mf"))
+            display_name.resize(display_name.size() - std::string(".gcode.3mf").size());
+
+        // The same package and strategy as "Export plate sliced file", so post-processing runs exactly once.
+        // ExportOngoing, not CustomNotification: its own type, so it is closed below without touching
+        // other notifications. It used to stay up under the hand-off notification.
+        p->notification_manager->push_notification(NotificationType::ExportOngoing,
+                                                      NotificationManager::NotificationLevel::RegularNotificationLevel,
+                                                      _u8L("Preparing file for Bambu Connect..."));
+        SaveStrategy strategy = SaveStrategy::Silence | SaveStrategy::SplitModel | SaveStrategy::WithGcode | SaveStrategy::SkipModel;
+        if (wxGetApp().app_config->get_bool("export_statistics"))
+            strategy = strategy | SaveStrategy::WithStatistics;
+        std::string                 package_error;
+        std::vector<BC::GcodeEntry> entries;
+        if (export_3mf(package, strategy, plate_idx) >= 0)
+            entries = BC::gcode_entries(package, package_error);
+        else
+            package_error = "the export failed";
+        p->notification_manager->close_notification_of_type(NotificationType::ExportOngoing);
+        if (entries.empty()) {
+            // A failed preparation never reaches Connect, and leaves no half-written job behind.
+            fs::remove_all(job_dir, ec);
+            show_error(this, GUI::format(_L("Could not prepare the file for Bambu Connect: %1%"), package_error), false);
+            return;
+        }
+
+        const DynamicPrintConfig& cfg = wxGetApp().preset_bundle->full_config();
+        BC::JobRecord record;
+        record.job_id         = job_dir.filename().string();
+        record.slicer_version = UNLAYERED_VERSION;
+        record.plate_index    = plate_idx;
+        record.display_name   = display_name;
+        record.printer_model  = cfg.opt_string("printer_model");
+        record.nozzle         = cfg.opt_serialize("nozzle_diameter");
+        record.build_plate    = cfg.opt_serialize("curr_bed_type");
+        if (auto* filaments = cfg.option<ConfigOptionStrings>("filament_settings_id"))
+            record.filaments = filaments->values;
+        record.package_path   = package;
+        record.package_sha256 = BC::sha256_file(package);
+        record.gcode_entries  = std::move(entries);
+        record.handoff_state  = "ready";
+        BC::write_job_record(job_dir, record);
+
+        last              = {};
+        last.plate_index  = plate_idx;
+        last.gcode_path   = gcode_path;
+        last.gcode_mtime  = gcode_mtime;
+        last.gcode_size   = gcode_size;
+        last.package      = package;
+        last.display_name = display_name;
+    }
+
+    const std::string folder = package.parent_path().string();
+    auto open_folder = [folder](wxEvtHandler*) {
+        desktop_open_any_folder(folder);
+        return false;
+    };
+    auto how_it_works = [this](wxEvtHandler*) {
+        CallAfter([this]() { show_bambu_connect_guide(this, false); });
+        return false;
+    };
+    // Only what Unlayered knows: the OS took the link. Import, printer choice and printing happen in
+    // Connect, which reports nothing back, so never "sent" or "printing" here.
+    const BC::LaunchResult launched = BC::launch(BC::build_import_uri(package, display_name));
+    if (!BC::record_launch_attempt(package.parent_path(), launched == BC::LaunchResult::Requested ? "handoff_requested" : "launch_failed"))
+        BOOST_LOG_TRIVIAL(warning) << "Bambu Connect: could not update job.json in " << package.parent_path().string();
+    switch (launched) {
+    case BC::LaunchResult::Requested:
+        BOOST_LOG_TRIVIAL(info) << "Bambu Connect: hand-off requested for job " << package.parent_path().filename().string()
+                                << (same_slice ? " (reopened)" : "");
+        p->notification_manager->push_notification(NotificationType::CustomNotification,
+                                                      NotificationManager::NotificationLevel::RegularNotificationLevel,
+                                                      same_slice ? _u8L("Opened the same prepared job in Bambu Connect again. Choose your printer there and press Print.")
+                                                                 : _u8L("Continue in Bambu Connect: choose your printer and press Print. You can then follow the print in Bambu Handy. "
+                                                                       "If Bambu Connect opens without asking to import the file, sign in, then choose Open in Bambu Connect again."),
+                                                      _u8L("How it works"), how_it_works);
+        break;
+    case BC::LaunchResult::NoHandler: {
+        // A dialog, not a notification: it needs two ways forward, and the export stays either way.
+        RichMessageDialog dlg(this,
+                              _L("Bambu Connect isn't installed. Install it from Bambu Lab, sign in with the account your printer is bound to, then try again.") +
+                                  "\n\n" + _L("The prepared file has been kept, so you can also open it in Bambu Connect by hand."),
+                              _L("Open in Bambu Connect"), wxYES | wxNO | wxCANCEL | wxICON_WARNING);
+        dlg.SetYesNoCancelLabels(_L("Download Bambu Connect"), _L("Show exported file"), _L("Close"));
+        const int answer = dlg.ShowModal();
+        if (answer == wxID_YES)
+            wxLaunchDefaultBrowser(BAMBU_CONNECT_PAGE);
+        else if (answer == wxID_NO)
+            desktop_open_any_folder(folder);
+        break;
+    }
+    case BC::LaunchResult::Failed:
+        p->notification_manager->push_notification(NotificationType::CustomNotification,
+                                                      NotificationManager::NotificationLevel::ErrorNotificationLevel,
+                                                      _u8L("Could not open Bambu Connect. Try again, or open the exported file in it by hand."),
+                                                      _u8L("Show exported file"), open_folder);
+        break;
     }
 }
 
@@ -22206,6 +22429,22 @@ bool Plater::is_multi_extruder_ams_empty()
     return true;
 }
 
+void Plater::show_slice_exception(std::exception_ptr e)
+{
+    const UiException::Info info = UiException::classify(e);
+    if (info.fatal)
+        std::rethrow_exception(e);
+    UsageTelemetry::note_exception(info.type, info.what);
+    BOOST_LOG_TRIVIAL(error) << "Slicing failed on the main thread (" << info.type << "): " << info.what;
+    p->notification_manager->set_slicing_progress_hidden();
+    // TRN %1% is the error's own (untranslated) message
+    p->notification_manager->push_slicing_error_notification(
+        format(_u8L("Slicing failed: %1%"), info.what.empty() ? info.type : info.what), {});
+    UsageTelemetry::record("slice", {{"result", "error"}, {"error_type", "ui_exception"},
+                                     {"error", UsageTelemetry::redact_message(info.type + ": " + info.what,
+                                                                              {get_project_name().ToUTF8().data()})}});
+}
+
 //BBS: add multiple plate reslice logic
 void Plater::reslice()
 {
@@ -22564,7 +22803,7 @@ void Plater::slice_nonplanar(bool quiet)
     auto fail = [this, quiet](const wxString& message) {
         BOOST_LOG_TRIVIAL(warning) << "Plater::slice_nonplanar: " << into_u8(message);
         if (quiet)
-            get_notification_manager()->push_notification(NotificationType::CustomNotification,
+            p->notification_manager->push_notification(NotificationType::CustomNotification,
                                                           NotificationManager::NotificationLevel::ErrorNotificationLevel,
                                                           into_u8(message));
         else

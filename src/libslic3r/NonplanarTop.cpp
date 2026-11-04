@@ -21,6 +21,7 @@
 #include "NonplanarTopSlice.hpp"
 
 #include "ClipperUtils.hpp"
+#include "Exception.hpp"
 #include "ExtrusionEntity.hpp"
 #include "ExtrusionEntityCollection.hpp"
 #include "Fill/FillBase.hpp"
@@ -54,6 +55,8 @@
 
 namespace Slic3r {
 
+void (*nonplanar_top_band_test_hook)() = nullptr;
+
 namespace {
 
 constexpr double kFlatSlopeDeg = 0.5;   // a max angle below this is "planar only"
@@ -77,6 +80,20 @@ struct Params
     double flow_max   = kMaxFlow;
     double tip_r      = 0.5;  // radius of the nozzle's flat tip face, mm
     bool   hold_back  = false; // nonplanar_hold_back: islands next to a top print after its shell
+    // UNLAYERED_MOD -- a tilted slice frame (cut-plane chunk, layer rotation): the upright nozzle is `tilt` degrees off the
+    // frame's Z, leaning toward `lean` (unit, frame XY). Slopes are measured against `up`, and every limit that checks a
+    // rise in one direction takes it there: limit - tilt * (direction . lean), so it is tighter leaning toward the nozzle's
+    // tilt and looser away from it. tilt 0 is the old symmetric behaviour exactly.
+    Vec3d  up         = Vec3d::UnitZ();
+    Vec2d  lean       = Vec2d::Zero();
+    double tilt       = 0.;
+    double env_deg    = 45.;  // the head envelope's smallest side angle, degrees
+    // tan of `base_deg` for a rise toward (dx, dy) (any length; zero = the plain base)
+    double tan_dir(double base_deg, double dx, double dy) const {
+        const double len = std::hypot(dx, dy);
+        const double a   = len > 0. && tilt > 0. ? base_deg - tilt * (dx * lean.x() + dy * lean.y()) / len : base_deg;
+        return std::tan(std::clamp(a, 0.5, 89.) * M_PI / 180.);
+    }
 };
 
 struct Cell
@@ -176,12 +193,12 @@ struct Surface3
     double to_print(double z_mesh) const { return z_mesh - ground + zmin; }
 };
 
-double slope_deg(const Vec3d &n)
+double slope_deg(const Vec3d &n, const Vec3d &up = Vec3d::UnitZ())
 {
     const double len = n.norm();
     if (len < EPSILON)
         return 90.;
-    return std::acos(std::clamp(n.z() / len, -1., 1.)) * 180. / M_PI;
+    return std::acos(std::clamp(n.dot(up) / len, -1., 1.)) * 180. / M_PI;
 }
 
 ExPolygons cells_to_expolygons(const Grid &grid, const std::function<bool(const Cell &)> &pred)
@@ -309,6 +326,7 @@ struct NpCached
     std::vector<ExPolygons>    cut; // per layer: what the slice-level clip took away (the shells' band)
     ExPolygons                 cover; // what the top curved layers cover (their beads, closed)
     std::vector<ExPolygons>    held_under; // per layer: where it stands on a held island printed with a shell (not the clipped layer below)
+    std::vector<ExPolygons>    held_above; // per layer: held islands on the layer above (printed later), so not a real top here
     std::shared_ptr<const NonplanarZaaLimits> zaa; // Z contouring limits beside the shells
 };
 
@@ -495,6 +513,22 @@ double nonplanar_effective_max_angle(const PrintRegionConfig &region, const Conf
     return std::clamp(a, 0., 89.);
 }
 
+// UNLAYERED_MOD -- how far the slice frame is tilted from the world (degrees): a tilted cut-plane chunk or layer rotation.
+// object_to_slice() is that frame's rotation times the object's own placement (object.trafo()), divided out here so a
+// part merely rotated on the plate counts as 0. On a 3-axis or virtual 5-axis machine the nozzle stays upright in the
+// world, i.e. this far off the frame's Z, so the nonplanar angle limits shrink by it (np_build).
+static double np_frame_tilt_deg(const PrintObject &object)
+{
+    // A real rotary machine (AB / BC / AC, not virtual) turns the part or the head so the nozzle follows the chunk's build
+    // direction: the clearance cone rotates with the frame, so there is no tilt to allow for (2026-11-02).
+    const PrintConfig &pc = object.print()->config();
+    if (! pc.virtual_5axis.value && pc.axis_selection.value != AxisSelection::Virtual)
+        return 0.;
+    const Eigen::Matrix3d frame = object.object_to_slice().linear() * object.trafo().linear().inverse();
+    const double          cz    = std::clamp((frame * Vec3d::UnitZ()).normalized().z(), -1., 1.);
+    return std::acos(cz) * 180. / M_PI;
+}
+
 // Analysis, eligibility, shells and the slice-level clip of one object (see nonplanar_top_clip_slices).
 // `its` is the same mesh as `mesh` (slice frame), for slicing it at the shell's floor.
 static NonplanarTopStats np_build(PrintObject &object, const sla::IndexedMesh &mesh, const indexed_triangle_set &its,
@@ -520,6 +554,18 @@ static NonplanarTopStats np_build(PrintObject &object, const sla::IndexedMesh &m
         return stats;
     P.n          = nonplanar_layer_count(rc, P.h);
     P.T          = P.n * P.h;
+    // In a tilted frame the upright nozzle is `tilt` off the frame's Z: slopes are measured against it (P.up) and the
+    // per-direction limits lean with it (Params::tan_dir).
+    {
+        // np_frame_tilt_deg() is 0 on a real rotary machine: there the cone follows the frame and nothing is skewed.
+        if (np_frame_tilt_deg(object) > 1e-6) {
+            const Eigen::Matrix3d frame = object.object_to_slice().linear() * object.trafo().linear().inverse();
+            P.up   = (frame * Vec3d::UnitZ()).normalized();
+            P.tilt = std::acos(std::clamp(P.up.z(), -1., 1.)) * 180. / M_PI;
+            const Vec2d xy(P.up.x(), P.up.y());
+            P.lean = xy.norm() > 1e-12 ? Vec2d(xy / xy.norm()) : Vec2d::Zero();
+        }
+    }
     P.max_angle  = nonplanar_effective_max_angle(rc, pc);
     P.max_height = rc.nonplanar_max_height.value;
     P.hold_back  = rc.nonplanar_hold_back.value;
@@ -538,9 +584,10 @@ static NonplanarTopStats np_build(PrintObject &object, const sla::IndexedMesh &m
             a = *std::min_element(env.angle.begin(), env.angle.end());
             P.env_reach = env.height;
         }
-        P.env_tan = std::tan(std::clamp(a, 1., 89.) * M_PI / 180.);
+        P.env_deg = std::clamp(a, 1., 89.);
+        P.env_tan = std::tan(P.env_deg * M_PI / 180.);
     }
-    if (P.max_angle < kFlatSlopeDeg || P.max_height < P.T + P.h)
+    if (P.max_angle - P.tilt < kFlatSlopeDeg || P.max_height < P.T + P.h)
         return stats;
 
     const double zmin = object.slicing_parameters().object_print_z_min;
@@ -582,7 +629,7 @@ static NonplanarTopStats np_build(PrintObject &object, const sla::IndexedMesh &m
                     c.col   = j * G.nx + i;
                     c.hit   = true;
                     c.s     = float(surf.to_print(h.z));
-                    c.slope = float(slope_deg(h.n));
+                    c.slope = float(slope_deg(h.n, P.up));
                     c.why   = h.cut ? 2 : 3;
                     // The column's material spans, top down, from all hits of the down-ray with a winding count, so
                     // overlapping parts (several volumes of one object) count as their union: a top is where the count
@@ -640,7 +687,7 @@ static NonplanarTopStats np_build(PrintObject &object, const sla::IndexedMesh &m
                         u.level = int(nodes.size());
                         u.hit   = true;
                         u.s     = float(surf.to_print(sp.top));
-                        u.slope = float(slope_deg(sp.n));
+                        u.slope = float(slope_deg(sp.n, P.up));
                         u.bot   = float(surf.to_print(std::max(sp.bot, floor)));
                         u.why   = 3;
                         if (u.slope <= P.max_angle) {
@@ -725,7 +772,11 @@ static NonplanarTopStats np_build(PrintObject &object, const sla::IndexedMesh &m
                     if (! G.cells[v].ok) continue;
                     // Only the foot of a cliff: the cell on top of it is at its own top's outline (a rim over a deck),
                     // and dropping it took the clearance of the whole narrow top with it (0.1.9).
-                    if (std::abs(G.cells[v].s - c.s) <= dz_cliff) cont = true; else if (G.cells[v].s > c.s) big = true;
+                    // the rise toward q, or toward this cell when q is lower (P.tan_dir: tilted frames)
+                    const double dz  = double(G.cells[v].s) - double(c.s);
+                    const double sgn = dz >= 0. ? 1. : -1.;
+                    const double lim = P.tilt > 0. ? G.g * P.tan_dir(P.max_angle, sgn * (q[0] - i), sgn * (q[1] - j)) + 0.015 : dz_cliff;
+                    if (std::abs(dz) <= lim) cont = true; else if (G.cells[v].s > c.s) big = true;
                 }
                 if (big && ! cont) cliff[u] = 1;
             }
@@ -787,6 +838,11 @@ static NonplanarTopStats np_build(PrintObject &object, const sla::IndexedMesh &m
         const double  allow_top = P.h + 0.05;
         const double  tan_eff  = P.env_tan / 1.0824;
         const float   step1    = float(tan_eff * G.g), step2 = float(tan_eff * G.g * std::sqrt(2.));
+        // per neighbour (da, db) = the column the value comes from, i.e. the direction from here toward it
+        auto step_to = [&](int da, int db) {
+            return P.tilt > 0. ? float(P.tan_dir(P.env_deg, da, db) / 1.0824 * G.g * std::hypot(double(da), double(db)))
+                               : (da != 0 && db != 0 ? step2 : step1);
+        };
         const int     flat_r   = int(std::floor(P.tip_r / G.g + 1e-9));
         const size_t  N        = size_t(G.ncols());
         const bool    any_cov  = std::any_of(cov_of.begin(), cov_of.end(), [](int v) { return v >= 0; });
@@ -921,18 +977,18 @@ static NonplanarTopStats np_build(PrintObject &object, const sla::IndexedMesh &m
                     for (int b = bx.b0; b <= bx.b1; ++ b)
                         for (int a = bx.a0; a <= bx.a1; ++ a) {
                             float &v = at(a, b);
-                            if (a > bx.a0)                   v = std::max(v, at(a - 1, b) - step1);
-                            if (b > bx.b0)                   v = std::max(v, at(a, b - 1) - step1);
-                            if (a > bx.a0 && b > bx.b0)      v = std::max(v, at(a - 1, b - 1) - step2);
-                            if (a < bx.a1 && b > bx.b0)      v = std::max(v, at(a + 1, b - 1) - step2);
+                            if (a > bx.a0)                   v = std::max(v, at(a - 1, b) - step_to(-1, 0));
+                            if (b > bx.b0)                   v = std::max(v, at(a, b - 1) - step_to(0, -1));
+                            if (a > bx.a0 && b > bx.b0)      v = std::max(v, at(a - 1, b - 1) - step_to(-1, -1));
+                            if (a < bx.a1 && b > bx.b0)      v = std::max(v, at(a + 1, b - 1) - step_to(1, -1));
                         }
                     for (int b = bx.b1; b >= bx.b0; -- b)
                         for (int a = bx.a1; a >= bx.a0; -- a) {
                             float &v = at(a, b);
-                            if (a < bx.a1)                   v = std::max(v, at(a + 1, b) - step1);
-                            if (b < bx.b1)                   v = std::max(v, at(a, b + 1) - step1);
-                            if (a < bx.a1 && b < bx.b1)      v = std::max(v, at(a + 1, b + 1) - step2);
-                            if (a > bx.a0 && b < bx.b1)      v = std::max(v, at(a - 1, b + 1) - step2);
+                            if (a < bx.a1)                   v = std::max(v, at(a + 1, b) - step_to(1, 0));
+                            if (b < bx.b1)                   v = std::max(v, at(a, b + 1) - step_to(0, 1));
+                            if (a < bx.a1 && b < bx.b1)      v = std::max(v, at(a + 1, b + 1) - step_to(1, 1));
+                            if (a > bx.a0 && b < bx.b1)      v = std::max(v, at(a - 1, b + 1) - step_to(-1, 1));
                         }
                     for (int ui : bx.nodes) {
                         const size_t u = size_t(ui);
@@ -1005,18 +1061,143 @@ static NonplanarTopStats np_build(PrintObject &object, const sla::IndexedMesh &m
                 if (ex.contains(Point::new_scale(G.cx(a), G.cy(b)))) cols.push_back(b * G.nx + a);
         return cols;
     };
+    // Grid columns as area: one cell square per column (grown a micron so neighbours merge, as cells_to_expolygons).
+    auto cols_area = [&G](const std::vector<int> &cols) {
+        Polygons      rects;
+        const coord_t half = coord_t(scale_(G.g * 0.5)) + 1000;
+        rects.reserve(cols.size());
+        for (int c : cols) {
+            const coord_t x = coord_t(scale_(G.cx(c % G.nx))), y = coord_t(scale_(G.cy(c / G.nx)));
+            rects.emplace_back(Points{ Point(x - half, y - half), Point(x + half, y - half), Point(x + half, y + half), Point(x - half, y + half) });
+        }
+        return union_ex(rects);
+    };
+    // The nozzle around printed material: each column's height spread over the tip face, then down the hotend cone.
+    const float  kHoldNone    = -1e30f;
+    const double hold_tan_eff = P.env_tan / 1.0824;
+    const float  hold_step1   = float(hold_tan_eff * G.g), hold_step2 = float(hold_tan_eff * G.g * std::sqrt(2.));
+    auto hold_step_to = [&](int da, int db) {
+        return P.tilt > 0. ? float(P.tan_dir(P.env_deg, da, db) / 1.0824 * G.g * std::hypot(double(da), double(db)))
+                           : (da != 0 && db != 0 ? hold_step2 : hold_step1);
+    };
+    const int hold_flat_r = int(std::floor(P.tip_r / G.g + 1e-9));
+    auto hold_spread = [&](const std::vector<float> &top) {
+        const int          flat_r = hold_flat_r;
+        std::vector<float> flat(top.size(), kHoldNone);
+        for (int b = 0; b < G.ny; ++ b)
+            for (int a = 0; a < G.nx; ++ a) {
+                float m = kHoldNone;
+                for (int db = -flat_r; db <= flat_r; ++ db)
+                    for (int da = -flat_r; da <= flat_r; ++ da)
+                        if (da * da + db * db <= flat_r * flat_r && G.inside(a + da, b + db)) m = std::max(m, top[size_t(b + db) * G.nx + a + da]);
+                flat[size_t(b) * G.nx + a] = m;
+            }
+        auto at = [&](int a, int b) -> float & { return flat[size_t(b) * G.nx + a]; };
+        for (int b = 0; b < G.ny; ++ b)
+            for (int a = 0; a < G.nx; ++ a) {
+                float &v = at(a, b);
+                if (a > 0)                  v = std::max(v, at(a - 1, b) - hold_step_to(-1, 0));
+                if (b > 0)                  v = std::max(v, at(a, b - 1) - hold_step_to(0, -1));
+                if (a > 0 && b > 0)         v = std::max(v, at(a - 1, b - 1) - hold_step_to(-1, -1));
+                if (a < G.nx - 1 && b > 0)  v = std::max(v, at(a + 1, b - 1) - hold_step_to(1, -1));
+            }
+        for (int b = G.ny - 1; b >= 0; -- b)
+            for (int a = G.nx - 1; a >= 0; -- a) {
+                float &v = at(a, b);
+                if (a < G.nx - 1)                 v = std::max(v, at(a + 1, b) - hold_step_to(1, 0));
+                if (b < G.ny - 1)                 v = std::max(v, at(a, b + 1) - hold_step_to(0, 1));
+                if (a < G.nx - 1 && b < G.ny - 1) v = std::max(v, at(a + 1, b + 1) - hold_step_to(1, 1));
+                if (a > 0 && b < G.ny - 1)        v = std::max(v, at(a - 1, b + 1) - hold_step_to(-1, 1));
+            }
+        return flat;
+    };
+    // A held layer prints beside finished curved tops: the nozzle may not touch them (the shell's own h + 0.05 brush of a
+    // planar stair corner dragged held walls 0.25 mm through tt_5's finished top).
+    const double hold_allow_top = 0.05;
+    // The candidates of the last find_held_islands (layer, columns), in layer order: what of them is not held prints normally.
+    std::vector<std::pair<int, std::vector<int>>> hold_cands;
+    // A held island goes down after its top's shell, beside everything printed normally up to the host, the candidates'
+    // material that is not held included (the rest of a partly held piece, a piece that was not safe). The selection's
+    // fields leave all candidates out; here a held island is trimmed where that material (and what islands held for an
+    // earlier top left), spread by the tip face and the cone, stands over it. Then held layers must run without a gap up to
+    // the host: one with material of its own column printed normally over it would float, so it is printed normally too
+    // (from the top down). Both steps only take columns away, so this ends; it repeats until neither changes anything.
+    // NPTOP_PARTIAL_HOLD=1: hold the safe part of a piece (cut on the analysis grid; experimental, see find_held_islands)
+    const bool partial_hold = std::getenv("NPTOP_PARTIAL_HOLD") != nullptr;
+    auto settle_held = [&](std::vector<HeldIsland> &res) {
+        const size_t NC = size_t(G.ncols());
+        for (int it = 0; it < 256; ++ it) {
+            bool changed = false;
+            std::map<double, int> hosts; // host_ref -> host layer
+            for (const HeldIsland &h : res) hosts.emplace(h.host_ref, patches[h.pid].host);
+            for (const auto &[H, hl] : hosts) {
+                // per layer: the islands not printed yet when H's held islands go down (held for H or a later top)
+                std::map<int, std::vector<const HeldIsland *>> held_at;
+                for (const HeldIsland &h : res) if (h.host_ref >= H - 1e-6) held_at[h.layer].push_back(&h);
+                std::vector<float> top(NC, kHoldNone);
+                std::vector<int>   stamp(NC, -1);
+                int  stamped = -1;
+                bool any     = false;
+                for (const auto &[l, cols] : hold_cands) {
+                    if (l > hl) continue;
+                    if (l != stamped) {
+                        stamped = l;
+                        if (auto hit = held_at.find(l); hit != held_at.end())
+                            for (const HeldIsland *h : hit->second) for (int c : h->cols) stamp[c] = l;
+                    }
+                    const float z = float(layers[l]->print_z);
+                    for (int c : cols)
+                        if (stamp[c] != l && top[c] < z) { top[c] = z; any = true; }
+                }
+                if (! any) continue;
+                const std::vector<float> F = hold_spread(top);
+                std::vector<HeldIsland> next;
+                for (HeldIsland &h : res) {
+                    if (std::abs(h.host_ref - H) > 1e-6) { next.push_back(std::move(h)); continue; }
+                    const double     thr = layers[h.layer]->print_z + hold_allow_top;
+                    std::vector<int> bad;
+                    for (int c : h.cols) if (double(F[c]) > thr) bad.push_back(c);
+                    if (bad.empty()) { next.push_back(std::move(h)); continue; }
+                    changed = true;
+                    // without partial holds an island that is not safe everywhere is not held at all (no grid-cut walls)
+                    if (bad.size() == h.cols.size() || ! partial_hold) continue;
+                    for (ExPolygon &e : diff_ex(ExPolygons{ h.area }, cols_area(bad))) {
+                        if (std::abs(e.area()) * SCALING_FACTOR * SCALING_FACTOR < 0.5) continue;
+                        std::vector<int> cols = island_cols(e);
+                        if (! cols.empty()) next.push_back({ h.pid, h.layer, std::move(e), std::move(cols), h.host_ref });
+                    }
+                }
+                res = std::move(next);
+            }
+            std::sort(res.begin(), res.end(), [](const HeldIsland &x, const HeldIsland &y) { return x.layer > y.layer; });
+            std::vector<char> keep(res.size(), 1);
+            for (size_t i = 0; i < res.size(); ++ i) {
+                const HeldIsland &h = res[i];
+                if (h.layer >= patches[h.pid].host) continue;
+                // the layer above: held parts of the same top
+                ExPolygons above_held;
+                for (size_t j = 0; j < res.size(); ++ j)
+                    if (keep[j] && std::abs(res[j].host_ref - h.host_ref) < 1e-6 && res[j].layer == h.layer + 1) above_held.push_back(res[j].area);
+                if (! intersection_ex(ExPolygons{ h.area }, diff_ex(layers[h.layer + 1]->lslices, above_held)).empty()) { keep[i] = 0; changed = true; }
+            }
+            std::vector<HeldIsland> kept;
+            for (size_t i = 0; i < res.size(); ++ i) if (keep[i]) kept.push_back(std::move(res[i]));
+            res = std::move(kept);
+            if (! changed) return;
+        }
+        if (std::getenv("NPTOP_DEBUG") != nullptr)
+            std::fprintf(stderr, "np hold settle: no stable held set after 256 rounds (%zu islands left), holding nothing\n", res.size());
+        res.clear(); // did not settle: hold nothing rather than guess
+    };
     auto find_held_islands = [&]() {
         std::vector<HeldIsland> res;
+        hold_cands.clear();
         if (! P.hold_back)
             return res;
         const int    NC        = G.ncols();
-        const double tan_eff   = P.env_tan / 1.0824;
-        const float  step1     = float(tan_eff * G.g), step2 = float(tan_eff * G.g * std::sqrt(2.));
-        const int    flat_r    = int(std::floor(P.tip_r / G.g + 1e-9));
-        // A held layer prints beside finished curved tops: the nozzle may not touch them (the shell's own h + 0.05 brush of a
-        // planar stair corner dragged held walls 0.25 mm through tt_5's finished top).
-        const double allow_top = 0.05;
-        const float  kNone     = -1e30f;
+        const double tan_eff   = hold_tan_eff;
+        const double allow_top = hold_allow_top;
+        const float  kNone     = kHoldNone;
         const int    near_r    = int(std::ceil((P.tip_r + 2.) / G.g));
         if (patches.empty()) return res;
         // in_reach[pid]: columns within reach of the top
@@ -1069,6 +1250,7 @@ static NonplanarTopStats np_build(PrintObject &object, const sla::IndexedMesh &m
                     continue;
                 std::vector<int> cols = island_cols(ex);
                 if (cols.empty()) continue;
+                hold_cands.emplace_back(l, cols);
                 // (No "highest top in the column" test: the tops' own material near the layer is already taken out above,
                 // and a cabin wall whose column ends in the roof's curved top 20 mm higher is not roof material at the deck.)
                 std::vector<int> pids;
@@ -1092,7 +1274,7 @@ static NonplanarTopStats np_build(PrintObject &object, const sla::IndexedMesh &m
         auto field_at = [&](double H) -> const std::vector<float> & {
             auto it = printed.find(H);
             if (it != printed.end()) return it->second;
-            std::vector<float> top(size_t(NC), kNone), flat(size_t(NC), kNone);
+            std::vector<float> top(size_t(NC), kNone);
             for (const Cell &q : G.cells) {
                 if (! q.hit) continue;
                 if (q.ok && q.patch >= 0) {
@@ -1101,31 +1283,7 @@ static NonplanarTopStats np_build(PrintObject &object, const sla::IndexedMesh &m
                 } else if (! cand_col[q.col] && double(q.bot) < H - 1e-6)
                     top[q.col] = std::max(top[q.col], float(std::min(double(q.s) + 0.5 * P.h, H)));
             }
-            for (int b = 0; b < G.ny; ++ b)
-                for (int a = 0; a < G.nx; ++ a) {
-                    float m = kNone;
-                    for (int db = -flat_r; db <= flat_r; ++ db)
-                        for (int da = -flat_r; da <= flat_r; ++ da)
-                            if (da * da + db * db <= flat_r * flat_r && G.inside(a + da, b + db)) m = std::max(m, top[size_t(b + db) * G.nx + a + da]);
-                    flat[size_t(b) * G.nx + a] = m;
-                }
-            auto at = [&](int a, int b) -> float & { return flat[size_t(b) * G.nx + a]; };
-            for (int b = 0; b < G.ny; ++ b)
-                for (int a = 0; a < G.nx; ++ a) {
-                    float &v = at(a, b);
-                    if (a > 0)                  v = std::max(v, at(a - 1, b) - step1);
-                    if (b > 0)                  v = std::max(v, at(a, b - 1) - step1);
-                    if (a > 0 && b > 0)         v = std::max(v, at(a - 1, b - 1) - step2);
-                    if (a < G.nx - 1 && b > 0)  v = std::max(v, at(a + 1, b - 1) - step2);
-                }
-            for (int b = G.ny - 1; b >= 0; -- b)
-                for (int a = G.nx - 1; a >= 0; -- a) {
-                    float &v = at(a, b);
-                    if (a < G.nx - 1)                v = std::max(v, at(a + 1, b) - step1);
-                    if (b < G.ny - 1)                v = std::max(v, at(a, b + 1) - step1);
-                    if (a < G.nx - 1 && b < G.ny - 1) v = std::max(v, at(a + 1, b + 1) - step2);
-                    if (a > 0 && b < G.ny - 1)       v = std::max(v, at(a - 1, b + 1) - step2);
-                }
+            std::vector<float> flat = hold_spread(top);
             if (const char *pr = std::getenv("NPTOP_DEBUG_HOLD")) {
                 // the source of the field at a probe column: "x,y"
                 double px = 0, py = 0;
@@ -1149,40 +1307,53 @@ static NonplanarTopStats np_build(PrintObject &object, const sla::IndexedMesh &m
             }
             return printed.emplace(H, std::move(flat)).first->second;
         };
-        // Each candidate goes to the earliest top it is safe to follow.
+        // Each candidate goes to the earliest top it is safe to follow. A piece no top is safe for as a whole holds the part that
+        // is safe for the earliest top it can follow (Benchy's wheelhouse walls join the hull ring at the deck, and one ring
+        // column beside the deck's highest point rejected the walls too); the rest prints normally.
+        const bool dbg = std::getenv("NPTOP_DEBUG_HOLD") != nullptr;
         for (Cand &cd : cands) {
             std::sort(cd.pids.begin(), cd.pids.end(), [&](int x, int y) { return patches[x].host_ref < patches[y].host_ref; });
             const double pz = layers[cd.layer]->print_z;
+            bool done = false;
             for (int pid : cd.pids) {
                 const std::vector<float> &D = field_at(patches[pid].host_ref);
                 bool safe = true;
                 int  worst = -1;
                 for (int c : cd.cols) if (worst < 0 || D[c] > D[worst]) worst = c;
                 safe = worst < 0 || double(D[worst]) <= pz + allow_top;
-                if (std::getenv("NPTOP_DEBUG_HOLD") != nullptr && cd.cols.size() >= 20)
+                if (dbg && cd.cols.size() >= 20)
                     std::fprintf(stderr, "np hold cand layer %d z %.3f cols %zu top %d host %d: field max %.3f at (%.2f, %.2f) -> %s\n", cd.layer, pz, cd.cols.size(), pid,
                                  patches[pid].host, worst >= 0 ? double(D[worst]) : -1., worst >= 0 ? G.cx(worst % G.nx) : 0., worst >= 0 ? G.cy(worst / G.nx) : 0.,
                                  safe ? "held" : "not safe");
-                if (safe) { res.push_back({ pid, cd.layer, cd.area, cd.cols, patches[pid].host_ref }); break; }
+                if (safe) { res.push_back({ pid, cd.layer, cd.area, cd.cols, patches[pid].host_ref }); done = true; break; }
+            }
+            if (done) continue;
+            // Partial holds cut a piece along the 0.25 mm analysis grid: the walls then follow that staircase and loops are
+            // cut mid-wall (jagged, fragmented layers on a Benchy bow, 2026-11-02). Off until the cut follows the part.
+            if (! partial_hold) continue;
+            for (int pid : cd.pids) {
+                const std::vector<float> &D = field_at(patches[pid].host_ref);
+                std::vector<int> bad;
+                for (int c : cd.cols) if (double(D[c]) > pz + allow_top) bad.push_back(c);
+                if (bad.size() == cd.cols.size()) continue;
+                // the safe part, without slivers, and only pieces of it within reach of the top
+                size_t n_held = 0, n_cols = 0;
+                for (ExPolygon &e : diff_ex(ExPolygons{ cd.area }, cols_area(bad))) {
+                    if (std::abs(e.area()) * SCALING_FACTOR * SCALING_FACTOR < 0.5) continue;
+                    std::vector<int> cols = island_cols(e);
+                    if (cols.empty() || std::none_of(cols.begin(), cols.end(), [&](int c) { return in_reach[pid][c] != 0; })) continue;
+                    n_cols += cols.size();
+                    ++ n_held;
+                    res.push_back({ pid, cd.layer, std::move(e), std::move(cols), patches[pid].host_ref });
+                }
+                if (dbg && cd.cols.size() >= 20)
+                    std::fprintf(stderr, "np hold cand layer %d z %.3f cols %zu top %d host %d: safe part %zu cols in %zu pieces\n", cd.layer, pz, cd.cols.size(), pid,
+                                 patches[pid].host, n_cols, n_held);
+                if (n_held > 0) break;
             }
         }
-        // Held layers run without a gap up to the host: one with material of its own column printed normally over it would
-        // float, so it is printed normally too (from the top down).
-        std::sort(res.begin(), res.end(), [](const HeldIsland &x, const HeldIsland &y) { return x.layer > y.layer; });
-        std::vector<char> keep(res.size(), 1);
-        for (size_t i = 0; i < res.size(); ++ i) {
-            const HeldIsland &h = res[i];
-            if (h.layer >= patches[h.pid].host) continue;
-            // the layer above: held parts of the same top
-            ExPolygons above_held;
-            for (size_t j = 0; j < res.size(); ++ j)
-                if (keep[j] && res[j].pid == h.pid && res[j].layer == h.layer + 1) above_held.push_back(res[j].area);
-            const ExPolygons above_plain = diff_ex(layers[h.layer + 1]->lslices, above_held);
-            if (! intersection_ex(ExPolygons{ h.area }, above_plain).empty()) keep[i] = 0;
-        }
-        std::vector<HeldIsland> kept;
-        for (size_t i = 0; i < res.size(); ++ i) if (keep[i]) kept.push_back(std::move(res[i]));
-        return kept;
+        settle_held(res);
+        return res;
     };
     auto set_caps = [&](const std::vector<HeldIsland> &hs) {
         std::fill(colcap.begin(), colcap.end(), 1e30f);
@@ -1200,9 +1371,16 @@ static NonplanarTopStats np_build(PrintObject &object, const sla::IndexedMesh &m
     std::vector<HeldIsland> prev_held, final_set;
     bool final_pass = false;
     // Same island in two passes: same layer, same top (host), about the same columns.
+    // (A partly held piece can leave several held parts on one layer: they must share most columns, not only their count.)
     auto same_island = [](const HeldIsland &x, const HeldIsland &y) {
-        return x.layer == y.layer && std::abs(x.host_ref - y.host_ref) < 1e-6 &&
-               std::abs(double(x.cols.size()) - double(y.cols.size())) <= 0.1 * double(std::max(x.cols.size(), y.cols.size()));
+        if (x.layer != y.layer || std::abs(x.host_ref - y.host_ref) >= 1e-6) return false;
+        const double n = double(std::max(x.cols.size(), y.cols.size()));
+        if (std::abs(double(x.cols.size()) - double(y.cols.size())) > 0.1 * n) return false;
+        size_t common = 0; // island_cols lists columns in ascending order
+        for (size_t i = 0, j = 0; i < x.cols.size() && j < y.cols.size();) {
+            if (x.cols[i] < y.cols[j]) ++ i; else if (y.cols[j] < x.cols[i]) ++ j; else { ++ common; ++ i; ++ j; }
+        }
+        return double(common) >= 0.8 * n;
     };
     for (int hpass = 0; hpass < 5; ++ hpass) {
     if (hpass > 0) { G.cells = cells0; next_band = 1; dropped_cells = 0; dropped_why = nullptr; }
@@ -1323,8 +1501,13 @@ static NonplanarTopStats np_build(PrintObject &object, const sla::IndexedMesh &m
         break;
     }
     std::vector<HeldIsland> hs = find_held_islands();
+    // (order-free: the islands of one layer come in any order)
     size_t sig = hs.size();
-    for (const HeldIsland &h : hs) sig = sig * 1000003u + size_t(h.layer) * 131u + h.cols.size() + size_t(patches[h.pid].host_ref * 1000.);
+    for (const HeldIsland &h : hs) {
+        size_t hh = size_t(h.layer) * 131u + h.cols.size() * 1000003u + size_t(patches[h.pid].host_ref * 1000.) * 7919u;
+        for (int c : h.cols) hh = hh * 31u + size_t(c);
+        sig += hh * 2654435761u;
+    }
     if (std::getenv("NPTOP_DEBUG") != nullptr) {
         std::fprintf(stderr, "np hold pass %d: %zu tops, %zu held:", hpass, patches.size(), hs.size());
         for (const HeldIsland &h : hs) std::fprintf(stderr, " L%d/%zu@%.1f", h.layer, h.cols.size(), patches[h.pid].host_ref);
@@ -1332,29 +1515,18 @@ static NonplanarTopStats np_build(PrintObject &object, const sla::IndexedMesh &m
     }
     if (hs.empty() && hpass == 0) break;                                            // nothing to hold
     if (hpass > 0 && sig == held_sig) { held_islands = std::move(hs); break; }     // settled: the caps used are these
-    if (hpass > 0) {
+    // (A partly held piece can reshape the tops a lot -- a rim ring held lets a banded deck become fewer tops -- so the held
+    // set gets a few passes to settle before the fallback; pass 4 is then the final one.)
+    if (hpass >= 3) {
         // Not settled (fringe pieces move between passes): keep the islands both passes hold, and find the tops once more
         // with exactly their caps.
         final_set.clear();
         for (HeldIsland &h : hs)
             if (std::any_of(prev_held.begin(), prev_held.end(), [&](const HeldIsland &q) { return same_island(h, q); }))
                 final_set.push_back(std::move(h));
-        // Held layers still run without a gap up to the host (a dropped fringe piece may have sat on one): top down.
-        std::sort(final_set.begin(), final_set.end(), [](const HeldIsland &x, const HeldIsland &y) { return x.layer > y.layer; });
-        {
-            std::vector<char> keep(final_set.size(), 1);
-            for (size_t i = 0; i < final_set.size(); ++ i) {
-                const HeldIsland &h = final_set[i];
-                if (h.layer >= patches[h.pid].host) continue;
-                ExPolygons above_held;
-                for (size_t j = 0; j < final_set.size(); ++ j)
-                    if (keep[j] && std::abs(final_set[j].host_ref - h.host_ref) < 1e-6 && final_set[j].layer == h.layer + 1) above_held.push_back(final_set[j].area);
-                if (! intersection_ex(ExPolygons{ h.area }, diff_ex(layers[h.layer + 1]->lslices, above_held)).empty()) keep[i] = 0;
-            }
-            std::vector<HeldIsland> kept;
-            for (size_t i = 0; i < final_set.size(); ++ i) if (keep[i]) kept.push_back(std::move(final_set[i]));
-            final_set = std::move(kept);
-        }
+        // Held layers still run without a gap up to the host (a dropped fringe piece may have sat on one), and a dropped piece
+        // prints normally beside the others: settle again.
+        settle_held(final_set);
         set_caps(final_set);
         final_pass = true;
         continue;
@@ -1406,7 +1578,8 @@ static NonplanarTopStats np_build(PrintObject &object, const sla::IndexedMesh &m
                         const Cell &b = G.cells[v];
                         // the same surface, continued by a top printed later
                         if (! b.ok || b.patch < 0 || b.patch == a.patch || patches[b.patch].host_ref <= hra + 1e-6 ||
-                            std::abs(double(b.s) - double(a.s)) > tmax * d + 0.05)
+                            std::abs(double(b.s) - double(a.s)) >
+                                (P.tilt > 0. ? P.tan_dir(P.max_angle, (b.s >= a.s ? 1. : -1.) * di, (b.s >= a.s ? 1. : -1.) * dj) : tmax) * d + 0.05)
                             continue;
                         best = d;
                         bp   = b.patch;
@@ -1739,108 +1912,133 @@ static NonplanarTopStats np_build(PrintObject &object, const sla::IndexedMesh &m
         // surface, and loops along it showed through the top layer as a diagonal band of inner wall.
         const ExPolygons wall_band = diff_ex(offset_ex(p.outer, float(scale_(0.05))),
                                              offset_ex(p.outer, -float(loop_offset.back() + 0.75 * perim_flow.scaled_spacing())));
-        for (int k = 0; k < P.n; ++ k) {
-            const bool top = k == P.n - 1;
-            for (int li = 0; li < n_loops; ++ li) {
-                const ExPolygons    loops = offset_ex(p.layer_footprint[k], -float(loop_offset[li]));
-                const ExtrusionRole role  = li == 0 ? erExternalPerimeter : erPerimeter;
-                const Flow         *lf    = li == 0 ? &ext_flow : &perim_flow;
-                auto add_loop = [&](const Polygon &poly) {
-                    if (top) { jobs.push_back({ poly.points, k, role, lf, 1., true }); return; }
-                    Polyline closed(poly.points);
-                    closed.points.push_back(poly.points.front());
-                    Polylines kept = intersection_pl(Polylines{ closed }, wall_band);
-                    if (kept.size() == 1 && std::abs(kept.front().length() - closed.length()) < scale_(0.01)) {
-                        jobs.push_back({ poly.points, k, role, lf, 1., true });
-                        return;
+        // The fills of a band can throw instead of coming back empty: a sliver of a curved layer's footprint reaches
+        // the Voronoi code's resolution limit and the gap fill's medial axis gives up (Slic3r::OutOfRange out of
+        // VoronoiUtils). That must cost this top its curved band, never the slice: the band is dropped here and the
+        // planar top surface it would have replaced stays, exactly as for a top that was never eligible.
+        // CriticalException is the common base of InfillFailedException (a RuntimeError) and of the Voronoi
+        // OutOfRange / InvalidArgument (LogicErrors), so one catch covers every failure these fills can raise. Do NOT
+        // widen it to std::exception: CanceledException (PrintBase.hpp) and SlicingError are not CriticalException,
+        // and both must keep propagating -- a cancel and a deliberate slicing error are not ours to swallow.
+        // The whole band goes, not just the layer that failed: the planar part is clipped by what the TOP curved layer
+        // covers (patch_cover below), so a band missing a layer would either print its deeper curved layers into uncut
+        // planar material or leave a void under its top one.
+        bool band_failed = false;
+        try {
+            for (int k = 0; k < P.n; ++ k) {
+                const bool top = k == P.n - 1;
+                for (int li = 0; li < n_loops; ++ li) {
+                    const ExPolygons    loops = offset_ex(p.layer_footprint[k], -float(loop_offset[li]));
+                    const ExtrusionRole role  = li == 0 ? erExternalPerimeter : erPerimeter;
+                    const Flow         *lf    = li == 0 ? &ext_flow : &perim_flow;
+                    auto add_loop = [&](const Polygon &poly) {
+                        if (top) { jobs.push_back({ poly.points, k, role, lf, 1., true }); return; }
+                        Polyline closed(poly.points);
+                        closed.points.push_back(poly.points.front());
+                        Polylines kept = intersection_pl(Polylines{ closed }, wall_band);
+                        if (kept.size() == 1 && std::abs(kept.front().length() - closed.length()) < scale_(0.01)) {
+                            jobs.push_back({ poly.points, k, role, lf, 1., true });
+                            return;
+                        }
+                        for (Polyline &pl : kept)
+                            if (pl.length() > scale_(0.8))
+                                jobs.push_back({ pl.points, k, role, lf, 1., false });
+                    };
+                    for (const ExPolygon &ex : loops) {
+                        add_loop(ex.contour);
+                        for (const Polygon &hole : ex.holes)
+                            add_loop(hole);
+                        if (top) {
+                            Polyline c(ex.contour.points); c.points.push_back(ex.contour.points.front()); top_loop_lines.push_back(c);
+                            for (const Polygon &hole : ex.holes) { Polyline hl(hole.points); hl.points.push_back(hole.points.front()); top_loop_lines.push_back(hl); }
+                        }
                     }
-                    for (Polyline &pl : kept)
-                        if (pl.length() > scale_(0.8))
-                            jobs.push_back({ pl.points, k, role, lf, 1., false });
-                };
-                for (const ExPolygon &ex : loops) {
-                    add_loop(ex.contour);
-                    for (const Polygon &hole : ex.holes)
-                        add_loop(hole);
-                    if (top) {
-                        Polyline c(ex.contour.points); c.points.push_back(ex.contour.points.front()); top_loop_lines.push_back(c);
-                        for (const Polygon &hole : ex.holes) { Polyline hl(hole.points); hl.points.push_back(hole.points.front()); top_loop_lines.push_back(hl); }
+                }
+                const Flow      &flow      = top ? top_flow : solid_flow;
+                // Inside the wall band the fill stops at the last loop; at an inner (kmin ramp) edge it runs to the edge.
+                const ExPolygons fill_area = top ? offset_ex(p.layer_footprint[k], -fill_inset_for(flow)) :
+                    intersection_ex(offset_ex(p.layer_footprint[k], -float(0.5 * flow.scaled_spacing())), offset_ex(p.outer, -fill_inset_for(flow)));
+                const double     angle     = top_angle + (((P.n - 1 - k) % 2) ? 90. : 0.);
+                for (const ExPolygon &ex : fill_area) {
+                    Polylines lines;
+                    // The configured pattern first; a fill that comes back empty or throws falls back to plain monotonic lines.
+                    for (InfillPattern pat : { top ? top_pattern : solid_pattern, ipMonotonic, ipRectilinear }) {
+                        std::unique_ptr<Fill> f(Fill::new_from_type(pat));
+                        f->set_bounding_box(object.bounding_box());
+                        f->layer_id        = host->id();
+                        f->z               = hz;
+                        f->spacing         = flow.spacing();
+                        f->angle           = float(Geometry::deg2rad(angle));
+                        f->fixed_angle     = true;
+                        f->link_max_length = coord_t(scale_(3. * f->spacing));
+                        f->overlap         = 0;
+                        FillParams fp;
+                        fp.density   = 1.f;
+                        fp.monotonic = true;
+                        Surface s(top ? stTop : stInternalSolid, ex);
+                        try { lines = f->fill_surface(&s, fp); } catch (const Slic3r::CriticalException &) { lines.clear(); }
+                        if (! lines.empty())
+                            break;
+                    }
+                    for (const Polyline &pl : lines) {
+                        jobs.push_back({ pl.points, k, top ? erTopSolidInfill : erSolidInfill, &flow, top ? top_flow_scale : 1., false });
+                        if (top) top_fill_lines.push_back(pl);
                     }
                 }
             }
-            const Flow      &flow      = top ? top_flow : solid_flow;
-            // Inside the wall band the fill stops at the last loop; at an inner (kmin ramp) edge it runs to the edge.
-            const ExPolygons fill_area = top ? offset_ex(p.layer_footprint[k], -fill_inset_for(flow)) :
-                intersection_ex(offset_ex(p.layer_footprint[k], -float(0.5 * flow.scaled_spacing())), offset_ex(p.outer, -fill_inset_for(flow)));
-            const double     angle     = top_angle + (((P.n - 1 - k) % 2) ? 90. : 0.);
-            for (const ExPolygon &ex : fill_area) {
-                Polylines lines;
-                // The configured pattern first; a fill that fails falls back to plain monotonic lines.
-                for (InfillPattern pat : { top ? top_pattern : solid_pattern, ipMonotonic, ipRectilinear }) {
-                    std::unique_ptr<Fill> f(Fill::new_from_type(pat));
-                    f->set_bounding_box(object.bounding_box());
-                    f->layer_id        = host->id();
-                    f->z               = hz;
-                    f->spacing         = flow.spacing();
-                    f->angle           = float(Geometry::deg2rad(angle));
-                    f->fixed_angle     = true;
-                    f->link_max_length = coord_t(scale_(3. * f->spacing));
-                    f->overlap         = 0;
-                    FillParams fp;
-                    fp.density   = 1.f;
-                    fp.monotonic = true;
-                    Surface s(top ? stTop : stInternalSolid, ex);
-                    try { lines = f->fill_surface(&s, fp); } catch (InfillFailedException &) { lines.clear(); }
-                    if (! lines.empty())
-                        break;
-                }
-                for (const Polyline &pl : lines) {
-                    jobs.push_back({ pl.points, k, top ? erTopSolidInfill : erSolidInfill, &flow, top ? top_flow_scale : 1., false });
-                    if (top) top_fill_lines.push_back(pl);
-                }
-            }
-        }
 
-        // Gap fill: a neck or a small hole of the footprint leaves strips between the loops and the fill lines too
-        // narrow for a line, and the planar top under them is cut (tt_5: 20 mm2 of internal solid showing). Medial-axis
-        // lines, metered to the strip width, like a planar gap fill. On every curved layer (0.1.9, thin tops: a rim
-        // narrower than two walls gets the loops that fit and a centre line where none does).
-        for (int k = P.n - 1; k >= 0; -- k) {
-            const bool top = k == P.n - 1;
-            const Flow &gflow = top ? top_flow : solid_flow;
-            Polygons beads;
-            if (top) {
-                beads = offset(top_fill_lines, float(0.5 * top_flow.scaled_width()));
-                append(beads, offset(top_loop_lines, float(0.5 * perim_flow.scaled_width())));
-            } else
-                for (const Job &job : jobs)
-                    if (job.k == k && job.pts.size() >= 2) {
-                        Polyline pl(job.pts);
-                        if (job.closed) pl.points.push_back(job.pts.front());
-                        append(beads, offset(Polylines{ pl }, float(0.5 * job.flow->scaled_width())));
+            // Gap fill: a neck or a small hole of the footprint leaves strips between the loops and the fill lines too
+            // narrow for a line, and the planar top under them is cut (tt_5: 20 mm2 of internal solid showing). Medial-axis
+            // lines, metered to the strip width, like a planar gap fill. On every curved layer (0.1.9, thin tops: a rim
+            // narrower than two walls gets the loops that fit and a centre line where none does).
+            for (int k = P.n - 1; k >= 0; -- k) {
+                if (nonplanar_top_band_test_hook != nullptr)
+                    nonplanar_top_band_test_hook();
+                const bool top = k == P.n - 1;
+                const Flow &gflow = top ? top_flow : solid_flow;
+                Polygons beads;
+                if (top) {
+                    beads = offset(top_fill_lines, float(0.5 * top_flow.scaled_width()));
+                    append(beads, offset(top_loop_lines, float(0.5 * perim_flow.scaled_width())));
+                } else
+                    for (const Job &job : jobs)
+                        if (job.k == k && job.pts.size() >= 2) {
+                            Polyline pl(job.pts);
+                            if (job.closed) pl.points.push_back(job.pts.front());
+                            append(beads, offset(Polylines{ pl }, float(0.5 * job.flow->scaled_width())));
+                        }
+                ExPolygons gap_area = diff_ex(top ? p.footprint : p.layer_footprint[k], union_(beads));
+                // A deeper layer ends early on the clearance ramp, where the planar part stands higher: its gap fill keeps a
+                // bead away from that edge (it ran 0.12 mm under Benchy's planar wall there).
+                if (! top)
+                    gap_area = diff_ex(gap_area, offset_ex(diff_ex(p.outer, p.handoff[k].empty() ? p.layer_footprint[k] :
+                                                                   union_ex(p.layer_footprint[k], p.handoff[k])), float(gflow.scaled_width())));
+                const ExPolygons gaps = opening_ex(gap_area, float(scale_(0.05)));
+                for (const ExPolygon &gap : gaps) {
+                    ThickPolylines tps;
+                    gap.medial_axis(scale_(0.1), scale_(1.2), &tps);
+                    for (const ThickPolyline &tp : tps) {
+                        if (tp.points.size() < 2 || tp.length() < scale_(0.3))
+                            continue;
+                        double w = 0.;
+                        for (coordf_t v : tp.width) w += v;
+                        w = tp.width.empty() ? gflow.scaled_width() : w / tp.width.size();
+                        const double scale_w = std::clamp(w / gflow.scaled_width(), 0.25, 1.5);
+                        jobs.push_back({ tp.points, k, top ? erTopSolidInfill : erSolidInfill, &gflow, (top ? top_flow_scale : 1.) * scale_w, false });
+                        jobs.back().gap = true;
+                        if (top) top_fill_lines.push_back(Polyline(tp.points));
                     }
-            ExPolygons gap_area = diff_ex(top ? p.footprint : p.layer_footprint[k], union_(beads));
-            // A deeper layer ends early on the clearance ramp, where the planar part stands higher: its gap fill keeps a
-            // bead away from that edge (it ran 0.12 mm under Benchy's planar wall there).
-            if (! top)
-                gap_area = diff_ex(gap_area, offset_ex(diff_ex(p.outer, p.handoff[k].empty() ? p.layer_footprint[k] :
-                                                               union_ex(p.layer_footprint[k], p.handoff[k])), float(gflow.scaled_width())));
-            const ExPolygons gaps = opening_ex(gap_area, float(scale_(0.05)));
-            for (const ExPolygon &gap : gaps) {
-                ThickPolylines tps;
-                gap.medial_axis(scale_(0.1), scale_(1.2), &tps);
-                for (const ThickPolyline &tp : tps) {
-                    if (tp.points.size() < 2 || tp.length() < scale_(0.3))
-                        continue;
-                    double w = 0.;
-                    for (coordf_t v : tp.width) w += v;
-                    w = tp.width.empty() ? gflow.scaled_width() : w / tp.width.size();
-                    const double scale_w = std::clamp(w / gflow.scaled_width(), 0.25, 1.5);
-                    jobs.push_back({ tp.points, k, top ? erTopSolidInfill : erSolidInfill, &gflow, (top ? top_flow_scale : 1.) * scale_w, false });
-                    jobs.back().gap = true;
-                    if (top) top_fill_lines.push_back(Polyline(tp.points));
                 }
             }
+        } catch (const Slic3r::CriticalException &ex) {
+            BOOST_LOG_TRIVIAL(error) << "Nonplanar layers: the band of the curved top printed at z " << hz << " failed to fill ("
+                                     << ex.what() << "); it is dropped and the planar top surface is kept there.";
+            band_failed = true;
+        }
+        if (band_failed) {
+            // Nothing of this top has been committed yet: its shells, its cover and its clip all come below.
+            ++ stats.skipped_tops;
+            continue;
         }
 
         // Ironing over the top curved layer, on the surface itself, after it (in its layer). Same parameters as
@@ -1866,7 +2064,7 @@ static NonplanarTopStats np_build(PrintObject &object, const sla::IndexedMesh &m
                     fp.monotonic = true;
                     Surface sf(stTop, ex);
                     Polylines lines;
-                    try { lines = f->fill_surface(&sf, fp); } catch (InfillFailedException &) { lines.clear(); }
+                    try { lines = f->fill_surface(&sf, fp); } catch (const Slic3r::CriticalException &) { lines.clear(); }
                     for (const Polyline &pl : lines) {
                         Job j{ pl.points, P.n - 1, erIroning, &top_flow, 1., false };
                         j.mm3    = nozzle * ih;
@@ -2349,6 +2547,11 @@ static NonplanarTopStats np_build(PrintObject &object, const sla::IndexedMesh &m
                            held_islands.end());
         for (const HeldIsland &h : held_islands) {
             append(cut[h.layer], ExPolygons{ h.area });
+            // the layer under a held island pauses there: its surface is covered later, so it is not ironed
+            if (h.layer > 0) {
+                out.held_above.resize(layers.size());
+                out.held_above[h.layer - 1].push_back(h.area);
+            }
             // the layer over the host stands on the island's last held layer
             const int host = patches[h.pid].host;
             if (h.layer == host && host + 1 < int(layers.size())) {
@@ -2496,7 +2699,7 @@ static NonplanarTopStats np_build(PrintObject &object, const sla::IndexedMesh &m
                 fp.monotonic = true;
                 Surface sf(stInternalSolid, ex);
                 Polylines lines;
-                try { lines = fl->fill_surface(&sf, fp); } catch (InfillFailedException &) { lines.clear(); }
+                try { lines = fl->fill_surface(&sf, fp); } catch (const Slic3r::CriticalException &) { lines.clear(); }
                 for (Polyline &pl : lines)
                     hj.push_back({ std::move(pl), erSolidInfill, &solid_flow });
             }
@@ -2584,11 +2787,13 @@ static void np_object_mesh(const PrintObject &object, TriangleMesh &mesh, std::v
     for (const ModelVolume *v : object.model_object()->volumes)
         if (v->is_model_part() && (! object.is_segment() || segment_includes_volume(&*object.segment(), *v))) {
             TriangleMesh vol_mesh(v->mesh());
-            vol_mesh.transform(v->get_matrix());
+            // UNLAYERED_MOD -- keep a mirrored volume or instance outward-facing: the analysis reads the top
+            // from the face normals (log review 11/02: a mirrored part got no curved top, silently)
+            vol_mesh.transform(v->get_matrix(), true);
             mesh.merge(vol_mesh);
         }
     const Transform3d &trafo = object.object_to_slice();
-    mesh.transform(trafo);
+    mesh.transform(trafo, true);
     if (object.is_segment()) {
         const Eigen::Matrix3d a_inv_t = trafo.linear().inverse().transpose();
         for (const CutSegmentClip &clip : object.segment()->clips) {
@@ -2600,8 +2805,10 @@ static void np_object_mesh(const PrintObject &object, TriangleMesh &mesh, std::v
     }
 }
 
-std::string nonplanar_top_clip_slices(PrintObject &object)
+std::string nonplanar_top_clip_slices(PrintObject &object, size_t *skipped_tops)
 {
+    if (skipped_tops != nullptr)
+        *skipped_tops = 0;
     {
         std::lock_guard<std::mutex> lock(g_np_cache_mutex);
         g_np_cache.erase(&object);
@@ -2611,16 +2818,33 @@ std::string nonplanar_top_clip_slices(PrintObject &object)
     TriangleMesh                        tmesh;
     std::vector<Layer::ContourZCeiling> ceilings;
     np_object_mesh(object, tmesh, ceilings);
-    const Transform3d &trafo = object.object_to_slice();
-    if ((trafo.linear() * Vec3d::UnitZ()).normalized().z() < 1. - 1e-9 || (trafo.linear().transpose() * Vec3d::UnitZ()).normalized().z() < 1. - 1e-9)
-        return "the object is sliced in a tilted frame";
+    // UNLAYERED_MOD -- test the slice FRAME, not the part. object_to_slice() is the frame's rotation
+    // (layer_rotation_b/c, a cut segment's build normal, a belt) times the object's own placement
+    // object.trafo(), so a part that is merely rotated on the plate -- auto-orient, a rotated import --
+    // read as "tilted" and lost its nonplanar layers (2026-11-02) although it is sliced in flat,
+    // world-horizontal layers. np_object_mesh() already brings the mesh into the slice frame.
+    // A tilted frame works with the angle limits reduced by the tilt (np_build); only one tilted past the limit is skipped.
+    if (const double tilt = np_frame_tilt_deg(object); tilt > 1e-6) {
+        const PrintRegionConfig *rc = nullptr;
+        for (size_t r = 0; r < object.num_printing_regions() && rc == nullptr; ++ r)
+            if (object.printing_region(r).config().nonplanar_layers.value)
+                rc = &object.printing_region(r).config();
+        if (rc != nullptr) {
+            const double limit = nonplanar_effective_max_angle(*rc, object.print()->config());
+            if (limit - tilt < kFlatSlopeDeg)
+                return "this chunk is tilted " + std::to_string(int(std::lround(tilt))) + " degrees, more than its nonplanar angle limit of " +
+                       std::to_string(int(std::lround(limit))) + " degrees allows";
+        }
+    }
     if (tmesh.empty())
         return std::string();
     sla::IndexedMesh imesh(tmesh);
     imesh.ground_level_offset(-tmesh.bounding_box().min.z());
     auto        cached = std::make_shared<NpCached>();
     std::string skip;
-    np_build(object, imesh, tmesh.its, ceilings, *cached, skip);
+    const NonplanarTopStats stats = np_build(object, imesh, tmesh.its, ceilings, *cached, skip);
+    if (skipped_tops != nullptr)
+        *skipped_tops = stats.skipped_tops;
     if (! skip.empty()) {
         BOOST_LOG_TRIVIAL(info) << "Nonplanar layers skipped for " << object.model_object()->name << ": " << skip;
         if (std::getenv("NPTOP_DEBUG") != nullptr)
@@ -2634,6 +2858,23 @@ std::string nonplanar_top_clip_slices(PrintObject &object)
     std::lock_guard<std::mutex> lock(g_np_cache_mutex);
     g_np_cache[&object] = std::move(cached);
     return std::string();
+}
+
+ExPolygons nonplanar_held_above(const Layer &layer)
+{
+    std::shared_ptr<NpCached> cached;
+    {
+        std::lock_guard<std::mutex> lock(g_np_cache_mutex);
+        auto it = g_np_cache.find(layer.object());
+        if (it != g_np_cache.end()) cached = it->second;
+    }
+    if (! cached || cached->held_above.empty())
+        return ExPolygons();
+    const auto it = std::find(cached->layers.begin(), cached->layers.end(), &layer);
+    if (it == cached->layers.end())
+        return ExPolygons();
+    const size_t l = size_t(it - cached->layers.begin());
+    return l < cached->held_above.size() ? union_ex(cached->held_above[l]) : ExPolygons();
 }
 
 std::shared_ptr<const NonplanarZaaLimits> nonplanar_top_zaa_limits(const PrintObject &object)
@@ -2718,6 +2959,25 @@ void nonplanar_top_retype_surfaces(PrintObject &object)
                         if (s.surface_type != stBottom && s.surface_type != stBottomBridge) { out.push_back(std::move(s)); continue; }
                         for (ExPolygon &ex : diff_ex(s.expolygon, under)) out.emplace_back(s, std::move(ex));
                         for (ExPolygon &ex : intersection_ex(s.expolygon, under)) { out.emplace_back(s, std::move(ex)); out.back().surface_type = stInternalSolid; }
+                    }
+                    sc->surfaces = std::move(out);
+                }
+        }
+    // Hold-back, the other end: the layer a held island pauses on has nothing above it until the island resumes, so it
+    // was classified as a top. It is covered later, so it is plain sparse infill, as if the island were already above it:
+    // the infill grid is fixed per layer, so it runs on unbroken into the island; no top pattern, no solid band, no bridge
+    // over it, no ironing (2026-11-02).
+    if (cached->held_above.size() == layers.size())
+        for (size_t l = 0; l < layers.size(); ++ l) {
+            if (cached->held_above[l].empty()) continue;
+            const ExPolygons above = union_ex(cached->held_above[l]);
+            for (LayerRegion *layerm : layers[l]->regions())
+                for (SurfaceCollection *sc : { &layerm->slices, &layerm->fill_surfaces }) {
+                    Surfaces out;
+                    for (Surface &s : sc->surfaces) {
+                        if (s.surface_type != stTop) { out.push_back(std::move(s)); continue; }
+                        for (ExPolygon &ex : diff_ex(s.expolygon, above)) out.emplace_back(s, std::move(ex));
+                        for (ExPolygon &ex : intersection_ex(s.expolygon, above)) { out.emplace_back(s, std::move(ex)); out.back().surface_type = stInternal; }
                     }
                     sc->surfaces = std::move(out);
                 }

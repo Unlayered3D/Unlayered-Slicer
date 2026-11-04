@@ -93,8 +93,8 @@ enum WebAppBridgeError
 //     both default off): absent from `capabilities` and answered with 1005 while it is off, so a
 //     slicer with the opt-ins off behaves exactly as before they existed.
 //   - three deny lists no configuration widens: print-host addresses and credentials are neither
-//     read nor written; custom G-code and post_process are never written and read only on
-//     request; preset identity (inherits, printer_model, *_settings_id, compatibility ...) is
+//     read nor written; custom G-code is read only on request (and writable, so a preset can be
+//     converted to another firmware); post_process is never written; preset identity (inherits, printer_model, *_settings_id, compatibility ...) is
 //     never written. Read-only and plugin-backed options are never written either.
 //   - values cross the bridge as the .ini serialisation of a NAMED key, never as a
 //     DynamicPrintConfig dump: the page asks for keys and gets strings.

@@ -55,12 +55,15 @@ add_executable(${_TEST_NAME}_tests
     test_texture_island_view.cpp
     test_timelapse_codecs.cpp
     test_file_url.cpp
+    test_bambu_connect.cpp
     test_imgui_wrapper.cpp
     test_user_manager.cpp
     test_sequential_clearance.cpp
     test_object_list.cpp
     test_sys_files_updater.cpp
     test_usage_telemetry.cpp
+    test_ui_exception.cpp
+    test_crash_log_scrub.cpp
     test_webapp_preset_share.cpp
     test_privacy_consent.cpp
     test_app_updater_macos.cpp
@@ -82,6 +85,7 @@ add_executable(${_TEST_NAME}_tests
     test_firmware_bundle.cpp
     test_slice_warnings.cpp
     test_orient_scope.cpp
+    test_unlayered_account.cpp
     ../fff_print/test_helpers.cpp
     )
 

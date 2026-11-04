@@ -50,6 +50,7 @@
 #include "libslic3r/MultiMaterialSegmentation.hpp"
 #include "libslic3r/Slicing.hpp"
 #include "libslic3r/SurfaceCollection.hpp"
+#include "libslic3r/NonplanarTop.hpp" // UNLAYERED_MOD: nonplanar_held_above() for ironing
 
 namespace Slic3r::FillAdaptive { struct Octree; }
 namespace Slic3r::FillLightning { class Generator; }
@@ -2002,6 +2003,36 @@ void Layer::make_ironing()
             // BBS: ironing inset
             double ironing_areas_offset = ironing_params.inset == 0 ? float(scale_(0.5 * nozzle_dmr)) : scale_(ironing_params.inset);
 			ironing_areas = intersection_ex(polys, offset(this->lslices, - ironing_areas_offset));
+			// UNLAYERED_MOD -- nonplanar hold-back: where a held island continues later, this layer only pauses;
+			// its "top" gets covered, so it is not ironed (2026-11-02).
+			if (const ExPolygons held = nonplanar_held_above(*this); ! held.empty() && ! ironing_areas.empty())
+				ironing_areas = diff_ex(ironing_areas, held);
+			// UNLAYERED_MOD -- the base of the next cut-plane chunk: where this chunk's upper cut plane (a Ceiling clip)
+			// takes away the material just above this layer, that "top" is the floor the next chunk prints on, so it is
+			// not ironed (2026-11-02). Same frame mapping as slice_volumes(): the clip in object coordinates moved
+			// into the slice frame, traced at the next layer's slice plane.
+			if (! ironing_areas.empty() && this->object()->is_segment()) {
+				const Transform3d     &trafo   = this->object()->object_to_slice();
+				const Eigen::Matrix3d  a_inv_t = trafo.linear().inverse().transpose();
+				const double           z_next  = this->upper_layer != nullptr ? this->upper_layer->slice_z : this->slice_z + this->height;
+				ExPolygons             covered;
+				for (const CutSegmentClip &clip : this->object()->segment()->clips) {
+					if (clip.role != CutClipRole::Ceiling)
+						continue;
+					const Vec3d  n = a_inv_t * clip.normal;
+					const double d = clip.offset + n.dot(trafo.translation());
+					const Vec2d  ab(n.x(), n.y());
+					const double c = d - n.z() * z_next;
+					if (ab.squaredNorm() < 1e-12) {
+						// a level cut: the next layer is wholly past it or wholly not
+						if (c < 0.)
+							append(covered, ironing_areas);
+					} else
+						append(covered, clip_expolygons_by_half_plane(ExPolygons(ironing_areas), -ab, -c, get_extents(ironing_areas)));
+				}
+				if (! covered.empty())
+					ironing_areas = diff_ex(ironing_areas, covered);
+			}
 		}
 
         // Create the filler object.

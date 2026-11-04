@@ -492,6 +492,11 @@ public:
     // used "non-root segment" to mean "the floor is tilted", and the G-code stage un-rotates such
     // support like the object.
     bool  support_floor_is_tilted() const;
+    // UNLAYERED_MOD -- the root segment of an object lifted off a flat plate (auto-drop off): its
+    // lowest material sits more than a first-layer height above the plate, so its first layer is
+    // suspended exactly like a segment floating above its base plane. Its slice frame keeps the plate
+    // at a negative slice z (CutSegmentDescriptor::slice_z_base), so support can descend to it.
+    bool  root_floats_above_plate() const;
     // BELT_MOD -- the build plate (world z = 0) as a plane in this object's slice frame, in the
     // form n . (x, y, print_z) + k >= 0 for material above the plate, with XY in plate coordinates
     // and the lowest-sitting instance folded into k. Factored out of PrintObject::slice_volumes(),
