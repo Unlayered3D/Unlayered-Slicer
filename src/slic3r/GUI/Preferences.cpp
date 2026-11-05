@@ -86,6 +86,7 @@
 #include "slic3r/Utils/UsageTelemetry.hpp"
 #include "slic3r/Utils/PrivacyConsent.hpp"
 #include "slic3r/Utils/PrivacyChoiceStats.hpp"
+#include "slic3r/Utils/BambuConnect.hpp"
 #include "PrivacySetupDialog.hpp"
 #include "NetworkPluginDialog.hpp"
 #include "DownloadProgressDialog.hpp"
@@ -1217,6 +1218,11 @@ wxBoxSizer *PreferencesDialog::create_item_checkbox(wxString title, wxString too
         checkbox->SetValue(PrivacyConsent::program_permitted(*app_config));
         checkbox->Enable(PrivacyConsent::diagnostics_permitted(*app_config));
     }
+#if defined(_WIN32) || defined(__APPLE__)
+    // Unlayered: never set means on (BambuConnect::is_enabled); show that.
+    if (param == BambuConnect::CONFIG_KEY)
+        checkbox->SetValue(BambuConnect::is_enabled(app_config->get(param)));
+#endif
 
     m_sizer->Add(checkbox, 0, wxALIGN_CENTER);
 
@@ -3131,6 +3137,18 @@ void PreferencesDialog::create_items()
                                                           "and the same per layer and per object."),
                                                        "export_statistics");
     g_sizer->Add(item_export_statistics);
+
+#if defined(_WIN32) || defined(__APPLE__)
+    // Unlayered: Plater::open_in_bambu_connect, see Utils/BambuConnect.hpp
+    auto item_bambu_connect = create_item_checkbox(_L("Open in Bambu Connect (experimental)"),
+                                                   _L("Adds \"Open in Bambu Connect\" to the print menu for Bambu Lab printers (on by default). It exports the sliced plate "
+                                                      "and opens it in the Bambu Connect app, where you choose the printer and start the print. "
+                                                      "Once it is printing, you can follow and control it in the Bambu Handy app. "
+                                                      "Bambu Connect must be installed, and the printer bound to your Bambu account and connected "
+                                                      "to Bambu Cloud (LAN Only mode off)."),
+                                                   BambuConnect::CONFIG_KEY);
+    g_sizer->Add(item_bambu_connect);
+#endif
 
     //// DEVELOPER > Experimental Features
     g_sizer->Add(create_item_title(_L("Experimental Features")), 1, wxEXPAND);

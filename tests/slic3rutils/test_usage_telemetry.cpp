@@ -222,6 +222,60 @@ TEST_CASE("Usage diagnostics report a crash's phase, exception and location, and
 }
 
 
+// UNLAYERED_MOD 2026-11-02 (0.1.10) -- a customer's 0.1.8 closed 4 s into every launch with
+// "[json.exception.type_error.306] cannot use value() with discarded": an unreadable marker threw
+// in start() before it was removed, so the next launch met it again.
+TEST_CASE("Usage diagnostics survive an unreadable or malformed crash marker", "[UsageTelemetry]")
+{
+    const std::string old_data_dir = data_dir();
+    fs::path dir = fs::temp_directory_path() / fs::unique_path("usage-telemetry-%%%%-%%%%");
+    fs::create_directories(dir / "usage");
+    set_data_dir(dir.string());
+
+    AppConfig config;
+    config.set("usage_diagnostics_url", "http://127.0.0.1:9/api/slicer/telemetry");
+    grant(config);
+
+    auto write_marker = [&](const std::string &name, const std::string &body) {
+        std::ofstream out((dir / "usage" / name).string(), std::ios::binary);
+        out << body;
+    };
+    write_marker("session-empty.json", "");
+    write_marker("session-zeroed.json", std::string(64, '\0'));
+    write_marker("session-cut.json", "{\"pid\":123,\"version\":\"0.1.8\",\"sta");
+    write_marker("session-array.json", "[1,2,3]");
+    // Parses, but a field has the wrong type: value() throws type_error.302 on it.
+    write_marker("session-badtype.json", json{{"pid", 0x7ffffff2}, {"version", 18}, {"started", "soon"}, {"consented", true}}.dump());
+    // A good one beside them is still reported.
+    write_marker("session-crashed.json", json{{"pid", 0x7ffffff0}, {"version", "0.1.8"}, {"started", 1000}, {"alive", 31000},
+                                              {"phase", "slicing"}, {"exception", "0xC0000005"}, {"consented", true}}.dump());
+
+    REQUIRE_NOTHROW(UsageTelemetry::start(config, false));
+    if (UsageTelemetry::disabled_by_environment()) {
+        UsageTelemetry::shutdown();
+        set_data_dir(old_data_dir);
+        SKIP("UNLAYERED_NO_TELEMETRY is set on this machine");
+    }
+    for (const char *name : {"session-empty.json", "session-zeroed.json", "session-cut.json", "session-array.json",
+                             "session-badtype.json", "session-crashed.json"}) {
+        INFO(name);
+        CHECK(!fs::exists(dir / "usage" / name));
+    }
+    UsageTelemetry::shutdown();
+
+    std::vector<std::string> names = pending_event_names(dir);
+    CHECK(std::count(names.begin(), names.end(), "crash") == 1);
+
+    // And the launch after is clean too.
+    REQUIRE_NOTHROW(UsageTelemetry::start(config, false));
+    UsageTelemetry::shutdown();
+
+    set_data_dir(old_data_dir);
+    boost::system::error_code ec;
+    fs::remove_all(dir, ec);
+}
+
+
 // UNLAYERED_MOD 2026-10-11 (0.1.4) -- the update check sends the install id, and only while
 // diagnostics are on.
 TEST_CASE("Usage diagnostics give the install id out only while on", "[UsageTelemetry]")

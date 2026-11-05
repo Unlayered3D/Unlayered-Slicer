@@ -177,7 +177,8 @@ bool UnlayeredAccount::start_handoff(Handoff &out, std::string &error) const
             }
         })
         .on_error([&](std::string body, std::string err, unsigned status) {
-            error = status ? error_from_body(body, (boost::format("HTTP %1%") % status).str()) : err;
+            error           = status ? error_from_body(body, (boost::format("HTTP %1%") % status).str()) : err;
+            out.unreachable = status == 0;
         })
         .perform_sync();
     if (!ok)

@@ -228,6 +228,8 @@ void GLGizmoSkeleton::render_skeleton_cut_planes()
         return;
 
     const int inst_id       = m_c->selection_info()->get_active_instance();
+    if (inst_id < 0 || size_t(inst_id) >= mo->instances.size()) // UNLAYERED_MOD: no active instance
+        return;
     const Transform3d world = mo->instances[inst_id]->get_matrix();
     const Camera& camera    = wxGetApp().plater()->get_camera();
 
@@ -410,6 +412,8 @@ bool GLGizmoSkeleton::on_mouse(const wxMouseEvent& evt)
         return false;
 
     const int inst_id       = m_c->selection_info()->get_active_instance();
+    if (inst_id < 0 || size_t(inst_id) >= mo->instances.size()) // UNLAYERED_MOD: no active instance
+        return false;
     const Transform3d world = mo->instances[inst_id]->get_matrix();
     const Camera& camera    = wxGetApp().plater()->get_camera();
     const Vec2d mouse_pos(evt.GetX(), evt.GetY());
@@ -1197,8 +1201,9 @@ void GLGizmoSkeleton::render_cut_plane_input_window(CutConnectors& connectors, f
 
             m_imgui->disabled_begin(n_nodes == 0);
             if (m_imgui->button(_L("Step"))) {
-                if (m_c && m_c->selection_info() && m_c->selection_info()->model_object()) {
-                    const int inst_id  = m_c->selection_info()->get_active_instance();
+                if (const int inst_id = m_c && m_c->selection_info() ? m_c->selection_info()->get_active_instance() : -1;
+                    inst_id >= 0 && m_c->selection_info()->model_object() &&
+                    size_t(inst_id) < m_c->selection_info()->model_object()->instances.size()) { // UNLAYERED_MOD: no active instance
                     m_preview_world    = m_c->selection_info()->model_object()->instances[inst_id]->get_matrix();
                     m_preview_edges    = build_cut_edges(m_preview_world);
                     m_preview_step     = m_preview_edges.empty() ? -1 : 0;

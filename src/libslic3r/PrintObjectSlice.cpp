@@ -56,8 +56,15 @@ namespace Slic3r {
 bool PrintObject::clip_multipart_objects = true;
 bool PrintObject::infill_only_where_needed = false;
 
-static coordf_t compute_slice_z(PrintObject* print_object, size_t i_layer, coordf_t lo, coordf_t hi)
+// Z contouring slices a layer near its bottom instead of at its middle, at the smallest configured
+// minimum Z height of the object's regions above the layer's bottom. That minimum is a setting, not
+// a property of this layer, so a layer thinner than it has no such plane -- variable layer height,
+// the slivers a cut plane leaves, the thin planar layer under a nonplanar hold-back. Such a layer
+// is sliced at its middle, as it would be without Z contouring, and `out_too_thin` says so; failing
+// the whole slice over one layer the setting does not fit is never the better answer.
+static coordf_t compute_slice_z(PrintObject* print_object, size_t i_layer, coordf_t lo, coordf_t hi, bool &out_too_thin)
 {
+    out_too_thin      = false;
     bool zaa_active   = false;
     coordf_t z_offset = 0.0;
 
@@ -76,10 +83,11 @@ static coordf_t compute_slice_z(PrintObject* print_object, size_t i_layer, coord
     }
 
     coordf_t slice_z = lo + z_offset;
-    if ((slice_z < lo && !is_approx(slice_z, lo)) || (slice_z > hi && !is_approx(slice_z, hi))) {
-        throw RuntimeError("Bad min Z value");
+    if (slice_z > hi && !is_approx(slice_z, hi)) {
+        out_too_thin = true;
+        return 0.5 * (lo + hi);
     }
-    return slice_z;
+    return std::max(slice_z, lo);
 }
 
 LayerPtrs new_layers(
@@ -92,10 +100,13 @@ LayerPtrs new_layers(
     auto     id   = int(print_object->slicing_parameters().raft_layers());
     coordf_t zmin = print_object->slicing_parameters().object_print_z_min;
     Layer   *prev = nullptr;
+    size_t   num_too_thin = 0;
     for (size_t i_layer = 0; i_layer < object_layers.size(); i_layer += 2) {
         coordf_t lo = object_layers[i_layer];
         coordf_t hi = object_layers[i_layer + 1];
-        coordf_t slice_z = compute_slice_z(print_object, i_layer, lo, hi);
+        bool     too_thin = false;
+        coordf_t slice_z = compute_slice_z(print_object, i_layer, lo, hi, too_thin);
+        num_too_thin += too_thin ? 1 : 0;
 
         Layer *layer = new Layer(id ++, print_object, hi - lo, hi + zmin, slice_z);
         out.emplace_back(layer);
@@ -105,6 +116,13 @@ LayerPtrs new_layers(
         }
         prev = layer;
     }
+    // Once per object: the layers printed are correct, but their surfaces come off a plane the
+    // Z contouring settings did not ask for, so the setting that no longer fits has to be visible.
+    if (num_too_thin > 0)
+        BOOST_LOG_TRIVIAL(warning) << "Z contouring: object " << print_object->id().id << " has "
+                                   << num_too_thin << " of " << out.size()
+                                   << " layers thinner than the configured minimum Z height; "
+                                   << "slicing those at the middle of the layer";
     return out;
 }
 
@@ -984,11 +1002,19 @@ static bool tilted_on_flat_bed(const PrintObject &object)
     return (layer_rotation_trafo(object.print()->config(), object.config()).linear() * Vec3d::UnitZ()).z() < 1. - EPSILON;
 }
 
-// A tilted object (above) that reaches below the plate: its frame is rebased onto its own minimum and
-// slice_volumes() clips it at the plate.
+// A tilted object (above) that reaches below the plate: its frame is rebased onto its own minimum.
+// UNLAYERED_MOD -- measured on THIS PrintObject's instance, like the pivot and the z floor in
+// update_slice_frame below: bounding_box_exact() spans every instance of the object, and an object
+// sliced in a rotated frame gets one PrintObject per instance (PrintApply.cpp), so the object-wide
+// box can decide this for a copy it does not describe.
 static bool tilted_and_sunk(const PrintObject &object)
 {
-    return tilted_on_flat_bed(object) && object.model_object()->bounding_box_exact().min.z() < - EPSILON;
+    if (! tilted_on_flat_bed(object))
+        return false;
+    const BoundingBoxf3 box = object.instances().empty() ?
+        object.model_object()->bounding_box_exact() :
+        object.model_object()->instance_bounding_box(*object.instances().front().model_instance);
+    return box.min.z() < - EPSILON;
 }
 
 void PrintObject::update_slice_frame()
@@ -1242,10 +1268,16 @@ void PrintObject::slice()
     // UNLAYERED_MOD: nonplanar layers -- the planar part under a curved top is the model with its top T lower,
     // clipped here, before perimeters and infill, so it gets normal walls and its own top layers.
     if (nonplanar_top_requested(*this)) {
-        const std::string skip = nonplanar_top_clip_slices(*this);
+        size_t            skipped_tops = 0;
+        const std::string skip         = nonplanar_top_clip_slices(*this, &skipped_tops);
         if (! skip.empty())
             this->active_step_add_warning(PrintStateBase::WarningLevel::NON_CRITICAL,
                 Slic3r::format(_u8L("Nonplanar layers skipped for %1%: %2%. It prints with normal planar layers."), this->model_object()->name, skip));
+        else if (skipped_tops > 0)
+            // A band that could not be filled is dropped; the planar top surface it would have replaced is kept.
+            this->active_step_add_warning(PrintStateBase::WarningLevel::NON_CRITICAL,
+                Slic3r::format(_u8L("Nonplanar layers: %1% curved top surface(s) of %2% could not be built. They print with normal planar layers."),
+                               skipped_tops, this->model_object()->name));
         m_print->throw_if_canceled();
     }
     int firstLayerReplacedBy = 0;
@@ -1803,13 +1835,21 @@ void PrintObject::slice_volumes()
         }
     }
 
-    // UNLAYERED_MOD -- the build plate as a clip for a SUNK object with a whole-object layer rotation
+    // UNLAYERED_MOD -- the build plate as a clip for an object with a whole-object layer rotation
     // (see update_slice_frame). Keeps world z >= h/2 * cos(tilt) at each slice plane, so no bead
     // reaches below the plate, the same margin as a cut segment's Bed clip. Leading layers it empties
     // are dropped HERE, before the per-volume slices are copied for brim grouping and handed to the
-    // regions, so every per-layer array stays aligned. An object resting on the plate skips all this
-    // and keeps its exact old toolpaths.
-    if (tilted_and_sunk(*this) && ! m_layers.empty()) {
+    // regions, so every per-layer array stays aligned.
+    //
+    // Gated on the layer rotation alone, NOT on the object also being sunk: the rebase in
+    // update_slice_frame only lands one extreme point of the ROTATED box on slice z = 0, which says
+    // nothing about where the rest of the tilted slab -- or the bead around it -- sits relative to the
+    // bed plane, and the export refuses the whole slice over a single Z below it (Print.cpp). The
+    // plate is the one surface nothing may cross, so it is clipped against for every tilted object,
+    // sunk or resting. The clip is an intersection with the bed half-plane, so it is the identity for
+    // material already above the margin, and planar objects are untouched (tilted_on_flat_bed is
+    // false for them); a tilted object no longer keeps its exact old toolpaths near the plate.
+    if (tilted_on_flat_bed(*this) && ! m_layers.empty()) {
         Vec3d  n_bed;
         double k_bed;
         this->bed_plane_in_slice_frame(n_bed, k_bed);

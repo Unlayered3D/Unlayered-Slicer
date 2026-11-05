@@ -6275,13 +6275,12 @@ PageShp TabPrinter::build_kinematics_page()
     optgroup->append_single_option_line("nonplanar_departure_distance", "multiplanar_tutorial#printer-settings");
     optgroup->append_single_option_line("nonplanar_approach_distance", "multiplanar_tutorial#printer-settings");
     optgroup->append_single_option_line("nonplanar_nozzle_to_b_axis", "multiplanar_tutorial#printer-settings");
-    // Hotend model for the post-slice collision check.
-    optgroup->append_single_option_line("nonplanar_hotend_cone_height", "multiplanar_tutorial#printer-settings");
-    // Four sides, because a real toolhead is not round (HotendEnvelope, PrintConfig.hpp).
-    optgroup->append_single_option_line("nonplanar_hotend_angle_xpos", "multiplanar_tutorial#printer-settings");
-    optgroup->append_single_option_line("nonplanar_hotend_angle_xneg", "multiplanar_tutorial#printer-settings");
-    optgroup->append_single_option_line("nonplanar_hotend_angle_ypos", "multiplanar_tutorial#printer-settings");
-    optgroup->append_single_option_line("nonplanar_hotend_angle_yneg", "multiplanar_tutorial#printer-settings");
+    // Hotend model for the post-slice collision check. Four sides, because a real toolhead is not
+    // round (HotendEnvelope, PrintConfig.hpp). Per nozzle: index 0 registers them as variant options,
+    // which switch_excluder() re-targets to the nozzle picked on the Main / Auxiliary switch, the way
+    // the machine limits further down this page are; a single-nozzle printer shows no switch.
+    for (const std::string& key : HotendEnvelope::option_keys())
+        optgroup->append_single_option_line(key, "multiplanar_tutorial#printer-settings", 0);
     // Virtual-only safety limits; hidden unless Printer type = Virtual (see toggle_line below).
     // The gantry height comes first because it switches on the gantry term of the derived tilt
     // limit; with it unset only the hotend envelope above and the two below limit the tilt.
@@ -7444,12 +7443,13 @@ void TabPrinter::toggle_options()
         for (auto opt : {"axis_selection",
                          "axis_a_rotation_min", "axis_b_rotation_min", "axis_c_rotation_min",
                          "nonplanar_departure_distance", "nonplanar_approach_distance",
-                         "nonplanar_nozzle_to_b_axis", "nonplanar_hotend_cone_height",
-                         "nonplanar_hotend_angle_xpos", "nonplanar_hotend_angle_xneg",
-                         "nonplanar_hotend_angle_ypos", "nonplanar_hotend_angle_yneg",
+                         "nonplanar_nozzle_to_b_axis",
                          "nonplanar_gantry_height",
                          "nonplanar_virtual_max_angle", "nonplanar_virtual_max_z"})
             toggle_line(opt, enable_nonplanar);
+        // The per-nozzle hotend envelope lines are registered at index 0 (see build_kinematics_page).
+        for (const std::string& opt : HotendEnvelope::option_keys())
+            toggle_line(opt, enable_nonplanar, 0);
         // UNLAYERED_MOD -- the A/C machine geometry only means something on an A/C printer.
         {
             // A/B (0.1.4, a rough guess) reuses the same geometry: the pivot height and its offset.
@@ -9844,8 +9844,13 @@ void Tab::switch_excluder(int extruder_id, bool reload)
                 }
 
                 if (opt.second.second >= 0) {
-                    const_cast<int &>(opt.second.second) = page_index;
-                    page->m_opt_id_map.insert({opt.second.first + "#" + std::to_string(page_index), opt.first});
+                    // Orca: Motion ability holds the machine limits (two values per variant) and, since
+                    // Unlayered made the hotend envelope per nozzle, single-value variant options too.
+                    int idx = page_index;
+                    if (page->title().StartsWith("Motion ability") && printer_options_with_variant_1.count(opt.second.first) > 0)
+                        idx = get_index_for_extruder(extruder_id == -1 ? 0 : extruder_id);
+                    const_cast<int &>(opt.second.second) = idx;
+                    page->m_opt_id_map.insert({opt.second.first + "#" + std::to_string(idx), opt.first});
                     group->draw_multi_extruder = variant_switch_active();
                 }
             }
@@ -9867,9 +9872,11 @@ void Tab::sync_excluder()
     auto nozzle_volumes = m_preset_bundle->project_config.option<ConfigOptionEnumsGeneric>("nozzle_volume_type");
     auto extruders      = printer_preset.config.option<ConfigOptionEnumsGeneric>("extruder_type");
     // Motion ability options hold a (normal, silent) pair per variant, so switch_excluder indexes that page with stride 2.
-    const int stride = m_active_page->title().StartsWith("Motion ability") ? 2 : 1;
+    // Unlayered: except the per-nozzle hotend envelope there, one value per variant (printer_options_with_variant_1).
+    const bool motion_page = m_active_page->title().StartsWith("Motion ability");
+    const int  page_stride = motion_page ? 2 : 1;
     auto get_index_for_extruder =
-            [this, &extruders, stride, variant_keys = extruder_variant_keys[m_type >= Preset::TYPE_COUNT ? Preset::TYPE_PRINT : m_type]](int extruder_id, NozzleVolumeType nozzle_type) {
+            [this, &extruders, variant_keys = extruder_variant_keys[m_type >= Preset::TYPE_COUNT ? Preset::TYPE_PRINT : m_type]](int extruder_id, NozzleVolumeType nozzle_type, int stride) {
         return m_config->get_index_for_extruder(extruder_id + 1, variant_keys.first,
             ExtruderType(extruders->values[extruder_id]), nozzle_type, variant_keys.second, stride);
     };
@@ -9879,10 +9886,12 @@ void Tab::sync_excluder()
     if (!get_extruder_sync_enable_state(active_index))
         return;
     auto active_nozzle = get_actual_nozzle_volume_type(active_index);
-    int from_index = get_index_for_extruder(active_index, active_nozzle);
-    int dest_index = get_index_for_extruder(1 - active_index, active_nozzle);
+    int from_index = get_index_for_extruder(active_index, active_nozzle, page_stride);
+    int dest_index = get_index_for_extruder(1 - active_index, active_nozzle, page_stride);
     if (from_index < 0 || dest_index < 0) // no variant column for this nozzle on one of the extruders
         return;
+    const int from_index_1 = motion_page ? get_index_for_extruder(active_index, active_nozzle, 1) : from_index;
+    const int dest_index_1 = motion_page ? get_index_for_extruder(1 - active_index, active_nozzle, 1) : dest_index;
     auto dirty_options = m_presets->current_dirty_options(true);
     DynamicConfig config_origin, config_to_apply;
     for (int i = 0; i < dirty_options.size(); ++i) {
@@ -9890,14 +9899,20 @@ void Tab::sync_excluder()
         auto n= opt.find('#');
         if (n == std::string::npos)
             continue;
-        auto field = m_active_page->get_field(opt.substr(0, n), from_index + 256);
-        auto line  = m_active_page->get_line(opt.substr(0, n), from_index + 256);
+        const bool single_value = motion_page && printer_options_with_variant_1.count(opt.substr(0, n)) > 0;
+        const int  stride = single_value ? 1 : page_stride;
+        const int  from   = single_value ? from_index_1 : from_index;
+        const int  dest   = single_value ? dest_index_1 : dest_index;
+        if (from < 0 || dest < 0)
+            continue;
+        auto field = m_active_page->get_field(opt.substr(0, n), from + 256);
+        auto line  = m_active_page->get_line(opt.substr(0, n), from + 256);
         if (field == nullptr || line == nullptr)
             continue;
         ++n;
         auto is_from_slot = [&](const std::string &dirty_opt) {
             int slot = std::atoi(dirty_opt.c_str() + n);
-            return slot >= from_index && slot < from_index + stride;
+            return slot >= from && slot < from + stride;
         };
         bool dirty = is_from_slot(opt);
         while (i + 1 < dirty_options.size() && dirty_options[i + 1].compare(0, n, opt, 0, n) == 0) {
@@ -9909,7 +9924,7 @@ void Tab::sync_excluder()
             auto option = dynamic_cast<ConfigOptionVectorBase*>(m_config->option(key));
             auto option2 = dynamic_cast<ConfigOptionVectorBase*>(option->clone());
             for (int s = 0; s < stride; ++s)
-                option2->set_at(option, dest_index + s, from_index + s);
+                option2->set_at(option, dest + s, from + s);
             if (*option == *option2) {
                 delete option2;
                 continue;

@@ -844,6 +844,10 @@ set(SLIC3R_GUI_SOURCES
     Utils/UnlayeredAccount.cpp
     Utils/UnlayeredAccount.hpp
     Utils/AsioUtils.hpp
+    Utils/UiException.cpp
+    Utils/UiException.hpp
+    Utils/CrashLogScrub.cpp
+    Utils/CrashLogScrub.hpp
     Utils/UsageTelemetry.cpp
     Utils/UsageTelemetry.hpp
     Utils/PrivacyConsent.cpp
@@ -889,6 +893,8 @@ set(SLIC3R_GUI_SOURCES
     Utils/NonplanarSliceClient.hpp
     Utils/ServiceRefusal.cpp
     Utils/ServiceRefusal.hpp
+    Utils/BambuConnect.cpp
+    Utils/BambuConnect.hpp
     Utils/FirmwareBundle.cpp
     Utils/FirmwareBundle.hpp
     Utils/SysFilesBundle.cpp
@@ -1024,6 +1030,7 @@ if (APPLE)
     list(APPEND SLIC3R_GUI_SOURCES
             Utils/RetinaHelperImpl.mm
             Utils/MacDarkMode.mm
+            Utils/BambuConnectMac.mm
             GUI/RemovableDriveManagerMM.mm
             GUI/RemovableDriveManagerMM.h
             GUI/Mouse3DHandlerMac.mm

@@ -30,6 +30,7 @@
 #include "libslic3r/Preset.hpp"
 #include "libslic3r/Utils.hpp"
 #include "libslic3r_version.h"
+#include "CrashLogScrub.hpp"
 #include "DiagnosticsAllowlist.hpp"
 #include "Http.hpp"
 #include "PrivacyConsent.hpp"
@@ -80,6 +81,15 @@ constexpr int64_t HANG_AFTER_MS = 30 * 1000;
 // the minute rather than to the 5-minute flush.
 constexpr int64_t ALIVE_EVERY_MS = 60 * 1000;
 
+// 0.1.10: a crash that is sent also sends the end of that session's log, scrubbed on this computer
+// (CrashLogScrub), to /api/slicer/crash-log on the same site, joined to the crash event by report_id.
+struct CrashLog
+{
+    std::string report_id;
+    std::string log_path; // UTF-8; empty when that session's log could not be found
+    json        crash;    // the allow-listed "crash" props
+};
+
 struct State
 {
     std::mutex        mutex;
@@ -101,6 +111,10 @@ struct State
     // Crashes found at start() that diagnostics did not cover: offered to the person, once
     // (unreported_crashes / answer_unreported_crashes). Allow-listed "crash" props, newest last.
     std::vector<json>          crash_offers;
+    std::vector<CrashLog>      crash_offer_logs; // one per crash_offers entry, same order
+    // This session's log file name ("debug_Mon_Nov_02_10_00_00_1234.log.0"), kept in the crash marker
+    // so the next launch can find it. Empty when unknown or not a plain name.
+    std::string                log_file;
     std::vector<std::string>   pending;   // batch bodies a failed send left for later
     std::map<int, std::string> in_flight; // bodies being sent in the background
     int                        next_id{0};
@@ -308,8 +322,11 @@ void write_file(const fs::path &path, const std::string &content)
 struct CrashMarker
 {
     char path[1024]   = {0}; // UTF-8 path of this session's marker
+    char tmp_path[1040] = {0}; // written first, then renamed over path
     char version[32]  = {0};
     char phase[32]    = {0};
+    char what[176]    = {0}; // note_exception(): "type: message", JSON-safe
+    char log[160]     = {0}; // State::log_file: letters, digits, '.', '_' and '-' only, so no JSON escaping
     long long started = 0;
     long long alive   = 0;
     bool consented    = false; // see write_marker_locked()
@@ -329,6 +346,8 @@ void write_marker_locked(State &s)
     // ever reported; one that ran before the person said yes stays theirs.
     json marker = {{"pid", current_pid()}, {"version", s.version}, {"started", s.started_ms},
                    {"alive", alive},       {"phase", s.phase},     {"consented", s.on.load()}};
+    if (!s.log_file.empty())
+        marker["log"] = s.log_file;
     // A session that dies while frozen (typically force-quit) is a hang, not a crash. A crash
     // handler that runs later rewrites the marker with the signal or exception instead.
     if (s.hung) {
@@ -339,8 +358,11 @@ void write_marker_locked(State &s)
     write_file(marker_path(s.session), marker.dump());
     s.alive_written_ms = steady_ms();
     copy_cstr(g_crash_marker.path, sizeof(g_crash_marker.path), marker_path(s.session).string());
+    // Not write_file()'s ".tmp": the watchdog may be inside write_file() when a crash comes.
+    copy_cstr(g_crash_marker.tmp_path, sizeof(g_crash_marker.tmp_path), marker_path(s.session).string() + ".crash.tmp");
     copy_cstr(g_crash_marker.version, sizeof(g_crash_marker.version), s.version);
     copy_cstr(g_crash_marker.phase, sizeof(g_crash_marker.phase), s.phase);
+    copy_cstr(g_crash_marker.log, sizeof(g_crash_marker.log), s.log_file.size() < sizeof(g_crash_marker.log) ? s.log_file : std::string());
     g_crash_marker.started = s.started_ms;
     g_crash_marker.alive   = alive;
     g_crash_marker.consented = s.on.load();
@@ -406,27 +428,31 @@ void write_crash_marker(const char *exception, const char *at)
     std::snprintf(where, sizeof(where), "%s", at ? at : "");
     sanitize_token(exc);
     sanitize_token(where);
-    char body[768];
+    char body[1024];
     const int n = std::snprintf(body, sizeof(body),
                                 "{\"pid\":%ld,\"version\":\"%s\",\"started\":%lld,\"alive\":%lld,\"phase\":\"%s\","
-                                "\"exception\":\"%s\",\"at\":\"%s\",\"consented\":%s}",
+                                "\"exception\":\"%s\",\"at\":\"%s\",\"what\":\"%s\",\"log\":\"%s\",\"consented\":%s}",
                                 current_pid(), g_crash_marker.version, g_crash_marker.started, g_crash_marker.alive,
-                                g_crash_marker.phase, exc, where, g_crash_marker.consented ? "true" : "false");
+                                g_crash_marker.phase, exc, where, g_crash_marker.what, g_crash_marker.log,
+                                g_crash_marker.consented ? "true" : "false");
     if (n <= 0)
         return;
     const size_t len = std::min<size_t>(size_t(n), sizeof(body) - 1);
+    // 0.1.10: to a temporary file, then renamed over the marker. Written in place, a process that
+    // died mid-write left a cut-off marker in place of the good one write_marker_locked() kept.
 #ifdef _WIN32
-    if (FILE *f = std::fopen(g_crash_marker.path, "wb")) {
-        std::fwrite(body, 1, len, f);
-        std::fclose(f);
+    if (FILE *f = std::fopen(g_crash_marker.tmp_path, "wb")) {
+        const bool whole = std::fwrite(body, 1, len, f) == len;
+        if (std::fclose(f) == 0 && whole)
+            ::MoveFileExA(g_crash_marker.tmp_path, g_crash_marker.path, MOVEFILE_REPLACE_EXISTING);
     }
 #else
-    // open/write, not stdio: this runs in a signal handler.
-    const int fd = ::open(g_crash_marker.path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    // open/write/rename, not stdio: this runs in a signal handler.
+    const int fd = ::open(g_crash_marker.tmp_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (fd >= 0) {
-        const ssize_t written = ::write(fd, body, len);
-        (void) written;
-        ::close(fd);
+        const bool whole = ::write(fd, body, len) == ssize_t(len);
+        if (::close(fd) == 0 && whole)
+            ::rename(g_crash_marker.tmp_path, g_crash_marker.path);
     }
 #endif
 }
@@ -955,6 +981,106 @@ bool send(const std::string &body, bool sync)
     return delivered->load();
 }
 
+// The site (POST /api/slicer/crash-log) takes a log of at most 300 KB and a body of at most 400 KB.
+constexpr size_t CRASH_LOG_MAX_SENT_BYTES  = 290 * 1024;
+constexpr size_t CRASH_LOG_MAX_BODY_BYTES  = 390 * 1024;
+
+// Drops whole lines from the start of `text` until it is at most `max` bytes.
+void keep_last_lines(std::string &text, size_t max)
+{
+    if (text.size() <= max)
+        return;
+    const size_t from = text.size() - max;
+    const size_t nl   = text.find('\n', from > 0 ? from - 1 : 0);
+    text.erase(0, nl == std::string::npos ? text.size() : nl + 1);
+}
+
+// The end of a crashed session's log, scrubbed here, sent once in the background, never retried.
+// `require_on`: a crash that usage diagnostics cover (sent unasked) goes only while they still run;
+// one the person agreed to send in the crash report dialog goes whatever the diagnostics choice.
+// Nothing is sent without a log, or when the URL cannot be made.
+void upload_crash_log(CrashLog log, const std::string &telemetry_url, const std::string &app_version, const std::string &os,
+                      const std::string &channel, bool require_on)
+{
+    const std::string url = crash_log_url(telemetry_url);
+    if (url.empty() || log.log_path.empty() || log.report_id.empty())
+        return;
+    std::thread([log = std::move(log), url, app_version, os, channel, require_on]() {
+        try {
+            if (require_on && !state().on)
+                return;
+            LogTail tail;
+            if (!read_log_tail(log.log_path, tail))
+                return;
+            std::string text = scrub_log_for_upload(std::move(tail.text), ScrubContext::from_environment());
+            // Replacements can make a line longer than it was.
+            const size_t scrubbed_size = text.size();
+            keep_last_lines(text, CRASH_LOG_MAX_SENT_BYTES);
+            const bool truncated = tail.truncated || text.size() < scrubbed_size;
+
+            json crash = json::object();
+            for (const char *key : {"phase", "exception", "at"})
+                if (log.crash.contains(key) && log.crash[key].is_string())
+                    crash[key] = log.crash[key];
+            if (log.crash.contains("uptime_s") && log.crash["uptime_s"].is_number())
+                crash["uptime_s"] = log.crash["uptime_s"];
+            std::string version = log.crash.value("version", std::string());
+            if (version.empty())
+                version = app_version;
+
+            std::string body;
+            for (int attempt = 0; attempt < 8; ++attempt) {
+                const json payload = {{"v", 1},
+                                      {"report_id", log.report_id},
+                                      {"version", version},
+                                      {"os", os},
+                                      {"channel", channel},
+                                      {"crash", crash},
+                                      {"log", text},
+                                      {"log_bytes_original", tail.original_bytes},
+                                      {"truncated", truncated || attempt > 0}};
+                // Invalid UTF-8 in a log line becomes U+FFFD instead of failing the dump.
+                body = payload.dump(-1, ' ', false, json::error_handler_t::replace);
+                if (body.size() <= CRASH_LOG_MAX_BODY_BYTES)
+                    break;
+                // JSON escaping (control characters) made it too big: send less of the log.
+                keep_last_lines(text, text.size() / 2);
+                body.clear();
+            }
+            if (body.empty() || (require_on && !state().on))
+                return;
+
+            auto http = Http::post(url);
+            http.header("Content-Type", "application/json")
+                .set_post_body(body)
+                .timeout_connect(10)
+                .timeout_max(60)
+                .tls_verify(true)
+                .on_complete([](std::string, unsigned status) {
+                    BOOST_LOG_TRIVIAL(info) << "crash report: session log sent, status " << status;
+                })
+                .on_error([](std::string, std::string error, unsigned status) {
+                    BOOST_LOG_TRIVIAL(info) << "crash report: session log not delivered, status " << status << ", " << error;
+                })
+                .perform_sync();
+        } catch (const std::exception &e) {
+            BOOST_LOG_TRIVIAL(info) << "crash report: session log not sent, " << e.what();
+        } catch (...) {
+        }
+    }).detach();
+}
+
+// A log file name safe to keep in the crash marker unescaped (the crash handlers write it raw).
+std::string plain_log_name(const std::string &name)
+{
+    if (name.empty() || name.size() >= 160)
+        return {};
+    for (unsigned char c : name)
+        if (!(std::isalnum(c) || c == '.' || c == '_' || c == '-'))
+            return {};
+    return name;
+}
+
 } // namespace
 
 namespace {
@@ -1059,7 +1185,7 @@ static void load_install_id_locked(State &s, AppConfig &config)
 void start(AppConfig &config, bool first_run)
 {
     State &s = state();
-    std::lock_guard<std::mutex> lock(s.mutex);
+    std::unique_lock<std::mutex> lock(s.mutex);
     if (s.started)
         return;
     // Whatever an earlier start()/shutdown() pair left is on disk now, and is read back below.
@@ -1075,6 +1201,8 @@ void start(AppConfig &config, bool first_run)
     s.os         = os_name();
     s.started_at = std::chrono::steady_clock::now();
     s.session    = new_uuid();
+    // This session's log (GUI_App opened it before this), kept in the crash marker (0.1.10).
+    s.log_file   = plain_log_name(get_log_file_name().filename().string());
 
     std::string url = config.get("usage_diagnostics_url");
     s.url = url.empty() ? DEFAULT_URL : url;
@@ -1100,61 +1228,90 @@ void start(AppConfig &config, bool first_run)
     // A marker left by a process that no longer runs is a session that never reached shutdown().
     // A marker whose process still runs is a second copy of the app, open right now.
     std::vector<fs::path> markers; // collected first: they are deleted below
+    std::vector<CrashLog> covered_logs; // sent once the mutex is released, below
+    const std::string     log_dir = (fs::path(data_dir()) / "log").string();
+    // "debug_..._1234.log." of this session's own log, which is never a crashed session's.
+    const std::string     own_log_stem = s.log_file.substr(0, s.log_file.find_last_of('.') + 1);
     for (fs::directory_iterator it(usage_dir(), ec), end; !ec && it != end; it.increment(ec)) {
         const std::string file = it->path().filename().string();
         if (file.rfind("session-", 0) == 0 && it->path().extension() == ".json")
             markers.push_back(it->path());
     }
     for (const fs::path &marker_file : markers) {
-        json marker = json::parse(read_file(marker_file), nullptr, false);
-        long pid    = marker.is_object() ? marker.value("pid", 0L) : 0L;
-        if (pid != 0 && pid != current_pid() && process_alive(pid))
-            continue;
-        // The operating system ended that session (end_session_by_os): not a crash.
-        const bool os_ended  = marker.is_object() && marker.value("phase", std::string()) == "os_session_end";
-        const bool consented = marker.is_object() && marker.value("consented", false);
-        // Covered: diagnostics were shared in that session and are shared now - reported as before.
-        // Otherwise the person is asked once whether to send this one report (unreported_crashes).
-        const bool covered = s.on && consented;
-        const bool ask     = !covered && !s.env_off && PrivacyConsent::legal_approvals().crash_report_prompt;
-        if (!os_ended && (covered || ask)) {
-#ifdef _WIN32
-            // Our crash filter never ran (a fast fail, a stack overflow, heap corruption, or the
-            // person ended it while it hung): ask Windows how that process ended.
-            if (marker.value("exception", std::string()).empty() && pid > 0) {
-                std::string exception, where;
-                if (windows_crash_record(pid, marker.value("started", int64_t(0)), exception, where)) {
-                    marker["exception"]   = exception;
-                    marker["at"]          = where;
-                    marker["recorded_by"] = "windows";
-                }
-            }
-#endif
-            json props = {{"version", marker.value("version", std::string())}};
-            // Where it was and what ended it (older markers have neither).
-            for (const char *key : {"phase", "exception", "at", "recorded_by"})
-                if (marker.contains(key) && marker[key].is_string() && !marker[key].get<std::string>().empty()) {
-                    std::string value = marker[key].get<std::string>();
-                    if (value.size() > 190) {
-                        // A caller chain is cut at a frame boundary, never inside "module+0x...".
-                        const size_t frame = value.rfind('>', 190);
-                        value.resize(frame != std::string::npos && frame > 0 ? frame : 190);
-                    }
-                    props[key] = std::move(value);
-                }
-            // "alive" is refreshed by every flush, so this is the uptime to within a few minutes.
-            int64_t started = marker.value("started", int64_t(0)), alive = marker.value("alive", started);
-            if (started > 0 && alive >= started)
-                props["uptime_s"] = (alive - started) / 1000;
-            json clean, no_counts;
-            if (DiagnosticsAllowlist::filter("crash", props, json(), clean, no_counts)) {
-                if (covered)
-                    s.queue.push_back(make_event("crash", std::move(clean)));
-                else
-                    s.crash_offers.push_back(std::move(clean));
-            }
-        }
         boost::system::error_code rm_ec;
+        json marker = json::parse(read_file(marker_file), nullptr, false);
+        // 0.1.10: an empty, cut-off or zero-filled marker (a crash or power loss mid-write) says
+        // nothing about that session. value() threw on it before the remove below, so 0.1.8 and
+        // 0.1.9 crashed on every launch until the file was deleted by hand.
+        if (!marker.is_object()) {
+            BOOST_LOG_TRIVIAL(warning) << "usage diagnostics: removed an unreadable session marker";
+            fs::remove(marker_file, rm_ec);
+            continue;
+        }
+        try {
+            long pid    = marker.value("pid", 0L);
+            if (pid != 0 && pid != current_pid() && process_alive(pid))
+                continue;
+            // The operating system ended that session (end_session_by_os): not a crash.
+            const bool os_ended  = marker.value("phase", std::string()) == "os_session_end";
+            const bool consented = marker.value("consented", false);
+            // Covered: diagnostics were shared in that session and are shared now - reported as before.
+            // Otherwise the person is asked once whether to send this one report (unreported_crashes).
+            const bool covered = s.on && consented;
+            const bool ask     = !covered && !s.env_off && PrivacyConsent::legal_approvals().crash_report_prompt;
+            if (!os_ended && (covered || ask)) {
+#ifdef _WIN32
+                // Our crash filter never ran (a fast fail, a stack overflow, heap corruption, or the
+                // person ended it while it hung): ask Windows how that process ended.
+                if (marker.value("exception", std::string()).empty() && pid > 0) {
+                    std::string exception, where;
+                    if (windows_crash_record(pid, marker.value("started", int64_t(0)), exception, where)) {
+                        marker["exception"]   = exception;
+                        marker["at"]          = where;
+                        marker["recorded_by"] = "windows";
+                    }
+                }
+#endif
+                json props = {{"version", marker.value("version", std::string())}};
+                // Where it was and what ended it (older markers have neither).
+                for (const char *key : {"phase", "exception", "at", "recorded_by", "what"})
+                    if (marker.contains(key) && marker[key].is_string() && !marker[key].get<std::string>().empty()) {
+                        std::string value = marker[key].get<std::string>();
+                        if (value.size() > 190) {
+                            // A caller chain is cut at a frame boundary, never inside "module+0x...".
+                            const size_t frame = value.rfind('>', 190);
+                            value.resize(frame != std::string::npos && frame > 0 ? frame : 190);
+                        }
+                        props[key] = std::move(value);
+                    }
+                // "alive" is refreshed by every flush, so this is the uptime to within a few minutes.
+                int64_t started = marker.value("started", int64_t(0)), alive = marker.value("alive", started);
+                if (started > 0 && alive >= started)
+                    props["uptime_s"] = (alive - started) / 1000;
+                // A random id for this one report: the crash event and its log carry the same one.
+                const std::string report_id = new_uuid();
+                props["report_id"]          = report_id;
+                json clean, no_counts;
+                if (DiagnosticsAllowlist::filter("crash", props, json(), clean, no_counts)) {
+                    // That session's log file: named in its marker (0.1.10), else found by its process id.
+                    std::string log_path = find_session_log(log_dir, plain_log_name(marker.value("log", std::string())), pid, started);
+                    if (!log_path.empty() && !own_log_stem.empty() &&
+                        fs::path(log_path).filename().string().rfind(own_log_stem, 0) == 0)
+                        log_path.clear();
+                    CrashLog log{report_id, log_path, clean};
+                    if (covered) {
+                        s.queue.push_back(make_event("crash", std::move(clean)));
+                        covered_logs.push_back(std::move(log));
+                    } else {
+                        s.crash_offers.push_back(std::move(clean));
+                        s.crash_offer_logs.push_back(std::move(log));
+                    }
+                }
+            }
+        } catch (const std::exception &e) {
+            // A field of the wrong type: that one report is lost, never the launch.
+            BOOST_LOG_TRIVIAL(warning) << "usage diagnostics: skipped a malformed session marker: " << e.what();
+        }
         fs::remove(marker_file, rm_ec);
     }
     s.started_ms = now_ms();
@@ -1167,6 +1324,8 @@ void start(AppConfig &config, bool first_run)
     // Keep the newest few; older ones say nothing the newest does not.
     if (s.crash_offers.size() > 3)
         s.crash_offers.erase(s.crash_offers.begin(), s.crash_offers.end() - 3);
+    if (s.crash_offer_logs.size() > 3)
+        s.crash_offer_logs.erase(s.crash_offer_logs.begin(), s.crash_offer_logs.end() - 3);
 
     if (s.on) {
         json saved = json::parse(read_file(pending_path()), nullptr, false);
@@ -1186,6 +1345,12 @@ void start(AppConfig &config, bool first_run)
     }
     BOOST_LOG_TRIVIAL(info) << "usage diagnostics: " << (s.on ? "on" : (s.env_off ? "off (UNLAYERED_NO_TELEMETRY)" : "off"))
                             << ", channel " << s.channel;
+
+    // Crashes diagnostics cover send the end of their log too, in the background (0.1.10).
+    const std::string telemetry_url = s.url, version = s.version, os = s.os, channel = s.channel;
+    lock.unlock();
+    for (CrashLog &log : covered_logs)
+        upload_crash_log(std::move(log), telemetry_url, version, os, channel, true);
 }
 
 void heartbeat()
@@ -1213,6 +1378,18 @@ void set_phase(const char *phase)
         return;
     s.phase = phase;
     write_marker_locked(s);
+}
+
+void note_exception(const std::string &type, const std::string &what)
+{
+    // Kept as a JSON-safe string so the crash handler can write it as it is (no escaping there).
+    std::string text = type + (what.empty() ? std::string() : ": " + what);
+    for (char &c : text)
+        if (c == '"' || c == '\\' || static_cast<unsigned char>(c) < 0x20)
+            c = '\'';
+    State &s = state();
+    std::lock_guard<std::mutex> lock(s.mutex);
+    copy_cstr(g_crash_marker.what, sizeof(g_crash_marker.what), text);
 }
 
 void end_session_by_os()
@@ -1249,11 +1426,14 @@ std::vector<json> unreported_crashes()
 void answer_unreported_crashes(bool send_them)
 {
     State &s = state();
-    std::vector<json> crashes;
-    std::string       url, body;
+    std::vector<json>     crashes;
+    std::vector<CrashLog> logs;
+    std::string           url, body, version, os, channel;
     {
         std::lock_guard<std::mutex> lock(s.mutex);
         crashes.swap(s.crash_offers);
+        logs.swap(s.crash_offer_logs);
+        // Declined (or closed): the logs are forgotten with the reports, never read.
         if (!send_them || crashes.empty())
             return;
         std::vector<json> events;
@@ -1267,8 +1447,11 @@ void answer_unreported_crashes(bool send_them)
                       {"app", {{"version", s.version}, {"channel", s.channel}, {"os", s.os}}},
                       {"program", false},
                       {"events", std::move(events)}};
-        body = batch.dump();
-        url  = s.url;
+        body    = batch.dump();
+        url     = s.url;
+        version = s.version;
+        os      = s.os;
+        channel = s.channel;
     }
     // One attempt, in the background; not kept for a retry (the person agreed to this send only).
     auto http = Http::post(url);
@@ -1282,6 +1465,10 @@ void answer_unreported_crashes(bool send_them)
             BOOST_LOG_TRIVIAL(info) << "crash report: not delivered, status " << status << ", " << error;
         })
         .perform();
+    // The end of each crashed session's log, scrubbed on this computer (0.1.10). The person agreed
+    // to this send, so it does not depend on the diagnostics choice.
+    for (CrashLog &log : logs)
+        upload_crash_log(std::move(log), url, version, os, channel, false);
 }
 
 bool is_first_run() { return state().first_run; }

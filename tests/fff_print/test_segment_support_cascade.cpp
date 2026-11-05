@@ -6,6 +6,7 @@
 #include "libslic3r/Print.hpp"
 
 #include <boost/filesystem.hpp>
+#include <cstdlib>
 #include <fstream>
 #include <limits>
 
@@ -518,6 +519,119 @@ SCENARIO("Tree support descends to a floating segment's base plane", "[cutplanes
                 CHECK(below_zero_with_fills > 0);
             }
         }
+    }
+}
+
+namespace {
+// Lowest support layer of `object` with extrusions, and how many such layers sit below its own zero.
+std::pair<double, size_t> lowest_support_fill(const PrintObject &object)
+{
+    double lowest = std::numeric_limits<double>::max();
+    size_t below  = 0;
+    for (const SupportLayer *layer : object.support_layers())
+        if (layer != nullptr && ! layer->support_fills.empty()) {
+            lowest = std::min(lowest, layer->print_z);
+            if (layer->print_z < - EPSILON)
+                ++ below;
+        }
+    return { lowest, below };
+}
+} // namespace
+
+SCENARIO("A root lifted off the plate is supported down to the plate", "[cutplanes][cascade][floating_root]") {
+    // 2026-11-03, sample.3MF: "supports still dont work on parts floating off the build plate".
+    // An object with auto-drop off, 8.6 mm above the plate, with cut planes: its root segment slices
+    // from its own bottom and keeps the plate at a negative slice z, but nothing treated that first
+    // layer as suspended -- the cascade seeded floating NON-root segments only, the natural scan
+    // skipped layer 0, and the tree's descent ran for tilted floors only -- so the whole print,
+    // support included, started 8.6 mm in the air.
+    struct Style { const char *name; const char *type; const char *style; };
+    const std::vector<Style> styles = {
+        { "classic tree", "tree(auto)",   "tree_hybrid" },
+        { "organic tree", "tree(auto)",   "organic"     },
+        { "normal",       "normal(auto)", "default"     },
+    };
+    const double lift = 8.;
+    for (const Style &s : styles)
+        for (const char *axes : { "bc", "virtual" }) {
+            DYNAMIC_SECTION("style " << s.name << ", axes " << axes) {
+                Slic3r::Print print;
+                Model         model;
+                ModelObject  *object = model.add_object();
+                object->name = "lifted_cube";
+                object->add_volume(Test::cube(20.), ModelVolumeType::MODEL_PART, false);
+                object->add_instance()->set_offset(Vec3d(100., 100., lift));   // auto_drop is off: stays up
+
+                CutPlaneStack stack;
+                stack.enabled = true;
+                CutPlane cp;
+                cp.point  = Vec3d(10., 10., 10.);
+                cp.normal = Vec3d::UnitZ();
+                stack.planes.push_back(cp);
+                object->cut_planes = stack;
+
+                DynamicPrintConfig config = cascade_config(s.type, s.style);
+                config.set_deserialize_strict({ { "axis_selection", axes } });
+                print.apply(model, config);
+                REQUIRE_NOTHROW(print.process());
+
+                const PrintObject *root = segment_with_index(print, 0);
+                REQUIRE(root != nullptr);
+                REQUIRE(root->is_root_segment());
+                REQUIRE(root->root_floats_above_plate());
+
+                THEN("its support reaches the plate, a lift below the root's own zero") {
+                    const auto [lowest, below] = lowest_support_fill(*root);
+                    INFO("lowest support layer with extrusions: " << lowest << ", layers below zero: " << below
+                         << " -- the plate sits at " << -lift);
+                    CHECK(below > 0);
+                    CHECK(lowest < - lift + 0.5);
+                }
+            }
+        }
+}
+
+SCENARIO("A root resting on the plate does not float", "[cutplanes][cascade][floating_root]") {
+    Slic3r::Print print;
+    Model         model;
+    ModelObject  *object = model.add_object();
+    object->add_volume(Test::cube(20.), ModelVolumeType::MODEL_PART, false);
+    object->add_instance()->set_offset(Vec3d(100., 100., 0.));
+    CutPlaneStack stack;
+    stack.enabled = true;
+    CutPlane cp;
+    cp.point  = Vec3d(10., 10., 10.);
+    cp.normal = Vec3d::UnitZ();
+    stack.planes.push_back(cp);
+    object->cut_planes = stack;
+    print.apply(model, cascade_config("tree(auto)", "tree_hybrid"));
+    REQUIRE_NOTHROW(print.process());
+    const PrintObject *root = segment_with_index(print, 0);
+    REQUIRE(root != nullptr);
+    CHECK_FALSE(root->root_floats_above_plate());
+    // A cube on the plate needs no support at all.
+    CHECK(lowest_support_fill(*root).second == 0);
+}
+
+// Hidden: slice a real project with its own settings and supports on, and report each segment's
+// lowest support. UNLAYERED_REPRO_3MF=<path> fff_print_tests "[.repro_floating]"
+SCENARIO("Repro: floating project support per segment", "[.repro_floating]") {
+    const char *path = std::getenv("UNLAYERED_REPRO_3MF");
+    if (path == nullptr)
+        return;
+    DynamicPrintConfig        config = DynamicPrintConfig::full_print_config();
+    ConfigSubstitutionContext subs(ForwardCompatibilitySubstitutionRule::Enable);
+    Model model = Model::read_from_file(path, &config, &subs, LoadStrategy::LoadModel | LoadStrategy::LoadConfig);
+    config.set_deserialize_strict({ { "enable_support", "1" }, { "layer_change_gcode", "G92 E0" } });
+    Slic3r::Print print;
+    print.apply(model, config);
+    print.process();
+    for (const PrintObject *object : print.objects()) {
+        const auto [lowest, below] = lowest_support_fill(*object);
+        WARN("segment " << (object->is_segment() ? object->segment_index() : -1)
+             << (object->is_root_segment() ? " (root)" : "") << " floats_root=" << object->root_floats_above_plate()
+             << " slice_z_base=" << (object->is_segment() ? object->segment()->slice_z_base() : 0.)
+             << " lowest support fill " << lowest << " layers below zero " << below);
     }
 }
 

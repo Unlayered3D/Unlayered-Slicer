@@ -55,6 +55,7 @@ public:
         std::string id;
         std::string secret;
         std::string browser_url; // where to send the person to confirm
+        bool        unreachable = false; // start_handoff() got no answer at all: offline, DNS, firewall
     };
 
     enum class CollectResult { Pending, SignedIn, Failed };

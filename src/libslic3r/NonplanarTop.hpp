@@ -37,6 +37,7 @@ struct NonplanarTopStats
     size_t curved_layers  = 0;  // curved layers per patch (n), max over patches
     size_t shell_paths    = 0;  // extrusion paths added
     size_t clipped_layers = 0;  // planar layers that lost material to a patch
+    size_t skipped_tops   = 0;  // tops whose band failed to fill: dropped, their planar top surface kept
     double max_shell_z    = 0;  // highest curved point, print frame
     double kept_planar_mm2 = 0; // area that met the clip rule but stayed planar: no top curved bead over it
     double ms_analysis    = 0;  // height field, patches, clearance
@@ -54,11 +55,19 @@ bool nonplanar_top_requested(const PrintObject &object);
 // nonplanar_hotend_angle_* sides) when enable_nonplanar is on and the envelope height is > 0.
 double nonplanar_effective_max_angle(const PrintRegionConfig &region, const ConfigBase &printer);
 
+// nonplanar_hold_back: the areas of this layer that a held island covers later (it pauses here and is
+// printed after its top's shell), so they are not a real top: ironing skips them. Empty otherwise.
+ExPolygons nonplanar_held_above(const Layer &layer);
+
 // Builds the curved shells of one object and clips the planar material they replace. Idempotent:
 // shells from a previous run are removed first. `mesh` and `ceilings` are exactly what
 // PrintObject::contour_z() builds (slice frame, ground-level offset applied).
 NonplanarTopStats make_nonplanar_top(PrintObject                               &object,
                                      const sla::IndexedMesh                    &mesh,
                                      const std::vector<Layer::ContourZCeiling> &ceilings);
+
+// Test hook, null in production: called once per curved layer at the start of its gap fill. A test sets it to throw,
+// to check that a fill failing inside a band costs only that band and not the slice.
+extern void (*nonplanar_top_band_test_hook)();
 
 } // namespace Slic3r

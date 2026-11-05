@@ -11,6 +11,7 @@
 #include "libslic3r/PrintConfig.hpp"
 #include "slic3r/GUI/Actions/ObjectSettingsRules.hpp"
 #include "slic3r/GUI/WebAppBridge.hpp"
+#include "slic3r/GUI/WebAppSettings.hpp"
 
 using namespace Slic3r;
 using namespace Slic3r::GUI;
@@ -74,12 +75,23 @@ TEST_CASE("Object settings: per-key verdicts", "[actions][objectsettings]")
     }
     SECTION("deny-listed options: 1003, whatever the level")
     {
-        for (const char* k : {"machine_start_gcode", "post_process", "print_host", "printhost_apikey", "inherits", "print_settings_id"}) {
+        for (const char* k : {"post_process", "print_host", "printhost_apikey", "inherits", "print_settings_id"}) {
             const KeyVerdict v = check_key(k, Level::Object, 4, true);
             CHECK_FALSE(v.ok);
             CHECK(v.code == WAB_FORBIDDEN_ORIGIN);
             CHECK_FALSE(v.why.empty());
         }
+    }
+    SECTION("custom G-code: a printer preset option, never per object, but writable on the preset")
+    {
+        // feat/bridge-gcode-write: the side panel converts a preset to the firmware it runs
+        const KeyVerdict v = check_key("machine_start_gcode", Level::Object, 1, true);
+        CHECK_FALSE(v.ok);
+        std::string why;
+        CHECK(WebAppSettings::key_writable("machine_start_gcode", why));
+        CHECK(WebAppSettings::key_writable("machine_end_gcode", why));
+        CHECK_FALSE(WebAppSettings::key_writable("post_process", why));
+        CHECK_FALSE(why.empty());
     }
     SECTION("object-wide options on a part or range: 1002 with a hint")
     {

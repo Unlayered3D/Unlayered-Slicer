@@ -227,7 +227,7 @@ SCENARIO("hotend envelope: the single cone angle migrates to four sides", "[Virt
         DynamicPrintConfig cfg;
         cfg.apply(FullPrintConfig::defaults());
         CHECK(! cfg.has("nonplanar_hotend_cone_angle"));
-        cfg.set_key_value("nonplanar_hotend_angle_xneg", new ConfigOptionFloat(20.));
+        cfg.set_key_value("nonplanar_hotend_angle_xneg", new ConfigOptionFloats{ 20. });
         migrate_legacy_hotend_cone(cfg);
         CHECK(HotendEnvelope::from_config(cfg).angle[HotendEnvelope::XNeg] == Catch::Approx(20.));
     }
@@ -336,6 +336,64 @@ TEST_CASE("The virtual 5-axis height limit ignores the printer's own start and e
 }
 
 
+// UNLAYERED_MOD 2026-10-31 (0.1.9) -- "Max print height (from the bed)" entered as a clearance.
+//
+// The field is an absolute Z, but it sits directly under "Gantry height above nozzle", which is a
+// clearance, and it keeps being entered as a few millimetres of headroom above the part. Until this
+// check the only enforcement was the post-export scan, so every such attempt cost a complete slice
+// and G-code export before anything was reported. A limit below the top of the part cannot be met at
+// all -- the nozzle has to reach the top to print it -- so it is refused from the plate alone.
+TEST_CASE("A virtual 5-axis height limit below the part is refused before slicing", "[VirtualTiltLimit]")
+{
+    // 50 mm tall, upright, so nothing but the height limit can refuse it.
+    auto validate = [](double max_z, const char *nonplanar = "1") {
+        Model        model;
+        ModelObject *object = model.add_object();
+        object->name        = "tall part";
+        object->add_volume(make_cube(20., 20., 50.));
+        object->add_instance()->set_offset(Vec3d(100., 100., 0.));
+        DynamicPrintConfig config = DynamicPrintConfig::full_print_config();
+        config.set_deserialize_strict({
+            { "enable_nonplanar",        nonplanar },
+            { "axis_selection",          "virtual" },
+            { "nonplanar_virtual_max_z", max_z },
+            { "layer_change_gcode",      "G92 E0" },
+        });
+        Print print;
+        print.apply(model, config);
+        return print.validate();
+    };
+
+    // 5 mm reads as headroom above the part, and is 45 mm below the top of it. Nothing is sliced:
+    // validate() runs before the background process starts a slice at all.
+    const StringObjectException headroom = validate(5.);
+    INFO(headroom.string);
+    CHECK(! headroom.string.empty());
+    CHECK(headroom.opt_key == "nonplanar_virtual_max_z");
+    // Names the setting and where it lives, says what the number means, and names the object.
+    CHECK(headroom.string.find("Max print height (from the bed)") != std::string::npos);
+    CHECK(headroom.string.find("Motion ability") != std::string::npos);
+    CHECK(headroom.string.find("measured from the bed") != std::string::npos);
+    CHECK(headroom.string.find("tall part") != std::string::npos);
+
+    // Every size of clearance someone might type reads the same way, sub-millimetre ones included.
+    for (const double clearance : { 0.3, 3., 8., 12. }) {
+        const StringObjectException refused = validate(clearance);
+        INFO(refused.string);
+        CHECK(refused.opt_key == "nonplanar_virtual_max_z");
+    }
+
+    // 0 is "no limit", a limit above the part is the setting used as intended, and the top of the
+    // part itself is not yet over it.
+    CHECK(validate(0.).string.empty());
+    CHECK(validate(300.).string.empty());
+    CHECK(validate(50.).string.empty());
+
+    // Non-planar printing off: the limit is a virtual 5-axis setting and does not bind here.
+    CHECK(validate(5., "0").string.empty());
+}
+
+
 // UNLAYERED_MOD 2026-10-11 (0.1.4) -- 0.1.3 diagnostics reported two slicing crashes (access
 // violation) on an FLSun V400: a delta whose round bed is centred on the origin, with cut planes,
 // virtual 5-axis, by-group sequence and a prime tower. A cube does not reproduce it on that bed with
@@ -393,6 +451,31 @@ TEST_CASE("Virtual 5-axis cut planes slice on a round bed centred on the origin 
         }
     }
 }
+// The scan Print.cpp refuses a slice with, as a helper: the lowest Z word of the toolpath (outside
+// the printer's own ;TYPE:Custom blocks) and the number of extruding moves in a written file.
+static std::pair<double, size_t> toolpath_low_z(const std::string &gcode_path)
+{
+    std::ifstream in(gcode_path);
+    std::string   line;
+    bool          custom = false;
+    double        low_z  = 1e9;
+    size_t        extrusions = 0;
+    while (std::getline(in, line)) {
+        if (line.rfind(";TYPE:", 0) == 0) {
+            custom = line.find("Custom") != std::string::npos;
+            continue;
+        }
+        if (line.rfind("G1 ", 0) != 0 && line.rfind("G0 ", 0) != 0)
+            continue;
+        const std::string code = line.substr(0, line.find(';'));
+        if (const size_t z = code.find(" Z"); z != std::string::npos && ! custom)
+            low_z = std::min(low_z, std::atof(code.c_str() + z + 2));
+        if (code.find(" E") != std::string::npos && (code.find(" X") != std::string::npos || code.find(" Y") != std::string::npos))
+            ++ extrusions;
+    }
+    return std::make_pair(low_z, extrusions);
+}
+
 // UNLAYERED_MOD 2026-10-11 (0.1.4) -- a customer's A1 scraped its bed printing a tilted benchy with
 // tilted layers. An object sunk into the plate with a whole-object layer rotation was sliced from its
 // own minimum along the TILTED axis, which kept part of what is under the plate: walls went to
@@ -422,30 +505,10 @@ TEST_CASE("A sunk object with a layer rotation is clipped at the build plate", "
         struct Remove { boost::filesystem::path p; ~Remove() { boost::system::error_code ec; boost::filesystem::remove(p, ec); } } remove{out_path};
         GCodeProcessorResult result;
         print.export_gcode(out_path.string(), &result, nullptr);
-        // Lowest Z word of the toolpath (outside the printer's own ;TYPE:Custom blocks) and the
-        // number of extruding moves.
-        std::ifstream in(out_path.string());
-        std::string   line;
-        bool          custom = false;
-        double        low_z  = 1e9;
-        size_t        extrusions = 0;
-        while (std::getline(in, line)) {
-            if (line.rfind(";TYPE:", 0) == 0) {
-                custom = line.find("Custom") != std::string::npos;
-                continue;
-            }
-            if (line.rfind("G1 ", 0) != 0 && line.rfind("G0 ", 0) != 0)
-                continue;
-            const std::string code = line.substr(0, line.find(';'));
-            if (const size_t z = code.find(" Z"); z != std::string::npos && ! custom)
-                low_z = std::min(low_z, std::atof(code.c_str() + z + 2));
-            if (code.find(" E") != std::string::npos && (code.find(" X") != std::string::npos || code.find(" Y") != std::string::npos))
-                ++ extrusions;
-        }
-        return std::make_pair(low_z, extrusions);
+        return toolpath_low_z(out_path.string());
     };
 
-    // Resting on the plate: nothing to clip.
+    // Resting on the plate: the clip keeps everything but the half-bead sliver under its margin.
     const auto [rest_z, rest_n] = slice(0.);
     CHECK(rest_z >= 0.);
     CHECK(rest_n > 0);
@@ -457,4 +520,67 @@ TEST_CASE("A sunk object with a layer rotation is clipped at the build plate", "
     CHECK(sunk.second > 0);
     // Less material than the cube on the plate: the part under the plate is gone.
     CHECK(sunk.second < rest_n);
+}
+
+// UNLAYERED_MOD 2026-11-01 (0.1.9) -- the plate clip above ran only for an object whose box ALREADY
+// dipped below the plate, and that box spanned every copy of the object. A tilted object resting on
+// the plate was therefore sliced with no clip at all, and when its toolpath came out below the plate
+// the export refused the slice -- after the whole slice and G-code export had run. The clip is now
+// gated on the layer rotation alone, so the plate bounds every tilted object, at every tilt and for
+// every copy.
+TEST_CASE("A tilted object resting on the plate is clipped rather than refused", "[VirtualTiltLimit][BelowPlate]")
+{
+    // `copies` instances of one box, all resting on the plate (or sunk by `sink`), sliced in a frame
+    // tilted by B/C. Returns the lowest toolpath Z and the number of extruding moves.
+    auto slice = [](double tilt_b, double tilt_c, size_t copies, double sink = 0.) {
+        Model        model;
+        ModelObject *object = model.add_object();
+        object->add_volume(make_cube(20., 20., 40.));
+        for (size_t i = 0; i < copies; ++ i)
+            object->add_instance()->set_offset(Vec3d(70. + 40. * double(i), 100., - sink));
+        DynamicPrintConfig config = DynamicPrintConfig::full_print_config();
+        config.set_deserialize_strict({
+            { "enable_nonplanar",   "1" },
+            { "axis_selection",     "virtual" },
+            { "layer_rotation_b",   tilt_b },
+            { "layer_rotation_c",   tilt_c },
+            { "layer_change_gcode", "G92 E0" },
+        });
+        Print print;
+        print.apply(model, config);
+        REQUIRE(print.config().virtual_5axis.value);
+        print.set_status_silent();
+        print.process();
+        const auto out_path = boost::filesystem::temp_directory_path() / boost::filesystem::unique_path("ontheplate-%%%%%%%%.gcode");
+        struct Remove { boost::filesystem::path p; ~Remove() { boost::system::error_code ec; boost::filesystem::remove(p, ec); } } remove{out_path};
+        GCodeProcessorResult result;
+        // Throws SlicingError if the export finds a Z below the plate: that refusal is the bug.
+        print.export_gcode(out_path.string(), &result, nullptr);
+        return toolpath_low_z(out_path.string());
+    };
+
+    // Shallow tilts, where the dip is no more than a bead or two and the part plainly rests on the
+    // plate, and a steep one and a tilt about both axes for good measure.
+    for (const std::pair<double, double> &bc : { std::make_pair(5., 0.), std::make_pair(10., 0.),
+                                                 std::make_pair(30., 0.), std::make_pair(10., 45.) }) {
+        INFO("layer_rotation_b " << bc.first << ", layer_rotation_c " << bc.second);
+        std::pair<double, size_t> one;
+        REQUIRE_NOTHROW(one = slice(bc.first, bc.second, 1));
+        CHECK(one.first >= 0.);
+        CHECK(one.second > 0);
+    }
+
+    // Several copies: each is sliced in its own frame (one PrintObject per instance for a rotated
+    // object), so the clip must be decided per copy and not from the box around all of them.
+    std::pair<double, size_t> several;
+    REQUIRE_NOTHROW(several = slice(10., 0., 3));
+    CHECK(several.first >= 0.);
+    CHECK(several.second > 0);
+
+    // ... and with the copies sunk into the plate, which is the case that was clipped before.
+    std::pair<double, size_t> several_sunk;
+    REQUIRE_NOTHROW(several_sunk = slice(10., 0., 3, 6.));
+    CHECK(several_sunk.first >= 0.);
+    CHECK(several_sunk.second > 0);
+    CHECK(several_sunk.second < several.second);
 }

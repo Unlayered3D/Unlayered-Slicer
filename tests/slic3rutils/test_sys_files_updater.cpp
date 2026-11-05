@@ -459,7 +459,7 @@ TEST_CASE("A full SD card is recognised by its card-only folders and notes", "[S
 
 TEST_CASE("From Zip on a full SD card offers sys and macros and skips the rest", "[SysFilesUpdater]")
 {
-    for (const std::string wrapper : {std::string(), std::string("unlayered-1.9-sd-card-2026.10.26/")}) {
+    for (const std::string &wrapper : {std::string(), std::string("unlayered-1.9-sd-card-2026.10.26/")}) {
         DYNAMIC_SECTION("wrapper '" << wrapper << "'") {
             TempDir        tmp;
             const fs::path zip = tmp.path / "unlayered-1.9-sd-card.zip";

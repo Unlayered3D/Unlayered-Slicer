@@ -4,6 +4,8 @@
 #include "Http.hpp"
 #include "libslic3r/AppConfig.hpp"
 #include "slic3r/GUI/GUI.hpp" // get_app_config
+#include "slic3r/GUI/GUI_App.hpp" // wxGetApp().auto_updater(): the signed-in account
+#include "slic3r/GUI/AutoUpdater.hpp"
 #include "slic3r/GUI/WebAppSlot.hpp" // the dev-edition switch + its local-web-apps setting
 #include "UnlayeredAccount.hpp"
 
@@ -115,6 +117,10 @@ std::string NonplanarSliceClient::configured_url()
     // entries, the options dialog, the prepare-on-select step, Plater::slice_nonplanar.
     return {};
 #else
+    // A customer build offers the slicing service only to the provider's own staff accounts; for
+    // everyone else every entry point stays hidden, as in an OFF build.
+    if (!account_is_provider_staff())
+        return {};
     // The development override wins and is never written back, so a session pointed at a local
     // service cannot quietly become the user's stored configuration.
     if (const char *env = std::getenv("ORCA_NONPLANAR_SLICE_URL"); env != nullptr && *env != '\0')
@@ -124,8 +130,37 @@ std::string NonplanarSliceClient::configured_url()
     if (cfg == nullptr)
         return {};
     std::string url = trim_trailing_slashes(boost::trim_copy(cfg->get(SETTING_NONPLANAR_SLICE_URL)));
+    // The address the build was configured with (UNLAYERED_SLICE_SERVICE_DEFAULT_URL), when the
+    // person set none.
+    if (url.empty())
+        url = trim_trailing_slashes(std::string(UNLAYERED_SLICE_SERVICE_DEFAULT_URL));
     return url;
 #endif // UNLAYERED_SLICE_SERVICE
+}
+
+bool NonplanarSliceClient::account_is_provider_staff()
+{
+    GUI::AutoUpdater *updater = GUI::wxGetApp().auto_updater();
+    if (updater == nullptr)
+        return false;
+    UnlayeredAccount &account = updater->account();
+    if (!account.signed_in())
+        return false;
+    const std::optional<UnlayeredAccount::Profile> profile = account.profile();
+    if (!profile)
+        return false;
+    // The provider verified this email when the account signed in (a one-time code or a verified
+    // Google address), so its domain is trustworthy. Exact match: x@sub.<domain> is not staff.
+    const std::string email = boost::algorithm::to_lower_copy(boost::trim_copy(profile->email));
+    const size_t      at    = email.find('@');
+    if (at == std::string::npos || at == 0 || email.find('@', at + 1) != std::string::npos)
+        return false;
+    std::string host = UnlayeredAccount::host_of(account.site_url());
+    if (host.empty() || host.find(':') != std::string::npos)
+        return false;
+    if (boost::algorithm::starts_with(host, "www."))
+        host = host.substr(4);
+    return email.substr(at + 1) == host;
 }
 
 bool NonplanarSliceClient::is_configured()

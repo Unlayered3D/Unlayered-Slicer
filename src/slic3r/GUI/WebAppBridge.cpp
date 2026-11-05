@@ -34,6 +34,7 @@
 #include "slic3r/GUI/ModelUploadConsentDialog.hpp"
 #include "slic3r/Utils/PrivacyConsent.hpp"
 #include "slic3r/Utils/DuetRrfClient.hpp"
+#include "slic3r/Utils/NonplanarSliceClient.hpp" // account_is_provider_staff: who may start a service run
 #include "slic3r/GUI/DeviceManager.hpp"
 #include "slic3r/GUI/DeviceCore/DevManager.h"
 #include "slic3r/GUI/DeviceCore/DevBed.h"
@@ -2722,6 +2723,17 @@ void WebAppBridge::Impl::handle_set_settings(const std::string& id, const json& 
                     dst->set_at(src, size_t(variant * stride + j), size_t(j));
             } else {
                 copy.set_deserialize(key, text, context); // runs handle_legacy(); throws on a value it cannot parse
+                // Unlayered: the hotend envelope is per nozzle now. A single value written without
+                // `extruder` (what every caller sent while it was one number) sets every nozzle, rather
+                // than shrinking the per-variant list to one entry.
+                if (type == Preset::TYPE_PRINTER) {
+                    const auto& env_keys = HotendEnvelope::option_keys();
+                    auto*       dst      = dynamic_cast<ConfigOptionVectorBase*>(copy.option(key));
+                    const auto* was      = dynamic_cast<const ConfigOptionVectorBase*>(before);
+                    if (std::find(env_keys.begin(), env_keys.end(), key) != env_keys.end() && dst != nullptr && was != nullptr &&
+                        dst->size() == 1 && was->size() > 1)
+                        dst->resize(was->size());
+                }
             }
             if (!numeric_value_valid(*def, copy.option(key)))
                 error = range_text(*def);
@@ -4279,6 +4291,9 @@ json WebAppBridge::Impl::slice_modes_json() const
                          {"label", std::string(choice.label.ToUTF8().data())},
                          {"kind", choice.service ? "service" : "local"}});
     json out = {{"modes", modes}, {"selected", frame->selected_slice_mode()}};
+    // Whether slicer.slice may start a service run itself: only for the account provider's staff
+    // (NonplanarSliceClient::account_is_provider_staff). Everyone else's service runs wait for Slice.
+    out["serviceRunByPage"] = frame->slice_mode_choices().size() > 2 && NonplanarSliceClient::account_is_provider_staff();
     if (Plater* plater = wxGetApp().plater(); plater != nullptr && frame->slice_mode_choices().size() > 2) {
         json plates = json::array();
         for (int i = 0; i < plater->get_partplate_list().get_plate_count(); ++i)
@@ -4324,7 +4339,8 @@ void WebAppBridge::Impl::handle_set_slice_mode(const std::string& id, const json
         return;
     }
     json data = slice_modes_json();
-    send_response(id, METHOD, WAB_OK, "success", {{"selected", data["selected"]}, {"modes", data["modes"]}});
+    send_response(id, METHOD, WAB_OK, "success",
+                  {{"selected", data["selected"]}, {"modes", data["modes"]}, {"serviceRunByPage", data["serviceRunByPage"]}});
 }
 
 void WebAppBridge::Impl::handle_slice(const std::string& id, const json& params)
@@ -4336,9 +4352,13 @@ void WebAppBridge::Impl::handle_slice(const std::string& id, const json& params)
         send_response(id, METHOD, code, message);
         return;
     }
-    // A slicing-service mode is a cloud run: only the person starts it. Refused before anything
-    // (the plate switch included) changes.
-    if (MainFrame* frame = wxGetApp().mainframe; frame != nullptr && frame->slice_mode_is_service()) {
+    // A slicing-service mode is a cloud run: only the person starts it -- unless the signed-in
+    // account is the provider's staff, whose pages may start one. Refused before anything (the
+    // plate switch included) changes.
+    MainFrame* service_frame = wxGetApp().mainframe;
+    const bool service_run   = service_frame != nullptr && service_frame->slice_mode_is_service();
+    if (service_run && !NonplanarSliceClient::account_is_provider_staff()) {
+        MainFrame* frame = service_frame;
         send_response(id, METHOD, WAB_SERVICE_MODE_SELECTED,
                       "a slicing-service (cloud) mode is selected; the person must press Slice themselves "
                       "(or pick a local mode with slicer.setSliceMode)",
@@ -4368,6 +4388,20 @@ void WebAppBridge::Impl::handle_slice(const std::string& id, const json& params)
     }
     if (refuse_nothing_printable(id, METHOD, plates.get_curr_plate_index()))
         return;
+
+    if (service_run) {
+        // A staff account's page starts the service run the person's Slice would start
+        // (Plater::slice_nonplanar, quiet: a failure is a notification, not a modal dialog). The
+        // result arrives the way theirs does; slicer.getSliceResult / getSliceModes report progress.
+        plater->slice_nonplanar(true);
+        const int  index = plates.get_curr_plate_index();
+        const json st    = service_plate_json(*plater, index);
+        const bool going = st["jobRunning"].get<bool>();
+        send_response(id, METHOD, WAB_OK, going ? "accepted" : "not started",
+                      {{"accepted", going}, {"plate", index}, {"service", st}, {"mode", service_frame->selected_slice_mode()},
+                       {"sliceResultValid", plate->is_slice_result_valid()}});
+        return;
+    }
 
     // Plater::reslice() is the Slice button: it validates, may leave a notification instead of
     // starting, and reports nothing back. The outcome arrives as slicer.sliceStarted /

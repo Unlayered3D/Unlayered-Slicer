@@ -53,6 +53,10 @@ public:
     // ORCA_NONPLANAR_SLICE_URL wins over the stored setting and is never written back.
     static std::string configured_url();
     static bool        is_configured();
+    // The application is signed in to its account provider with an account on the provider's own
+    // email domain (x@unlayered3d.com for unlayered3d.com). In a customer build the slicing service
+    // is offered only to such accounts, and only they let a web app start a service run.
+    static bool        account_is_provider_staff();
     // https anywhere; plain http only for a loopback host. Same rule as the web app tab, and
     // for the same reason: a cleartext address on the network is not offered an override.
     static bool        is_secure_url(const std::string &url);

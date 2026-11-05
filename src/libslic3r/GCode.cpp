@@ -4533,6 +4533,11 @@ void GCode::_do_export(Print& print, GCodeOutputStream &file, ThumbnailsGenerato
         {
             coordf_t max_print_z = 0;
             for (auto& obj : print.objects()) {
+                // UNLAYERED_MOD: an object can come out of slicing with no layers (cut planes plus
+                // nonplanar printing did on 0.1.9); max_element() of an empty range is end(), and
+                // reading it took the app down (Windows access violation in _do_export).
+                if (obj->layers().empty())
+                    continue;
                 max_print_z = std::max(max_print_z, (*std::max_element(obj->layers().begin(), obj->layers().end(), [](Layer* a, Layer* b) { return a->print_z < b->print_z; }))->print_z);
             }
             this->placeholder_parser().set("max_print_z", new ConfigOptionInt(std::ceil(max_print_z)));
@@ -4968,7 +4973,8 @@ void GCode::_do_export(Print& print, GCodeOutputStream &file, ThumbnailsGenerato
 
         coordf_t max_height_z = -1;
         for (const auto& object : print.objects())
-            max_height_z = std::max(object->layers().back()->print_z, max_height_z);
+            if (! object->layers().empty()) // UNLAYERED_MOD: see max_print_z above
+                max_height_z = std::max(object->layers().back()->print_z, max_height_z);
 
         std::ostringstream max_height_z_tip;
         max_height_z_tip<<"; max_z_height: " << std::fixed << std::setprecision(2) << max_height_z << '\n';
@@ -5458,6 +5464,8 @@ void GCode::_do_export(Print& print, GCodeOutputStream &file, ThumbnailsGenerato
                 // Generate G-code, run the filters (vase mode, cooling buffer), run the G-code analyser
                 // and export G-code into file.
                 tool_ordering.cal_most_used_extruder(print.config());
+                // UNLAYERED_MOD: this instance's pauses and custom G-codes from the layer slider
+                tool_ordering.assign_custom_gcodes_sequential(print, int(finished_objects));
                 m_printed_objects.emplace_back(&object);
 
                 this->process_layers(print, tool_ordering, collect_layers_to_print(object), *print_object_instance_sequential_active - object.instances().data(), file,
@@ -7799,6 +7807,10 @@ LayerResult GCode::process_layer(
     }
     if (single_object_instance_idx == size_t(-1)) {
         // Normal (non-sequential) print.
+        gcode += ProcessLayer::emit_custom_gcode_per_print_z(*this, layer_tools.custom_gcode, m_writer.filament()->id(), first_extruder_id, print.config());
+    } else if (layer_tools.custom_gcode != nullptr) {
+        // UNLAYERED_MOD: a print by object. Only this instance's pauses and custom G-codes are set
+        // here (ToolOrdering::assign_custom_gcodes_sequential), so each runs once, on its object.
         gcode += ProcessLayer::emit_custom_gcode_per_print_z(*this, layer_tools.custom_gcode, m_writer.filament()->id(), first_extruder_id, print.config());
     }
 

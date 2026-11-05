@@ -1896,11 +1896,11 @@ PRINT_CONFIG_CLASS_DEFINE(
     ((ConfigOptionFloat,                nonplanar_departure_distance))
     ((ConfigOptionFloat,                nonplanar_approach_distance))
     ((ConfigOptionFloat,                nonplanar_nozzle_to_b_axis))
-    ((ConfigOptionFloat,                nonplanar_hotend_cone_height))
-    ((ConfigOptionFloat,                nonplanar_hotend_angle_xpos))
-    ((ConfigOptionFloat,                nonplanar_hotend_angle_xneg))
-    ((ConfigOptionFloat,                nonplanar_hotend_angle_ypos))
-    ((ConfigOptionFloat,                nonplanar_hotend_angle_yneg))
+    ((ConfigOptionFloats,               nonplanar_hotend_cone_height))
+    ((ConfigOptionFloats,               nonplanar_hotend_angle_xpos))
+    ((ConfigOptionFloats,               nonplanar_hotend_angle_xneg))
+    ((ConfigOptionFloats,               nonplanar_hotend_angle_ypos))
+    ((ConfigOptionFloats,               nonplanar_hotend_angle_yneg))
     ((ConfigOptionFloat,                nonplanar_gantry_height))
     ((ConfigOptionFloat,                nonplanar_virtual_max_angle))
     ((ConfigOptionFloat,                nonplanar_virtual_max_z))
@@ -3056,8 +3056,17 @@ struct HotendEnvelope
     // Lateral reach per mm of height, 1/tan(angle): 1 at 45, 0 at 90.
     double spread(Side s) const;
 
-    static HotendEnvelope from_config(const ConfigBase &config);
+    // Per nozzle: the five keys are per-extruder-variant printer options (printer_options_with_variant_1),
+    // one value per printer_extruder_variant slot, so a dual-nozzle printer (H2D, X2D) carries a
+    // separate envelope for its Main and Auxiliary nozzle. `extruder` (0-based) picks that nozzle's
+    // slot the way every other variant option is resolved: by printer_extruder_id plus the variant
+    // string from its extruder_type / nozzle_volume_type, falling back to the extruder's first slot,
+    // then to index `extruder`. extruder < 0 is the CONSERVATIVE envelope over every slot: per side
+    // the smallest angle (the fattest side) and the largest height -- for every reader that models
+    // one head without knowing which nozzle prints.
+    static HotendEnvelope from_config(const ConfigBase &config, int extruder = -1);
     static const char    *option_key(Side s);   // "nonplanar_hotend_angle_xpos", ...
+    static const std::vector<std::string> &option_keys(); // the height key and the four side keys
     static const char    *side_name(Side s);    // "+X", "-X", "+Y", "-Y"
 };
 

@@ -131,6 +131,7 @@
 #include "../Utils/MacDarkMode.hpp"
 #include "../Utils/NetworkAgentFactory.hpp"
 #include "../Utils/PrintHost.hpp"
+#include "../Utils/BambuConnect.hpp"
 
 #include "GUI_App.hpp"
 #include "AutoUpdater.hpp"
@@ -235,6 +236,16 @@ const ImGuiWrapper* focused_canvas_imgui(wxWindow* focus)
     if (!OpenGLManager::is_scene_canvas(focus) || !focus->IsShownOnScreen())
         return nullptr;
     return wxGetApp().imgui();
+}
+
+// The web page that has the keyboard (the side panel, a web tab), or null. On macOS the Edit menu's
+// key equivalents (Cmd+C/V/X/A/Z) reach the menu before the page, so the menu hands them on to it.
+wxWebView* focused_web_view()
+{
+    for (wxWindow* w = wxWindow::FindFocus(); w != nullptr; w = w->GetParent())
+        if (auto* view = dynamic_cast<wxWebView*>(w); view != nullptr && view->IsShownOnScreen())
+            return view;
+    return nullptr;
 }
 
 // Space opens the speed dial, but it is the activation key for buttons, checkboxes and other
@@ -2716,6 +2727,7 @@ const char* print_select_type_key(MainFrame::PrintSelectType type)
     case MainFrame::eSendToPrinter:       return "send_to_printer";
     case MainFrame::eSendToPrinterAll:    return "send_to_printer_all";
     case MainFrame::ePrintMultiMachine:   return "print_multi_machine";
+    case MainFrame::eOpenInBambuConnect:  return "open_in_bambu_connect";
     case MainFrame::eUploadGcode:         break; // Orca: no dropdown entry, never selectable
     }
     return "";
@@ -2734,6 +2746,7 @@ wxString print_select_type_label(MainFrame::PrintSelectType type)
     case MainFrame::eSendToPrinter:       return _L("Send");
     case MainFrame::eSendToPrinterAll:    return _L("Send all");
     case MainFrame::ePrintMultiMachine:   return _L("Send to Multi-device");
+    case MainFrame::eOpenInBambuConnect:  return _L("Open in Bambu Connect");
     case MainFrame::eUploadGcode:         break; // Orca: no dropdown entry, never selectable
     }
     return _L("Print plate");
@@ -2781,6 +2794,10 @@ std::vector<MainFrame::PrintSelectType> MainFrame::available_print_actions() con
         actions.push_back(ePrintMultiMachine);
     actions.push_back(eExportSlicedFile);
     actions.push_back(eExportAllSlicedFile);
+    // Unlayered: hand the sliced plate to Bambu Connect (experimental switch in Preferences)
+    if (preset_bundle && preset_bundle->is_bbl_vendor() &&
+        BambuConnect::is_enabled(wxGetApp().app_config->get(BambuConnect::CONFIG_KEY)))
+        actions.push_back(eOpenInBambuConnect);
     actions.push_back(eExportGcode);
     return actions;
 }
@@ -2819,6 +2836,19 @@ bool MainFrame::get_remembered_print_select(PrintSelectType& out) const
         }
     }
     return false;
+}
+
+// A Slice click that throws reports a slicing error instead of ending the app (0.1.9 closed it on
+// one: wxButton click -> wxEvtHandler::WXConsumeException -> wxAbort, 11/01).
+template<class Handler> static auto slice_guarded(MainFrame *frame, Handler handler)
+{
+    return [frame, handler](wxCommandEvent &event) {
+        try {
+            handler(event);
+        } catch (const std::exception &) {
+            frame->plater()->show_slice_exception(std::current_exception());
+        }
+    };
 }
 
 wxBoxSizer* MainFrame::create_side_tools()
@@ -2931,7 +2961,7 @@ wxBoxSizer* MainFrame::create_side_tools()
         });
 #endif
 
-    m_slice_btn->Bind(wxEVT_BUTTON, [this](wxCommandEvent& event)
+    m_slice_btn->Bind(wxEVT_BUTTON, slice_guarded(this, [this](wxCommandEvent& event)
         {
 
             //this->m_plater->select_view_3D("Preview");
@@ -2970,7 +3000,7 @@ wxBoxSizer* MainFrame::create_side_tools()
                     wxPostEvent(m_plater, SimpleEvent(EVT_GLTOOLBAR_SLICE_PLATE));
                 this->m_tabpanel->SelectPageByName(TAB_ID_PREVIEW);
             }
-        });
+        }));
 
     m_print_btn->Bind(wxEVT_BUTTON, [this](wxCommandEvent& event) { press_print_button(false); });
 
@@ -3172,6 +3202,14 @@ void MainFrame::press_print_button(bool wait)
         fire(EVT_GLTOOLBAR_EXPORT_SLICED_FILE);
     else if (m_print_select == eExportAllSlicedFile)
         fire(EVT_GLTOOLBAR_EXPORT_ALL_SLICED_FILE);
+    else if (m_print_select == eOpenInBambuConnect) {
+        if (get_enable_print_status()) {
+            if (wait)
+                m_plater->open_in_bambu_connect();
+            else
+                m_plater->CallAfter([this]() { m_plater->open_in_bambu_connect(); });
+        }
+    }
     else if (m_print_select == eSendToPrinter)
         fire(EVT_GLTOOLBAR_SEND_TO_PRINTER);
     else if (m_print_select == eSendToPrinterAll)
@@ -3244,7 +3282,7 @@ bool MainFrame::get_enable_print_status()
             enable = false;
         enable = enable && !is_all_plates;
     }
-    else if (m_print_select == eExportSlicedFile)
+    else if (m_print_select == eExportSlicedFile || m_print_select == eOpenInBambuConnect)
     {
         if (!current_plate->is_slice_result_ready_for_export())
         {
@@ -3900,6 +3938,17 @@ void MainFrame::init_menubar_as_editor()
     // Feeds the key to ImGui instead when ImGui has the focused canvas's keyboard, since the menu
     // handles its key equivalents before the canvas receives the key.
     auto handle_key_event = [](wxKeyEvent& evt) {
+        if (wxWebView* view = focused_web_view()) {
+            switch (evt.GetKeyCode()) {
+            case 'C': view->Copy(); return true;
+            case 'V': view->Paste(); return true;
+            case 'X': view->Cut(); return true;
+            case 'A': view->SelectAll(); return true;
+            case 'Z': view->Undo(); return true;
+            case 'Y': view->Redo(); return true;
+            default: break;
+            }
+        }
         const ImGuiWrapper* imgui = focused_canvas_imgui(wxWindow::FindFocus());
         if (imgui == nullptr || !imgui->owns_keyboard())
             return false;
@@ -3986,7 +4035,7 @@ void MainFrame::init_menubar_as_editor()
 #ifdef SLIC3R_CAD
                 if (DesignPanel* dp = shown_design_panel()) return dp->menu_can_undo_redo(false);
 #endif
-                return m_plater->can_undo(); }, this);
+                return focused_web_view() != nullptr || m_plater->can_undo(); }, this);
         // BBS redo
         append_shortcut_item(editMenu, Shortcut::Redo, false, _L("Redo"),
             _L("Redo"), [this, handle_key_event](wxCommandEvent&) {
@@ -4005,7 +4054,7 @@ void MainFrame::init_menubar_as_editor()
 #ifdef SLIC3R_CAD
                 if (DesignPanel* dp = shown_design_panel()) return dp->menu_can_undo_redo(true);
 #endif
-                return m_plater->can_redo(); }, this);
+                return focused_web_view() != nullptr || m_plater->can_redo(); }, this);
         editMenu->AppendSeparator();
         // BBS Cut TODO
         append_shortcut_item(editMenu, Shortcut::Cut, false, _L("Cut"),
@@ -4018,7 +4067,7 @@ void MainFrame::init_menubar_as_editor()
                     return;
                 }
                 m_plater->cut_selection_to_clipboard(); },
-            "", nullptr, [this]() {return m_plater->can_copy_to_clipboard(); }, this);
+            "", nullptr, [this]() {return focused_web_view() != nullptr || m_plater->can_copy_to_clipboard(); }, this);
         // BBS Copy
         append_shortcut_item(editMenu, Shortcut::Copy, false, _L("Copy"),
             _L("Copy selection to clipboard"), [this, handle_key_event](wxCommandEvent&) {
@@ -4030,7 +4079,7 @@ void MainFrame::init_menubar_as_editor()
                     return;
                 }
                 m_plater->copy_selection_to_clipboard(); },
-            "", nullptr, [this](){return m_plater->can_copy_to_clipboard(); }, this);
+            "", nullptr, [this](){return focused_web_view() != nullptr || m_plater->can_copy_to_clipboard(); }, this);
         // BBS Paste
         append_shortcut_item(editMenu, Shortcut::Paste, false, _L("Paste"),
             _L("Paste clipboard"), [this, handle_key_event](wxCommandEvent&) {
@@ -4042,7 +4091,7 @@ void MainFrame::init_menubar_as_editor()
                     return;
                 }
                 m_plater->paste_from_clipboard(); },
-            "", nullptr, [this](){return m_plater->can_paste_from_clipboard(); }, this);
+            "", nullptr, [this](){return focused_web_view() != nullptr || m_plater->can_paste_from_clipboard(); }, this);
 #if 0
         // BBS Delete selected
         append_shortcut_item(editMenu, Shortcut::DeleteSelected, true, _L("Delete Selected"),
@@ -4098,7 +4147,7 @@ void MainFrame::init_menubar_as_editor()
                     return;
                 }
                 m_plater->select_all(); },
-            "", nullptr, [this](){return can_select(); }, this);
+            "", nullptr, [this](){return focused_web_view() != nullptr || can_select(); }, this);
         // BBS Deslect All
         append_menu_item(editMenu, wxID_ANY, _L("Deselect All") + sep + _L_CONTEXT("Esc", "Keyboard Shortcut"),
             _L("Deselects all objects"), [this, handle_key_event](wxCommandEvent&) {

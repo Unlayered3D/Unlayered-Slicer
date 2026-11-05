@@ -52,6 +52,16 @@ class PresetCollection;
 // kill -9), or the power went. A session the operating system ended (log off, shut down, and on
 // macOS an ordinary Quit, which never reaches shutdown()) is not reported as a crash.
 //
+// Since 0.1.10 the marker also names the session's log file ("log", a file name in data_dir()/log),
+// and every crash report that is sent (unasked for a sharer, or after "Send" in the crash report
+// dialog) also sends the end of that log: its last 256 KB, from a complete line, scrubbed on this
+// computer by scrub_log_for_upload() (CrashLogScrub.hpp), POSTed once in the background, never
+// retried, to /api/slicer/crash-log on the diagnostics URL's own site, as
+//   {"v":1, "report_id", "version", "os", "channel", "crash":{phase, exception, at, uptime_s},
+//    "log", "log_bytes_original", "truncated"}.
+// The crash event carries the same random report_id. Nothing is read or sent when the person
+// declines, under UNLAYERED_NO_TELEMETRY, or when that session's log cannot be found.
+//
 // Thread safety: record()/count() may be called from any thread. start(), refresh() and
 // shutdown() run on the main thread (they touch AppConfig).
 namespace UsageTelemetry {
@@ -105,6 +115,11 @@ void count(const std::string &feature, int by = 1);
 
 // Sends what is queued, in the background. Called every few minutes by the app.
 void flush();
+
+// An exception the main loop caught (GUI_App::OnExceptionInMainLoop, UiException): its type and a
+// short, path-free message, kept for the crash marker so a crash that follows names its cause (the
+// "crash" event's "what"). Sends nothing itself.
+void note_exception(const std::string &type, const std::string &what);
 
 // What the app is doing, kept in the crash marker: "startup", "running", "slicing", "closing".
 // A crash reported at the next launch says which phase it happened in.

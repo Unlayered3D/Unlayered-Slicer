@@ -31,7 +31,9 @@ std::shared_ptr<const NonplanarZaaLimits> nonplanar_top_zaa_limits(const PrintOb
 // top surface the shell can follow (otherwise returns why not, and the object prints planar), builds the
 // curved shells (kept aside for make_nonplanar_top) and clips each layer's slices so the planar part is the
 // model as if its top were the shell's thickness lower. Returns "" when nonplanar layers apply or are off.
-std::string nonplanar_top_clip_slices(PrintObject &object);
+// `skipped_tops`, when given, receives the number of tops whose band failed to fill and was dropped, each keeping its
+// planar top surface instead (the rest of the object is sliced as usual).
+std::string nonplanar_top_clip_slices(PrintObject &object, size_t *skipped_tops = nullptr);
 
 // After detect_surfaces_type(): the planar tops under the shells are internal solid, not top (no top shells,
 // no ironing under a shell).

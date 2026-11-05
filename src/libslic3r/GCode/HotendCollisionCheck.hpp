@@ -28,6 +28,12 @@ namespace Slic3r {
 struct HotendCollisionParams
 {
     HotendEnvelope envelope;          // height <= 0 disables the check
+    // Per nozzle (indexed by the physical extruder, MoveVertex::physical_extruder_id): on a
+    // dual-nozzle printer each nozzle has its own pyramid, and a move is tested with the envelope of
+    // the nozzle that made it. A move whose extruder is unknown (-1) or past the end of this list
+    // uses `envelope`, which callers set to the conservative one over all nozzles
+    // (HotendEnvelope::from_config(config, -1)). Empty: `envelope` for every move.
+    std::vector<HotendEnvelope> extruder_envelopes;
     bool           upright = false;   // virtual 5-axis: the nozzle stays vertical
     // A/C table-table machine: the head never tilts, the table does, so the head's faces in the bed
     // frame come from the (A, C) the exporter picks for each episode (TrunnionAC::solve_sequence),

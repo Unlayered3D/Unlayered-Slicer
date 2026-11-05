@@ -22,8 +22,10 @@ const std::map<std::string, std::set<std::string>> &events()
         {"app_start", {"os_version", "arch", "language", "cpu_cores", "ram_gb", "first_run", "stealth", "dark_mode",
                        "bambu_plugin", "bambu_plugin_version"}},
         // A previous session that ended without closing (UsageTelemetry::start): the module file name
-        // and offset, the exception code, what the app was doing. Never a path or a dump.
-        {"crash", {"version", "phase", "exception", "at", "recorded_by", "uptime_s"}},
+        // and offset, the exception code, what the app was doing. Never a path or a dump. 0.1.10:
+        // report_id, a random id made for that one crash, the same one its scrubbed log is sent with
+        // (POST /api/slicer/crash-log), so the two can be joined.
+        {"crash", {"version", "phase", "exception", "at", "recorded_by", "uptime_s", "what", "report_id"}},
         {"session_end", {"duration_s"}},
         // Slicing (Plater record_usage_slice): presets by their system names, setting names and values
         // (private keys and path-like values already dropped there), part measurements (never a mesh),
@@ -54,7 +56,7 @@ size_t max_len_for(const std::string &event, const std::string &key)
     // A crash's "at" is the faulting frame plus up to five callers ("UnlayeredSlicer.dll+0x4862937>..."),
     // about 30 characters a frame; at 120 the whole value was dropped and no 0.1.6/0.1.7 crash inside our
     // own code reported where it happened. UsageTelemetry cuts it to 190 at a frame boundary.
-    if (key == "error" || key == "why" || (event == "crash" && key == "at"))
+    if (key == "error" || key == "why" || (event == "crash" && (key == "at" || key == "what")))
         return 190;
     return 120;
 }

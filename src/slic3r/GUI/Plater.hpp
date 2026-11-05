@@ -3,6 +3,7 @@
 
 #include "libslic3r/Config.hpp"
 #include "libslic3r/PrintConfig.hpp"
+#include <exception>
 #include <cstddef>
 #include <map>
 #include "libslic3r/Technologies.hpp"
@@ -618,6 +619,9 @@ public:
     void send_to_printer(bool isall = false);
     void export_gcode(bool prefer_removable);
     void export_gcode_3mf(bool export_all = false);
+    // Unlayered: exports the selected sliced plate into a retained job and opens it in Bambu Connect
+    // (Utils/BambuConnect.hpp). Experimental, Bambu printer profiles on Windows and macOS only.
+    void open_in_bambu_connect();
     void send_gcode_finish(wxString name);
 
     // Hand the current plate to the external slicing service (SLICE_SERVICE_PROTOCOL.md).
@@ -739,6 +743,9 @@ public:
     bool has_toolpaths_to_export() const;
     void export_toolpaths_to_obj() const;
     void reslice();
+    // A slice the person asked for that threw on this (main) thread: the usual slicing error
+    // (notification + "slice" diagnostics), not a crash (UiException). Fatal kinds are rethrown.
+    void show_slice_exception(std::exception_ptr e);
     void reslice_SLA_supports(const ModelObject &object, bool postpone_error_messages = false);
     void reslice_SLA_hollowing(const ModelObject &object, bool postpone_error_messages = false);
     void reslice_SLA_until_step(SLAPrintObjectStep step, const ModelObject &object, bool postpone_error_messages = false);

@@ -2,6 +2,7 @@
 
 #include "libslic3r/libslic3r.h"
 #include "libslic3r/ClipperUtils.hpp"
+#include "libslic3r/Exception.hpp"
 #include "libslic3r/ExtrusionEntity.hpp"
 #include "libslic3r/ExtrusionEntityCollection.hpp"
 #include "libslic3r/Layer.hpp"
@@ -394,10 +395,79 @@ TEST_CASE("Nonplanar layers: two instances of one object both get the curved top
     CHECK(max_extrusion_z(gcode) <= zmax + 0.02);
 }
 
-TEST_CASE("Nonplanar layers: a cut-plane object slices, and a gentle cut face is not curved", "[NonplanarTop][cutplanes]")
+// UNLAYERED_MOD -- the dome of the dome case placed with an instance rotation and mirror, stored in the object turned
+// back by their inverse (a valid, outward-facing mesh) so the plate shows the same upright dome every time.
+static std::pair<LayerScan, double> placed_dome_scan(double angle, const Vec3d &axis, const Vec3d &mirror)
 {
-    // A box cut by a plane tilted 8 degrees: the lower segment's top is the cut face, which another
-    // segment rests on, so it must stay planar; the upper segment's flat top has no slope at all.
+    const HeightFn dome = [](double x, double y) { return 6. + 3. * (1. - (x * x + y * y) / 450.); };
+    Geometry::Transformation placement;
+    placement.set_rotation(angle * axis);
+    placement.set_mirror(mirror);
+    TriangleMesh mesh = heightfield_block(20., 20., 64, 64, dome);
+    mesh.transform(placement.get_matrix_no_offset().inverse(), true);
+    Model        model;
+    ModelObject *object = model.add_object();
+    object->name        = "placed_dome";
+    object->add_volume(std::move(mesh), ModelVolumeType::MODEL_PART, false);
+    ModelInstance *instance = object->add_instance();
+    instance->set_offset(Vec3d(100., 100., 0.));
+    instance->set_rotation(angle * axis);
+    instance->set_mirror(mirror);
+    object->ensure_on_bed();
+    Print print;
+    print.apply(model, base_config(true));
+    print.process();
+    const std::string gcode = Test::gcode(print);
+    REQUIRE(print.objects().size() == 1);
+    const double T    = 4 * kH;
+    auto         core = [](double x, double y) { return x * x + y * y < 14. * 14.; };
+    return { scan_layers(*print.objects().front(), dome, core, T), max_extrusion_z(gcode) };
+}
+
+// An object turned about X or Y on a flat plate is sliced along world Z like any other: its own rotation is part of
+// object_to_slice(), but the slice frame is not tilted, so its top is curved (log review 11/02: 22 chats got planar
+// layers with "sliced in a tilted frame" for a part laid on its side, flipped or auto-oriented).
+TEST_CASE("Nonplanar layers: an object flipped or laid on its side on the plate gets the curved top", "[NonplanarTop]")
+{
+    const auto [angle, axis] = GENERATE(std::make_pair(M_PI, Vec3d::UnitX().eval()), std::make_pair(0.5 * M_PI, Vec3d::UnitY().eval()));
+    INFO("instance rotation " << angle * 180. / M_PI << " degrees about (" << axis.transpose() << ")");
+    const auto [s, top_z] = placed_dome_scan(angle, axis, Vec3d::Ones());
+    INFO("shell paths " << s.shell_paths << ", top error " << s.max_shell_err << ", above " << s.max_above
+                        << ", stair excess " << s.max_stair_excess << ", top samples " << s.top_samples);
+    REQUIRE(s.shell_paths > 0);
+    CHECK(s.top_samples > 100);
+    CHECK(s.max_shell_err < 0.05);
+    CHECK(s.max_above < 0.02);
+    CHECK(s.max_stair_excess < 0.03);
+    CHECK(top_z <= 9. + 0.02);
+}
+
+// A mirrored part (scale -1 on an axis) has a left-handed placement: the mesh built in the slice frame for the
+// nonplanar analysis must keep its faces pointing out, or every top reads as a bottom and the part prints planar
+// without a word.
+TEST_CASE("Nonplanar layers: a mirrored object gets the same curved top as the original", "[NonplanarTop]")
+{
+    const auto [base, base_z] = placed_dome_scan(0., Vec3d::UnitZ(), Vec3d::Ones());
+    REQUIRE(base.shell_paths > 0);
+    const auto [angle, axis] = GENERATE(std::make_pair(0., Vec3d::UnitZ().eval()), std::make_pair(0.5 * M_PI, Vec3d::UnitY().eval()));
+    INFO("mirrored in X, instance rotation " << angle * 180. / M_PI << " degrees about (" << axis.transpose() << ")");
+    const auto [s, top_z] = placed_dome_scan(angle, axis, Vec3d(-1., 1., 1.));
+    INFO("shell paths " << s.shell_paths << " (original " << base.shell_paths << "), top error " << s.max_shell_err
+                        << ", above " << s.max_above << ", top samples " << s.top_samples);
+    REQUIRE(s.shell_paths > 0);
+    CHECK(std::abs(double(s.shell_paths) - double(base.shell_paths)) <= 0.05 * double(base.shell_paths));
+    CHECK(s.max_shell_err < 0.05);
+    CHECK(s.max_above < 0.02);
+    CHECK(std::abs(top_z - base_z) < 0.02);
+}
+
+TEST_CASE("Nonplanar layers: a gentle cut face is not curved; the tilted chunk's world-flat top may be", "[NonplanarTop][cutplanes]")
+{
+    // A box cut by a plane tilted 8 degrees: the lower (root) segment's top is the cut face, which the
+    // upper segment rests on, so it must stay planar (the h.cut rule). The upper segment prints in its
+    // own frame, tilted 8 degrees: its top is world-flat but 8 degrees off that frame, and since
+    // 67ae445ee3 a tilted chunk on a virtual printer gets curved tops measured against the upright
+    // nozzle, so that top is curved -- flat in world Z, not stair-stepped.
     Model        model;
     ModelObject *object = model.add_object();
     object->name        = "cut_box";
@@ -419,10 +489,54 @@ TEST_CASE("Nonplanar layers: a cut-plane object slices, and a gentle cut face is
     print.apply(model, config);
     REQUIRE_NOTHROW(print.process());
     REQUIRE_FALSE(Test::gcode(print).empty());
-    size_t shells = 0;
-    for (const PrintObject *obj : print.objects())
-        shells += scan_layers(*obj, [](double, double) { return 0.; }, [](double, double) { return true; }, 4 * kH).shell_paths;
-    CHECK(shells == 0);
+    const double top = object->instance_bounding_box(0).max.z();       // the box's world-flat top
+    size_t root_shells = 0, upper_shells = 0, top_samples = 0;
+    double top_lo = 1e9, top_hi = -1e9;
+    for (const PrintObject *obj : print.objects()) {
+        const Eigen::Matrix3d frame   = obj->object_to_slice().linear() * obj->trafo().linear().inverse();
+        const bool            upright = (frame * Vec3d::UnitZ()).normalized().z() > 1. - 1e-9;
+        const size_t shells = scan_layers(*obj, [](double, double) { return 0.; }, [](double, double) { return true; }, 4 * kH).shell_paths;
+        (upright ? root_shells : upper_shells) += shells;
+        if (upright)
+            continue;
+        // The visible curved layer of the tilted chunk, mapped from its slice frame back to the world.
+        const Transform3d to_world = instance->get_matrix() * obj->slice_to_object();
+        for (const Layer *layer : obj->layers())
+            for (const LayerRegion *lr : layer->regions())
+                for (const ExtrusionEntityCollection *coll : { &lr->fills, &lr->perimeters }) {
+                    std::function<void(const ExtrusionEntity *)> visit = [&](const ExtrusionEntity *e) {
+                        if (const auto *c = dynamic_cast<const ExtrusionEntityCollection *>(e)) {
+                            for (const ExtrusionEntity *x : c->entities) visit(x);
+                            return;
+                        }
+                        std::vector<const ExtrusionPath *> paths;
+                        if (const auto *p = dynamic_cast<const ExtrusionPath *>(e)) paths.push_back(p);
+                        else if (const auto *mp = dynamic_cast<const ExtrusionMultiPath *>(e)) for (const ExtrusionPath &p : mp->paths) paths.push_back(&p);
+                        else if (const auto *lp = dynamic_cast<const ExtrusionLoop *>(e)) for (const ExtrusionPath &p : lp->paths) paths.push_back(&p);
+                        for (const ExtrusionPath *p : paths) {
+                            if (! p->nonplanar_shell)
+                                continue;
+                            for (const Point3 &pt : p->polyline.points) {
+                                const Vec3d w = to_world * Vec3d(unscale<double>(pt.x()), unscale<double>(pt.y()),
+                                                                 layer->print_z + unscale<double>(pt.z()));
+                                if (w.z() > top - 0.5 * kH) {
+                                    top_lo = std::min(top_lo, w.z());
+                                    top_hi = std::max(top_hi, w.z());
+                                    ++ top_samples;
+                                }
+                            }
+                        }
+                    };
+                    visit(coll);
+                }
+    }
+    INFO("root shells " << root_shells << ", upper shells " << upper_shells << ", world top " << top << ", visible curved layer z "
+                        << top_lo << ".." << top_hi << " (" << top_samples << " points)");
+    CHECK(root_shells == 0);                     // the cut face stays planar
+    REQUIRE(upper_shells > 0);
+    REQUIRE(top_samples > 50);
+    CHECK(top_hi - top_lo < 0.05);               // flat in world Z: planar layers in the 8 degree frame would span ~2.8 mm
+    CHECK(top_hi < top + 0.02);
 }
 
 namespace {
@@ -1490,4 +1604,154 @@ TEST_CASE("Nonplanar layers: solid layers under the shell make up a curved count
     for (const Sliced *sl : { &s2, &s0 })
         for (const auto &[z, role, shell] : samples_near(*sl->print.objects().front(), 0., 0., 6.))
             CHECK(! (role == int(erIroning) && ! shell));
+}
+
+TEST_CASE("Nonplanar layers: hold back holds the safe part of a wall joined to a rim beside the top's highest point", "[NonplanarTop]")
+{
+    // Benchy's wheelhouse: a crowned deck (6 deg, rising stern to bow, 7 .. 10.15) inside a 1.2 mm rim with a flat top at 11,
+    // and a thin bulkhead (x -8, 1.2 mm) standing on the deck from the port rim to y -1, up to 14. The rim ring (with the
+    // bulkhead on some layers) is one piece at the deck's layers, and it stands right beside the highest point of every top
+    // (band) of the deck: as a whole it is never safe to print after a shell, and the old all-or-nothing choice held
+    // nothing. Its safe parts are held now (most of the ring, the bulkhead), so the deck curves up to them.
+    const double   tan6   = std::tan(6. * M_PI / 180.);
+    const HeightFn deck   = [tan6](double x, double) { return 7. + (x + 15.) * tan6; };
+    const HeightFn flat11 = [](double, double) { return 11.; };
+    const HeightFn flat14 = [](double, double) { return 14.; };
+    auto meshes = [&] {
+        std::vector<TriangleMesh> m;
+        m.push_back(block_at(0., 0., 0., 15., 8., 60, 4, deck));       // hull + deck
+        m.push_back(block_at(0., 7.4, 0., 15., 0.6, 4, 2, flat11));    // port rim
+        m.push_back(block_at(0., -7.4, 0., 15., 0.6, 4, 2, flat11));   // starboard rim
+        m.push_back(block_at(-14.4, 0., 0., 0.6, 8., 2, 4, flat11));   // stern rim
+        m.push_back(block_at(14.4, 0., 0., 0.6, 8., 2, 4, flat11));    // bow rim
+        m.push_back(block_at(-8., 3.1, 0., 0.6, 4.1, 2, 4, flat14));   // bulkhead, y -1 .. 7.2 (into the port rim)
+        return m;
+    };
+    DynamicPrintConfig held_cfg = base_config(true);
+    held_cfg.set_deserialize_strict({ { "nonplanar_hold_back", 1 } });
+    Sliced held, plain;
+    slice_volumes(held, meshes(), held_cfg);
+    slice_volumes(plain, meshes(), base_config(true));
+    dump("bulkhead_held", held.gcode);
+    const PrintObject &hpo = *held.print.objects().front();
+    const PrintObject &ppo = *plain.print.objects().front();
+    BoundingBox bb;
+    for (const ExPolygon &ex : hpo.layers().front()->lslices) bb.merge(get_extents(ex.contour));
+    const Vec2d c = unscale(bb.center());
+    auto has = [&](const Layer &l, double x, double y) {
+        const Point pt = Point::new_scale(x + c.x(), y + c.y());
+        for (const ExPolygon &ex : l.lslices) if (ex.contains(pt)) return true;
+        return false;
+    };
+    // Layers between the deck at the bulkhead (7.7) and the deck's host (~10.1): the bulkhead's far end (y 0) left the
+    // layer (held, printed after the shell); the bow rim, which the top's highest point is up against, did not.
+    int held_layers = 0, rim_kept = 0, n = 0;
+    for (const Layer *l : hpo.layers()) {
+        if (l->print_z < 8.4 || l->print_z > 9.6) continue;
+        ++ n;
+        if (! has(*l, -8., 0.)) ++ held_layers;
+        if (has(*l, 14.4, 0.)) ++ rim_kept;
+    }
+    // without hold back the bulkhead is in every layer
+    int plain_has = 0, pn = 0;
+    for (const Layer *l : ppo.layers())
+        if (l->print_z >= 8.4 && l->print_z <= 9.6) { ++ pn; if (has(*l, -8., 0.)) ++ plain_has; }
+    INFO("layers 8.4..9.6: " << n << ", bulkhead held in " << held_layers << ", bow rim kept in " << rim_kept << "; plain: bulkhead in " << plain_has << " of " << pn);
+    CHECK(n >= 5);
+    CHECK(plain_has == pn);
+    CHECK(held_layers == n);
+    CHECK(rim_kept == n);
+    // With the bulkhead and the rim held, the deck is curved over far more of it: full curved layers (4) across the deck
+    // (off the bulkhead, whose held walls print with the shells and would count as depths of their own), and more curved
+    // layers right beside the bulkhead on its downhill side.
+    int held4 = 0, plain4 = 0, held_near = 0, plain_near = 0;
+    for (double y = -5.5; y <= 5.5; y += 0.5)
+        for (double x = -13.; x <= 13.; x += 0.5) {
+            if (std::abs(x + 8.) < 1.2 && y > -2.) continue;
+            held4  += curved_layers_at(hpo, deck, x, y) == 4;
+            plain4 += curved_layers_at(ppo, deck, x, y) == 4;
+            if (x >= -7. && x <= -5. && y >= -0.5 && y <= 3.) {
+                held_near  += curved_layers_at(hpo, deck, x, y);
+                plain_near += curved_layers_at(ppo, deck, x, y);
+            }
+        }
+    const LayerScan sh = scan_layers(hpo, deck, [](double x, double y) { return x > -5. && x < 10. && std::abs(y) < 4.; }, 4 * kH, 10.4);
+    INFO("deck points with 4 curved layers: held " << held4 << ", plain " << plain4 << "; curved layers beside the bulkhead: held "
+                                                   << held_near << ", plain " << plain_near << "; top error " << sh.max_shell_err);
+    CHECK(held4 > plain4 + plain4 / 5);
+    CHECK(held_near > plain_near);
+    CHECK(sh.top_samples > 50);
+    CHECK(sh.max_shell_err < 0.05);
+    const Collision col = gcode_collisions(held.gcode);
+    INFO("collision " << col.depth << " at line " << col.line << " (" << col.count << ")");
+    CHECK(col.depth < 0.5 * kH + 0.05 + 1e-3);
+}
+
+namespace {
+// Sets the band test hook for a scope and always clears it again, whatever the slice does.
+struct BandHook
+{
+    explicit BandHook(void (*fn)()) { nonplanar_top_band_test_hook = fn; }
+    ~BandHook() { nonplanar_top_band_test_hook = nullptr; }
+};
+
+int g_band_hook_calls = 0;
+
+// The non-critical warnings the slicing step of an object recorded.
+std::vector<std::string> slice_warnings(const PrintObject &obj)
+{
+    std::vector<std::string> out;
+    for (const PrintStateBase::Warning &w : obj.step_state_with_warnings(posSlice).warnings)
+        if (w.level == PrintStateBase::WarningLevel::NON_CRITICAL)
+            out.push_back(w.message);
+    return out;
+}
+} // namespace
+
+TEST_CASE("Nonplanar layers: a fill that throws inside a band costs the band, not the slice", "[NonplanarTop]")
+{
+    // The gap fill of a curved layer runs a medial axis, which on geometry at its resolution limit THROWS
+    // (Slic3r::OutOfRange out of the Voronoi code) instead of coming back empty. The hook stands in for that at the
+    // same place. The slice has to finish, the top has to print planar, and the user has to be told once.
+    const HeightFn wedge = [](double x, double) { return 6. + (x + 12.5) * kTan8; };
+    Sliced off;
+    slice(off, heightfield_block(12.5, 10., 25, 4, wedge), base_config(false));
+
+    g_band_hook_calls = 0;
+    Sliced on;
+    {
+        BandHook hook([]() {
+            if (++ g_band_hook_calls == 1)
+                throw Slic3r::OutOfRange("Voronoi cell source index is out of range!");
+        });
+        REQUIRE_NOTHROW(slice(on, heightfield_block(12.5, 10., 25, 4, wedge), base_config(true)));
+    }
+    REQUIRE(g_band_hook_calls >= 1);
+    CHECK(! on.gcode.empty());
+
+    const PrintObject &obj    = *on.print.objects().front();
+    const PrintObject &planar = *off.print.objects().front();
+    // No curved material anywhere: the band of the only top was dropped whole.
+    CHECK(scan_layers(obj, wedge, [](double, double) { return true; }, 4 * kH).shell_paths == 0);
+    CHECK(curved_layers_at(obj, wedge, 0., 0.) == 0);
+    // The planar top shell the band would have replaced is printed instead, up to the same height as without the option.
+    CHECK(planar_solid_layers_at(planar, 0., 0.) > 0);
+    CHECK(planar_solid_layers_at(obj, 0., 0.) == planar_solid_layers_at(planar, 0., 0.));
+    CHECK(max_extrusion_z(on.gcode) == Catch::Approx(max_extrusion_z(off.gcode)).margin(1e-6));
+
+    // Exactly one non-critical warning more than the same object sliced planar.
+    const std::vector<std::string> warned = slice_warnings(obj), quiet = slice_warnings(planar);
+    INFO("warnings " << warned.size() << " vs " << quiet.size() << ": " << (warned.empty() ? std::string() : warned.back()));
+    CHECK(warned.size() == quiet.size() + 1);
+}
+
+TEST_CASE("Nonplanar layers: a cancel while a band is built still stops the slice", "[NonplanarTop]")
+{
+    // The band's guard catches Slic3r::CriticalException only. A cancel is not one, and must keep propagating:
+    // cancelling a print that happens to have a curved top may not quietly slice on.
+    const HeightFn wedge = [](double x, double) { return 6. + (x + 12.5) * kTan8; };
+    Sliced   on;
+    BandHook hook([]() { throw CanceledException(); });
+    CHECK_THROWS_AS(slice(on, heightfield_block(12.5, 10., 25, 4, wedge), base_config(true)), CanceledException);
+    CHECK(on.gcode.empty());
 }

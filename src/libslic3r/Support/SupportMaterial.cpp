@@ -2205,8 +2205,9 @@ SupportGeneratorLayersPtr PrintObjectSupportMaterial::top_contact_layers(
     // FLOATS above its base plane (a plane through empty space between disconnected shells produces
     // no cut face) genuinely has its whole first layer suspended, so for that case the natural scan
     // should include layer 0.
-    const bool floating_segment = object.is_segment() && ! object.is_root_segment()
-                               && ! object.segment()->touches_base_plane();
+    const bool floating_segment = (object.is_segment() && ! object.is_root_segment()
+                                   && ! object.segment()->touches_base_plane())
+                               || object.root_floats_above_plate();
     size_t layer_id_start = (this->has_raft() || floating_segment) ? 0 : 1;
 
     // INHERITED demand is a different matter, and must not be conflated with the above. A parent --

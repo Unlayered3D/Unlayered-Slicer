@@ -988,7 +988,9 @@ void PrintObject::contour_z()
     for (const ModelVolume *v : m_model_object->volumes)
         if (v->is_model_part() && (! this->is_segment() || segment_includes_volume(&*m_segment, *v))) {
             TriangleMesh vol_mesh(v->mesh());
-            vol_mesh.transform(v->get_matrix());
+            // UNLAYERED_MOD -- keep a mirrored volume or instance outward-facing: the analysis reads the top
+            // from the face normals (log review 11/02: a mirrored part got no curved top, silently)
+            vol_mesh.transform(v->get_matrix(), true);
             mesh.merge(vol_mesh);
         }
 
@@ -996,7 +998,7 @@ void PrintObject::contour_z()
     // segment's own build frame), Z floor correction or segment rebase, minus the center offset.
     // The mesh seen by the ray caster must match what was sliced.
     const Transform3d &trafo = this->object_to_slice();
-    mesh.transform(trafo);
+    mesh.transform(trafo, true);
 
     // A segment slices the UNCLIPPED mesh and then clips each layer by its half-spaces (see
     // PrintObject::slice), so its cut faces exist only as these planes. Map them into the slice
@@ -1023,8 +1025,10 @@ void PrintObject::contour_z()
     // (it skips the curved shell paths).
     // Only where the slice frame keeps world Z vertical: the clearance model assumes the nozzle
     // runs along the slice frame's Z. A tilted cut-plane segment (virtual or real 5-axis) is skipped.
-    const bool np_upright = (trafo.linear() * Vec3d::UnitZ()).normalized().z() > 1. - 1e-9 &&
-                            (trafo.linear().transpose() * Vec3d::UnitZ()).normalized().z() > 1. - 1e-9;
+    // The FRAME, not the part: trafo is the frame's rotation times the object's own placement
+    // (this->trafo()), and a part merely rotated on the plate (auto-orient) still slices in flat layers.
+    // A tilted frame is allowed too: NonplanarTop.cpp reduces the angle limits by the tilt and skips a chunk tilted past them.
+    const bool np_upright = true;
     if (nonplanar_top_requested(*this) && ! np_upright)
         BOOST_LOG_TRIVIAL(info) << "Nonplanar layers: skipped for a segment printed in a tilted frame";
     if (nonplanar_top_requested(*this) && np_upright) {
@@ -2486,6 +2490,11 @@ void PrintObject::detect_surfaces_type()
         if (interface_shells)
             surfaces_new.assign(num_layers, Surfaces());
 
+        // UNLAYERED_MOD -- a cut-plane chunk printed straight up (B 0): its first layer rests on its parent (see below).
+        double seg_b = 0., seg_c = 0.;
+        if (this->is_segment())
+            this->effective_layer_rotation_bc(seg_b, seg_c);
+        const bool upright_segment = this->is_segment() && std::abs(seg_b) < 1e-3;
         tbb::parallel_for(
             tbb::blocked_range<size_t>(0,
             	spiral_mode ?
@@ -2493,7 +2502,7 @@ void PrintObject::detect_surfaces_type()
             		((num_layers > 1) ? num_layers - 1 : num_layers) :
             		// In non-spiral vase mode, go over all layers.
             		m_layers.size()),
-            [this, region_id, interface_shells, &surfaces_new](const tbb::blocked_range<size_t>& range) {
+            [this, region_id, interface_shells, upright_segment, &surfaces_new](const tbb::blocked_range<size_t>& range) {
                 // If we have soluble support material, don't bridge. The overhang will be squished against a soluble layer separating
                 // the support from the print.
                 // BBS: the above logic only applys for normal(auto) support. Complete logic:
@@ -2540,6 +2549,28 @@ void PrintObject::detect_surfaces_type()
                         for (Surface &surface : top)
                             surface.surface_type = stTop;
                     }
+                    // UNLAYERED_MOD -- a level cut plane above this chunk (a Ceiling clip parallel to the layers): what the
+                    // next chunk prints straight on over is not a top, so no top shells grow down from it (the solid
+                    // band at an upright chunk transition, 2026-11-02). Tilted cuts keep their tops.
+                    if (! top.empty() && this->is_segment()) {
+                        const Transform3d     &trafo   = this->object_to_slice();
+                        const Eigen::Matrix3d  a_inv_t = trafo.linear().inverse().transpose();
+                        const double           z_next  = upper_layer != nullptr ? upper_layer->slice_z : layer->slice_z + layer->height;
+                        bool covered = false;
+                        for (const CutSegmentClip &clip : this->segment()->clips) {
+                            if (clip.role != CutClipRole::Ceiling)
+                                continue;
+                            const Vec3d n = (a_inv_t * clip.normal).normalized();
+                            if (std::hypot(n.x(), n.y()) > 1e-3)
+                                continue;
+                            const Vec3d  n_raw = a_inv_t * clip.normal;
+                            const double d     = clip.offset + n_raw.dot(trafo.translation());
+                            if (d - n_raw.z() * z_next < 0.)
+                                covered = true;
+                        }
+                        if (covered)
+                            top.clear();
+                    }
 
                     // Find bottom surfaces (difference between current surfaces of current layer and lower one).
                     Surfaces bottom;
@@ -2576,6 +2607,10 @@ void PrintObject::detect_surfaces_type()
                                 stBottom);
                         }
 #endif
+                    } else if (this->is_segment() && ! this->is_root_segment() && upright_segment) {
+                        // UNLAYERED_MOD -- the first layer of a cut-plane chunk that keeps printing straight up
+                        // lies on its own cut face, i.e. on the parent's material, not on air: no bottom shells
+                        // there (they showed as two solid layers mid-part, 2026-11-02).
                     } else {
                         // if no lower layer, all surfaces of this one are solid
                         // we clone surfaces because we're going to clear the slices collection
@@ -5446,6 +5481,15 @@ Vec3d PrintObject::build_normal_world() const
     double b_deg = 0., c_deg = 0.;
     this->effective_layer_rotation_bc(b_deg, c_deg);
     return Geometry::build_normal_from_bc(b_deg, c_deg);
+}
+
+// UNLAYERED_MOD -- see Print.hpp. 2026-11-03: "supports still dont work on parts floating off the
+// build plate" -- a lifted root got no support at all under its first layer (sample.3MF, 8.6 mm up).
+bool PrintObject::root_floats_above_plate() const
+{
+    if (! this->is_segment() || ! this->is_root_segment() || m_print->config().belt_printer.value)
+        return false;
+    return m_segment->root_builds_up && m_segment->slice_z_base() > m_print->config().initial_layer_print_height.value;
 }
 
 // BELT_MOD -- see Print.hpp.

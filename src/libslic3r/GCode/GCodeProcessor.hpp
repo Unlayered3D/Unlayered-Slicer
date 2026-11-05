@@ -273,10 +273,15 @@ inline constexpr float DEFAULT_FILAMENT_DENSITY = 1.245f;
             // Declarative cut planes: index of the segment ("section") this move belongs to, -1
             // for an ordinary object. Drives the section view in the preview.
             //
-            // KEEP THESE TWO LAST, IN THIS ORDER: this struct is brace-initialised positionally in
-            // store_move_vertex(), so an insert in the middle -- or swapping these two -- silently
+            // KEEP THESE LAST, IN THIS ORDER: this struct is brace-initialised positionally in
+            // store_move_vertex(), so an insert in the middle -- or swapping any of them -- silently
             // shifts every later field.
             int  cut_segment_id{-1};
+            // UNLAYERED_MOD: the PHYSICAL extruder (nozzle, 0-based) that made this move, -1 before
+            // the first tool change. `extruder_id` above is the filament. Lets the hotend collision
+            // check and the preview's envelope use that nozzle's own clearance pyramid on a
+            // dual-nozzle printer (HotendEnvelope::from_config(config, extruder)).
+            signed char physical_extruder_id{-1};
 
             float volumetric_rate() const { return feedrate * mm3_per_mm; }
             float actual_volumetric_rate() const { return actual_feedrate * mm3_per_mm; }

@@ -12,7 +12,10 @@
 #include <wx/button.h>
 #include <wx/checkbox.h>
 #include <wx/dialog.h>
+#include <wx/dirdlg.h>
+#include <wx/filedlg.h>
 #include <wx/modalhook.h>
+#include <wx/msgdlg.h>
 #include <wx/stattext.h>
 #include <wx/textctrl.h>
 #include <wx/utils.h>
@@ -146,11 +149,42 @@ std::vector<Pressable> buttons_of(wxDialog* dlg)
     return buttons;
 }
 
+// UNLAYERED_MOD -- a native dialog (the system's message box, file or folder picker) has no wx child controls, so
+// collect() reads nothing from it and the page saw an untitled dialog with no text and no buttons (log review
+// 11/02, dialog-block-without-a-dialog-to-name). Name its kind, and read a message box's text from the dialog itself.
+std::string native_kind(wxDialog* dlg)
+{
+    if (dynamic_cast<wxFileDialog*>(dlg) != nullptr)
+        return "file picker";
+    if (dynamic_cast<wxDirDialog*>(dlg) != nullptr)
+        return "folder picker";
+    if (dynamic_cast<wxMessageDialogBase*>(dlg) != nullptr)
+        return "message box";
+    return {};
+}
+
+std::string display_title(wxDialog* dlg)
+{
+    std::string title = clean_label(dlg->GetTitle());
+    if (title.empty()) {
+        const std::string kind = native_kind(dlg);
+        title = kind.empty() ? "untitled window" : "the system " + kind;
+    }
+    return title;
+}
+
 json describe(const OpenDialog& d)
 {
     json                   texts = json::array(), checks = json::array(), fields = json::array(), labels = json::array();
     std::vector<Pressable> buttons;
     collect(d.dialog, 0, texts, buttons, checks, fields);
+    if (auto* md = dynamic_cast<wxMessageDialogBase*>(d.dialog); md != nullptr && texts.empty()) {
+        for (const wxString& m : {md->GetMessage(), md->GetExtendedMessage()}) {
+            std::string t = clean_label(m);
+            if (!t.empty())
+                texts.push_back(t.size() > MAX_TEXT_CHARS ? t.substr(0, MAX_TEXT_CHARS) + "..." : t);
+        }
+    }
     for (const Pressable& b : buttons)
         labels.push_back({{"label", b.label}, {"enabled", b.window->IsEnabled()}});
     const std::string why = refusal(d);
@@ -160,6 +194,8 @@ json describe(const OpenDialog& d)
                 {"texts", texts},
                 {"buttons", labels},
                 {"answerable", why.empty()}};
+    if (const std::string kind = native_kind(d.dialog); !kind.empty())
+        out["kind"] = kind;
     if (!checks.empty())
         out["checkboxes"] = checks;
     if (!fields.empty())
@@ -248,9 +284,12 @@ json list()
 std::string busy_message()
 {
     if (s_open.empty())
-        return "a dialog is open";
+        // UNLAYERED_MOD -- the main window is disabled by something that is not a modal dialog (a progress window,
+        // a busy operation): there is nothing to list, so say what the person can do instead.
+        return "a dialog is open that the page cannot list (for example a progress window or a file picker); "
+               "ask the person to finish or close it, then try again";
     const OpenDialog& d = s_open.back();
-    std::string       m = "a dialog is open: \"" + clean_label(d.dialog->GetTitle()) + "\"";
+    std::string       m = "a dialog is open: \"" + display_title(d.dialog) + "\"";
     std::string       labels;
     for (const Pressable& b : buttons_of(d.dialog))
         labels += (labels.empty() ? "" : ", ") + b.label;

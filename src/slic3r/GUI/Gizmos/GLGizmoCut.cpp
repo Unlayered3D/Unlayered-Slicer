@@ -2662,6 +2662,10 @@ void GLGizmoCut3D::render_skeleton()
         return;
 
     const int inst_id       = m_c->selection_info()->get_active_instance();
+    // UNLAYERED_MOD -- no active instance (selection changing under the open gizmo): nothing to draw.
+    // 0.1.9 crash report: access violation here, GLGizmoSkeleton::on_render -> render_skeleton.
+    if (inst_id < 0 || size_t(inst_id) >= mo->instances.size())
+        return;
     const Transform3d world = mo->instances[inst_id]->get_matrix();
 
     const Camera& camera         = wxGetApp().plater()->get_camera();

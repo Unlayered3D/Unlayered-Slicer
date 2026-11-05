@@ -231,16 +231,69 @@ const char *HotendEnvelope::side_name(Side s)
     return names[size_t(s)];
 }
 
-HotendEnvelope HotendEnvelope::from_config(const ConfigBase &config)
+const std::vector<std::string> &HotendEnvelope::option_keys()
+{
+    static const std::vector<std::string> keys = { "nonplanar_hotend_cone_height",
+                                                   "nonplanar_hotend_angle_xpos", "nonplanar_hotend_angle_xneg",
+                                                   "nonplanar_hotend_angle_ypos", "nonplanar_hotend_angle_yneg" };
+    return keys;
+}
+
+// The printer_extruder_variant slot 0-based `extruder` uses in `config`, or -1 when the config has
+// no variant layout to resolve it with. The lookup of DynamicPrintConfig::get_index_for_extruder
+// (find_variant_index by printer_extruder_id plus the extruder_type / nozzle_volume_type variant
+// string), written against ConfigBase so it also serves a Print's static PrintConfig, whose variant
+// arrays -- printer_extruder_id and printer_extruder_variant included -- are already expanded per slot.
+static int hotend_envelope_slot(const ConfigBase &config, int extruder)
+{
+    const auto *ids      = config.option<ConfigOptionInts>("printer_extruder_id");
+    const auto *variants = config.option<ConfigOptionStrings>("printer_extruder_variant");
+    if (ids == nullptr || ids->values.empty())
+        return -1;
+    std::string want;
+    const auto *types = config.option<ConfigOptionEnumsGeneric>("extruder_type");
+    const auto *nvts  = config.option<ConfigOptionEnumsGeneric>("nozzle_volume_type");
+    if (types != nullptr && ! types->values.empty() && nvts != nullptr && ! nvts->values.empty()) {
+        NozzleVolumeType nvt = NozzleVolumeType(nvts->get_at(size_t(extruder)));
+        if (nvt == nvtHybrid)
+            nvt = nvtStandard; // presets carry no hybrid column, as in get_index_for_extruder
+        want = get_extruder_variant_string(ExtruderType(types->get_at(size_t(extruder))), nvt);
+    }
+    const int idx = find_variant_index(want, extruder + 1, variants != nullptr ? variants->values : std::vector<std::string>(), ids->values);
+    // find_variant_index answers 0 for an empty list: only an index whose id really matches counts.
+    return idx >= 0 && size_t(idx) < ids->values.size() && ids->values[size_t(idx)] == extruder + 1 ? idx : -1;
+}
+
+HotendEnvelope HotendEnvelope::from_config(const ConfigBase &config, int extruder)
 {
     HotendEnvelope env;
-    auto get = [&config](const char *key, double fallback) {
-        const auto *opt = config.option<ConfigOptionFloat>(key);
-        return opt == nullptr ? fallback : opt->value;
+    const int  slot       = extruder >= 0 ? hotend_envelope_slot(config, extruder) : -1;
+    const bool has_layout = config.option("printer_extruder_id") != nullptr;
+    // take_max: the conservative merge is the largest height but the smallest (fattest) angle.
+    auto get = [&config, extruder, slot, has_layout](const std::string &key, double fallback, bool take_max) {
+        const ConfigOption *raw = config.option(key);
+        if (raw == nullptr)
+            return fallback;
+        if (const auto *scalar = dynamic_cast<const ConfigOptionFloat *>(raw))
+            return scalar->value; // a scalar from an old in-memory config: one value for every nozzle
+        const auto *vec = dynamic_cast<const ConfigOptionFloats *>(raw);
+        if (vec == nullptr || vec->values.empty())
+            return fallback;
+        const std::vector<double> &v = vec->values;
+        if (extruder >= 0) {
+            if (slot >= 0 && size_t(slot) < v.size())
+                return v[size_t(slot)];
+            if (v.size() == 1)
+                return v.front();
+            if (! has_layout && size_t(extruder) < v.size())
+                return v[size_t(extruder)]; // a bare per-extruder list with no variant layout
+            // Unresolvable: the conservative value below rather than a guessed nozzle.
+        }
+        return take_max ? *std::max_element(v.begin(), v.end()) : *std::min_element(v.begin(), v.end());
     };
-    env.height = get("nonplanar_hotend_cone_height", env.height);
+    env.height = get("nonplanar_hotend_cone_height", env.height, true);
     for (int s = 0; s < 4; ++ s)
-        env.angle[s] = get(option_key(Side(s)), env.angle[s]);
+        env.angle[s] = get(option_key(Side(s)), env.angle[s], false);
     return env;
 }
 
@@ -250,13 +303,20 @@ void migrate_legacy_hotend_cone(DynamicPrintConfig &config)
     if (legacy == nullptr)
         return;
     const double full = legacy->value;
+    // The faces are per nozzle now: the one legacy cone becomes every nozzle's envelope, keeping the
+    // slot count the config already has (extend_default_config_length pads a single value).
+    auto set_all = [&config](const std::string &key, double value) {
+        const auto  *cur = config.option<ConfigOptionFloats>(key);
+        const size_t n   = cur != nullptr && ! cur->values.empty() ? cur->values.size() : 1;
+        config.set_key_value(key, new ConfigOptionFloats(n, value));
+    };
     if (full <= 0. || full >= 180.) {
         // 0 was the documented "disable the check" value; 180 never described a cone either.
-        config.set_key_value("nonplanar_hotend_cone_height", new ConfigOptionFloat(0.));
+        set_all("nonplanar_hotend_cone_height", 0.);
     } else {
         const double face = std::clamp(90. - 0.5 * full, 1., 90.);
         for (int s = 0; s < 4; ++ s)
-            config.set_key_value(HotendEnvelope::option_key(HotendEnvelope::Side(s)), new ConfigOptionFloat(face));
+            set_all(HotendEnvelope::option_key(HotendEnvelope::Side(s)), face);
     }
     config.erase("nonplanar_hotend_cone_angle");
 }
@@ -5928,7 +5988,10 @@ void PrintConfigDef::init_fff_params()
 
     // UNLAYERED_MOD -- hotend model for the post-slice collision check (multiplanar prints only).
     // The key keeps its old "cone" name so no saved preset loses its value; the model is a pyramid now.
-    def = this->add("nonplanar_hotend_cone_height", coFloat);
+    // Per nozzle (printer_options_with_variant_1): one value per printer_extruder_variant slot, so the
+    // Main and Auxiliary nozzle of a dual-nozzle printer each get their own envelope. A single value
+    // (every preset or project saved before this was per nozzle) applies to every nozzle.
+    def = this->add("nonplanar_hotend_cone_height", coFloats);
     def->label = L("Hotend envelope radius");
     def->category = L("Non-planar Printing");
     def->tooltip = L("After slicing a multiplanar print, the hotend is modelled as a four-sided pyramid with its apex "
@@ -5940,7 +6003,7 @@ void PrintConfigDef::init_fff_params()
     def->sidetext = L("mm");
     def->min = 0;
     def->mode = comAdvanced;
-    def->set_default_value(new ConfigOptionFloat(40.0));
+    def->set_default_value(new ConfigOptionFloats{ 40.0 });
 
     // UNLAYERED_MOD -- the four faces of the hotend envelope (HotendEnvelope in PrintConfig.hpp).
     // Measured from the bed plane, so 45 on all four is the old 90-degree cone.
@@ -5949,7 +6012,7 @@ void PrintConfigDef::init_fff_params()
                                        HotendFaceDef{ "nonplanar_hotend_angle_xneg", L("Hotend side angle -X (left)") },
                                        HotendFaceDef{ "nonplanar_hotend_angle_ypos", L("Hotend side angle +Y (back)") },
                                        HotendFaceDef{ "nonplanar_hotend_angle_yneg", L("Hotend side angle -Y (front)") } }) {
-        def = this->add(face.key, coFloat);
+        def = this->add(face.key, coFloats);
         def->label = face.label;
         def->category = L("Non-planar Printing");
         def->tooltip = L("Angle of this side of the hotend envelope, measured up from the bed plane with the nozzle "
@@ -5961,7 +6024,7 @@ void PrintConfigDef::init_fff_params()
         def->min = 1;
         def->max = 90;
         def->mode = comAdvanced;
-        def->set_default_value(new ConfigOptionFloat(45.0));
+        def->set_default_value(new ConfigOptionFloats{ 45.0 });
     }
 
     // Legacy: the single full opening angle the four faces replaced. Kept defined, hidden and out of
@@ -6114,7 +6177,11 @@ void PrintConfigDef::init_fff_params()
     def->enum_labels.push_back(L("A/C"));
     def->enum_labels.push_back(L("Virtual"));
     def->mode = comSimple; // UNLAYERED_MOD -- shown beside enable_nonplanar, which is Simple too
-    def->set_default_value(new ConfigOptionEnum<AxisSelection>(AxisSelection::BC));
+    // UNLAYERED_MOD -- Virtual by default (2026-11-03, 0.1.10): every printer that is not an Unlayered 5-axis
+    // machine is a 3-axis printer, and with B/C as the default those presets wrote rotary moves and failed with
+    // trunnion errors once non-planar printing was switched on. The Unlayered 5-axis profiles set "bc" themselves
+    // (fdm_common_5axis.json); a legacy config that recorded virtual_5axis = 0 keeps B/C (handle_legacy).
+    def->set_default_value(new ConfigOptionEnum<AxisSelection>(AxisSelection::Virtual));
 
     // Per-axis rotation limits (degrees). Read by the A/C output (GCode/TrunnionAC.cpp).
     auto add_axis_rotation_limit = [this](const std::string &opt, const std::string &label, double default_value) {
@@ -11577,6 +11644,10 @@ void PrintConfigDef::handle_legacy_composite(DynamicPrintConfig &config)
     if (config.has("virtual_5axis")) {
         if (config.opt_bool("virtual_5axis"))
             config.set_key_value("axis_selection", new ConfigOptionEnum<AxisSelection>(AxisSelection::Virtual));
+        // A config from before axis_selection that said "not virtual" meant the then-default B/C machine; the
+        // default is Virtual since 0.1.10, so say B/C explicitly.
+        else if (! config.has("axis_selection"))
+            config.set_key_value("axis_selection", new ConfigOptionEnum<AxisSelection>(AxisSelection::BC));
         // Drop the legacy key once it has been read. Nothing writes it back now that the
         // checkbox is gone, so leaving a stale true in a saved preset would re-run this
         // migration on every load and silently undo a later change of the dropdown -- the
@@ -11809,7 +11880,13 @@ std::set<std::string> printer_options_with_variant_1 = {
     // Per-variant hotend heat-up / cool-down rates (pre-heat time model)
     "hotend_cooling_rate",
     "hotend_heating_rate",
-    "nozzle_flush_dataset"
+    "nozzle_flush_dataset",
+    // UNLAYERED_MOD -- the hotend clearance envelope, per nozzle (HotendEnvelope::from_config)
+    "nonplanar_hotend_cone_height",
+    "nonplanar_hotend_angle_xpos",
+    "nonplanar_hotend_angle_xneg",
+    "nonplanar_hotend_angle_ypos",
+    "nonplanar_hotend_angle_yneg"
 };
 
 //options with silient mode
@@ -12218,6 +12295,10 @@ static void extend_extruder_variant(DynamicPrintConfig& config, const unsigned i
     // They are not extruder option keys, so the resize loop in set_num_extruders skips them.
     const auto &defaults = FullPrintConfig::defaults();
     for (const std::string &key : printer_options_with_variant_2)
+        if (auto *opt = config.option<ConfigOptionFloats>(key))
+            opt->resize(config.get_parameter_size(key, num_extruders), defaults.option(key));
+    // UNLAYERED_MOD -- nor is the per-nozzle hotend envelope.
+    for (const std::string &key : HotendEnvelope::option_keys())
         if (auto *opt = config.option<ConfigOptionFloats>(key))
             opt->resize(config.get_parameter_size(key, num_extruders), defaults.option(key));
 }

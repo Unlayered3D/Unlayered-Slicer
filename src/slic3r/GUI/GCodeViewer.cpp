@@ -1830,7 +1830,18 @@ void GCodeViewer::load_as_gcode(const GCodeProcessorResult& gcode_result, const 
     // envelope stands vertical because the physical nozzle does.
     {
         const PrintConfig& print_config = wxGetApp().plater()->get_partplate_list().get_current_fff_print().config();
-        m_sequential_view.marker.set_envelope(gcode_result.tool_axes.size() > 1, HotendEnvelope::from_config(print_config));
+        // Per nozzle: render_markers() swaps in the envelope of the nozzle making the current move.
+        m_envelope_on           = gcode_result.tool_axes.size() > 1;
+        m_envelope_conservative = HotendEnvelope::from_config(print_config);
+        m_extruder_envelopes.clear();
+        for (size_t x = 0; x < print_config.nozzle_diameter.values.size(); ++x)
+            m_extruder_envelopes.push_back(HotendEnvelope::from_config(print_config, int(x)));
+        m_envelope_extruder_changes.clear();
+        if (m_envelope_on && m_extruder_envelopes.size() > 1)
+            for (const GCodeProcessorResult::MoveVertex& m : gcode_result.moves)
+                if (m_envelope_extruder_changes.empty() || m_envelope_extruder_changes.back().second != int(m.physical_extruder_id))
+                    m_envelope_extruder_changes.emplace_back(m.gcode_id, int(m.physical_extruder_id));
+        m_sequential_view.marker.set_envelope(m_envelope_on, m_envelope_conservative);
     }
 
     m_gcode_check_result = gcode_result.gcode_check_result;
@@ -2270,6 +2281,14 @@ void GCodeViewer::render_markers(int canvas_width, int canvas_height)
     // GCodeProcessorResult::tool_axis_fixed.
     m_sequential_view.marker.set_tool_axis(m_tool_axis_fixed ? m_fixed_tool_axis
                                                              : libvgcode::convert(m_viewer.get_tool_axis(curr_vertex.tool_axis_id)));
+    // UNLAYERED_MOD: the envelope of the nozzle that makes this move (set_envelope is a no-op when unchanged).
+    if (m_envelope_on && !m_envelope_extruder_changes.empty()) {
+        auto it = std::upper_bound(m_envelope_extruder_changes.begin(), m_envelope_extruder_changes.end(), curr_vertex.gcode_id,
+                                   [](unsigned int id, const std::pair<unsigned int, int>& c) { return id < c.first; });
+        const int x = it == m_envelope_extruder_changes.begin() ? -1 : std::prev(it)->second;
+        m_sequential_view.marker.set_envelope(true, x >= 0 && size_t(x) < m_extruder_envelopes.size() ? m_extruder_envelopes[size_t(x)]
+                                                                                                    : m_envelope_conservative);
+    }
 
     // IDEX/IQEX: compute all carriage positions; update secondary nozzle markers;
     // carriage_box_draws is populated for toolhead footprint rendering after render_marker().

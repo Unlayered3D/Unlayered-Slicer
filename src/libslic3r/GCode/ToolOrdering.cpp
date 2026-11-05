@@ -3407,6 +3407,33 @@ void ToolOrdering::assign_custom_gcodes(const Print &print)
 	}
 }
 
+// UNLAYERED_MOD: the codes the layers of the object being printed point to. One object instance at a
+// time, like custom_gcode_per_print_z above: refilled before each instance is printed.
+static std::vector<CustomGCode::Item> custom_gcodes_sequential;
+void ToolOrdering::assign_custom_gcodes_sequential(const Print &print, int sequential_object)
+{
+    assert(print.config().print_sequence == PrintSequence::ByObject);
+    for (LayerTools &lt : m_layer_tools)
+        lt.custom_gcode = nullptr;
+    custom_gcodes_sequential.clear();
+    for (const CustomGCode::Item &item : print.model().get_curr_plate_custom_gcodes().gcodes)
+        if (item.sequential_object == sequential_object &&
+            (item.type == CustomGCode::PausePrint || item.type == CustomGCode::Custom || item.type == CustomGCode::Template))
+            custom_gcodes_sequential.push_back(item);
+    if (custom_gcodes_sequential.empty() || m_layer_tools.empty())
+        return;
+    // Each code goes to the layer it was added on (the slider stores that layer's print_z), or the
+    // nearest one; never to a layer more than half a layer away. Several on one layer: the last wins.
+    for (const CustomGCode::Item &item : custom_gcodes_sequential) {
+        auto it = std::min_element(m_layer_tools.begin(), m_layer_tools.end(), [&item](const LayerTools &a, const LayerTools &b) {
+            return std::abs(a.print_z - item.print_z) < std::abs(b.print_z - item.print_z);
+        });
+        coordf_t below = it == m_layer_tools.begin() ? 0. : std::prev(it)->print_z;
+        if (std::abs(it->print_z - item.print_z) <= 0.5 * (it->print_z - below) + EPSILON)
+            it->custom_gcode = &item;
+    }
+}
+
 const LayerTools& ToolOrdering::tools_for_layer(coordf_t print_z) const
 {
     auto it_layer_tools = std::lower_bound(m_layer_tools.begin(), m_layer_tools.end(), LayerTools(print_z - EPSILON));

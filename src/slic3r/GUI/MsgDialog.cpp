@@ -542,7 +542,16 @@ int RichMessageDialog::ShowModal()
         show_dsa_button(m_checkBoxText);
         m_checkbox_dsa->SetValue(m_checkBoxValue);
     }
+    // Unlayered 0.1.10: the Set*Labels() calls only store the labels, and apply_style() built the
+    // buttons with the default ones before any of them could run, so every custom label showed as
+    // Yes / No / Cancel / OK (found on macOS with the Bambu Connect guide).
+    for (const auto &[id, label] : {std::pair<wxWindowID, const wxString &>{wxID_YES, m_yes}, {wxID_NO, m_no},
+                                    {wxID_CANCEL, m_cancel}, {wxID_OK, m_ok}, {wxID_HELP, m_help}})
+        if (!label.empty())
+            if (Button *btn = get_button(id))
+                btn->SetLabel(label);
     Layout();
+    Fit();
 
     return MsgDialog::ShowModal();
 }

@@ -260,6 +260,14 @@ private:
     // See GCodeProcessorResult::tool_axis_fixed.
     bool  m_tool_axis_fixed{ false };
     Vec3f m_fixed_tool_axis{ Vec3f::UnitZ() };
+    // UNLAYERED_MOD: the hotend envelope per nozzle (physical extruder), and the G-code line ids at
+    // which the printing nozzle changes, so the marker draws the envelope of the nozzle that makes the
+    // current move -- the one HotendCollisionCheck tested it with. Before the first tool change, or
+    // for a nozzle past the end of the list, the conservative envelope over every nozzle.
+    bool                                           m_envelope_on{ false };
+    HotendEnvelope                                 m_envelope_conservative;
+    std::vector<HotendEnvelope>                    m_extruder_envelopes;
+    std::vector<std::pair<unsigned int, int>>      m_envelope_extruder_changes; // (first gcode_id, physical extruder)
 
     ConfigOptionMode m_user_mode;
     bool m_fold = {false};

@@ -274,6 +274,9 @@ Info IMSlider::GetTicksValues() const
         for (const TickCode &tick : m_ticks.ticks) {
             if (tick.tick > val_size) break;
             values.emplace_back(CustomGCode::Item{m_values[tick.tick], tick.type, tick.extruder, tick.color, tick.extra});
+            // UNLAYERED_MOD: in a print by object a print_z alone does not say which object
+            if (m_draw_mode == dmSequentialFffPrint)
+                values.back().sequential_object = sequential_object_of_tick(tick.tick);
         }
 
     if (m_force_mode_apply) custom_gcode_per_print_z.mode = m_mode;
@@ -294,10 +297,17 @@ void IMSlider::SetTicksValues(const Info &custom_gcode_per_print_z)
 
     m_ticks.ticks.clear();
     const std::vector<CustomGCode::Item> &heights = custom_gcode_per_print_z.gcodes;
+    // UNLAYERED_MOD: in a print by object, a code goes on its own object's layer. One without an
+    // object (added by layer, or from an older project) can't be placed and is dropped, as every
+    // code used to be in this mode.
+    bool dropped = false;
     for (auto h : heights) {
-        int tick = get_tick_from_value(h.print_z, true);
+        int tick = m_draw_mode != dmSequentialFffPrint ? get_tick_from_value(h.print_z, true) :
+                   h.sequential_object >= 0            ? tick_in_sequential_object(h.sequential_object, h.print_z) : -1;
         if (tick >= 0) m_ticks.ticks.emplace(TickCode{tick, h.type, h.extruder, h.color, h.extra});
+        else dropped |= m_draw_mode == dmSequentialFffPrint;
     }
+    if (dropped) post_ticks_changed_event();
 
     if (m_ticks.has_tick_with_code(ToolChange) && !m_can_change_color) {
         if (!wxGetApp().plater()->only_gcode_mode() && !wxGetApp().plater()->using_exported_file())
@@ -322,13 +332,16 @@ void IMSlider::SetTicksValues(const Info &custom_gcode_per_print_z)
     //    return false;
     //};
     if ((!m_ticks.empty() /*&& has_tick_execpt(PausePrint)*/) && m_draw_mode == dmSequentialFffPrint) {
+        // UNLAYERED_MOD: pauses and custom G-code stay; color and tool changes still go
+        bool erased = false;
         for (auto it{ m_ticks.ticks.begin() }, end{ m_ticks.ticks.end() }; it != end;) {
-            if (true/*it->type != PausePrint*/)
+            if (!sequential_codes_allowed() || (it->type != PausePrint && it->type != Custom && it->type != Template)) {
                 it = m_ticks.ticks.erase(it);
-            else
+                erased = true;
+            } else
                 ++it;
         }
-        post_ticks_changed_event();
+        if (erased) post_ticks_changed_event();
     }
 
     if (custom_gcode_per_print_z.mode && !custom_gcode_per_print_z.gcodes.empty()) m_ticks.mode = custom_gcode_per_print_z.mode;
@@ -1544,7 +1557,8 @@ void IMSlider::render_add_menu()
         m_show_menu = false;
     }
     if (ImGui::BeginPopup("slider_add_menu_popup", ImGuiWindowFlags_NoMove)) {
-        bool menu_item_enable = m_draw_mode != dmSequentialFffPrint;
+        // UNLAYERED_MOD: also in a print by object (see sequential_codes_allowed())
+        bool menu_item_enable = m_draw_mode != dmSequentialFffPrint || sequential_codes_allowed();
         bool hovered = false;
         {
             if (menu_item_with_icon(_u8L("Add Pause").c_str(), "", ImVec2(0, 0), 0, false, menu_item_enable, &hovered)) {
@@ -1810,6 +1824,30 @@ double IMSlider::get_double_value(const SelectedSlider &selection)
         return m_values.back();
     }
     return m_values[selection == ssLower ? m_lower_value : m_higher_value];
+}
+
+int IMSlider::sequential_object_of_tick(int tick) const
+{
+    int object = 0;
+    for (int i = 1; i <= tick && i < int(m_values.size()); ++i)
+        if (m_values[i] <= m_values[i - 1] + epsilon())
+            ++object;
+    return object;
+}
+
+int IMSlider::tick_in_sequential_object(int object, double print_z) const
+{
+    int current = 0;
+    for (int i = 0; i < int(m_values.size()); ++i) {
+        if (i > 0 && m_values[i] <= m_values[i - 1] + epsilon())
+            ++current;
+        if (current > object)
+            break;
+        // The object's first layer at or above print_z, as get_tick_from_value() does for a whole print
+        if (current == object && m_values[i] >= print_z - epsilon())
+            return i;
+    }
+    return -1;
 }
 
 int IMSlider::get_tick_from_value(double value, bool force_lower_bound /* = false*/)

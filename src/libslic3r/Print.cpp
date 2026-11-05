@@ -2380,6 +2380,7 @@ StringObjectException Print::validate(std::vector<StringObjectException> *warnin
     // objection does not apply to the gizmo, where the plane visibly stops where it is stored.)
     if (m_config.enable_nonplanar.value && m_config.virtual_5axis.value) {
         const double         manual   = m_config.nonplanar_virtual_max_angle.value;
+        // Conservative over every nozzle: a chunk's tilt is fixed before it is known which nozzle prints it.
         const HotendEnvelope envelope = HotendEnvelope::from_config(m_config);
         // BELT_MOD: the upright nozzle stands along the machine's build direction -- world +Z on a
         // flat bed, the gantry normal on a belt -- so on a belt the tilt and its azimuth are measured
@@ -2437,6 +2438,48 @@ StringObjectException Print::validate(std::vector<StringObjectException> *warnin
                                  HotendEnvelope::side_name(face));
             ret.opt_key = gantry_bound ? "nonplanar_gantry_height" : HotendEnvelope::option_key(face);
             ret.object  = const_cast<ModelObject *>(object->model_object());
+            return ret;
+        }
+    }
+
+    // UNLAYERED_MOD -- virtual 5-axis total-height limit, the part of it that is decidable from the
+    // plate alone. "Max print height (from the bed)" is an absolute Z, but it sits in the same group
+    // directly under "Gantry height above nozzle", which is a clearance, and it gets entered as one:
+    // a few millimetres of headroom above the part. A limit below the top of the part itself can
+    // never be met -- the nozzle has to reach the top to print it -- so say so here, before anything
+    // is sliced, rather than letting it cost a whole slice and G-code export first.
+    //
+    // The post-export scan in export_gcode() stays as the backstop: it is the only thing that sees
+    // the transition hops, which climb above the part and are the reason a limit that clears the
+    // part can still be exceeded.
+    if (m_config.enable_nonplanar.value && m_config.virtual_5axis.value && ! m_config.belt_printer.value &&
+        m_config.nonplanar_virtual_max_z.value > 0.) {
+        const double       limit   = m_config.nonplanar_virtual_max_z.value;
+        const PrintObject *tallest = nullptr;
+        double             top_z   = 0.;
+        for (const PrintObject *object : m_objects) {
+            // Top of the object in the plate frame, the same measure the wipe tower clearance
+            // checks use, so a tilted or cut object counts at the height it actually stands.
+            const double object_top = unscaled<double>(object->max_z());
+            if (tallest == nullptr || object_top > top_z) {
+                tallest = object;
+                top_z   = object_top;
+            }
+        }
+        if (tallest != nullptr && top_z > limit + EPSILON) {
+            StringObjectException ret;
+            // Same setting path and the same "measured from the bed" wording as the post-export
+            // refusal, so a user who has seen one recognises the other.
+            ret.string = Slic3r::format(_u8L("The object %1% reaches Z%2% mm, above the %3% mm set in Printer settings > "
+                                             "Motion ability > Non-planar Printing > \"Max print height (from the bed)\". "
+                                             "That limit is an absolute height measured from the bed, not a clearance above "
+                                             "the part, so the nozzle could not reach the top of this object. Set it to the "
+                                             "printer's build height, or to 0 for no limit."),
+                                        tallest->model_object()->name,
+                                        (boost::format("%.1f") % top_z).str(),
+                                        (boost::format("%.1f") % limit).str());
+            ret.opt_key = "nonplanar_virtual_max_z";
+            ret.object  = tallest->model_object();
             return ret;
         }
     }
@@ -3771,18 +3814,22 @@ void Print::run_segment_support_cascade(const std::vector<PrintObject*> &family)
         // disconnected shells produces no cut face) has its whole first layer suspended. The stock
         // generators assume layer 0 rests on the ground, so nothing would support it: seed the
         // demand explicitly, before this segment generates.
-        if (! child->is_root_segment() && ! child->segment()->touches_base_plane() && child->layer_count() > 0
-            && ! segment_demand_allowed(child)) {
+        // A root lifted off the plate (auto-drop off) is suspended the same way, over the plate.
+        const bool floats = child->is_root_segment() ? child->root_floats_above_plate()
+                                                     : ! child->segment()->touches_base_plane();
+        if (floats && child->layer_count() > 0 && ! segment_demand_allowed(child)) {
             BOOST_LOG_TRIVIAL(info) << "Cut planes: segment " << child->segment_index()
                                     << " floats above its base plane, but support_type is manual;"
                                     << " not seeding it -- paint an enforcer to support it.";
         }
-        else if (! child->is_root_segment() && ! child->segment()->touches_base_plane() && child->layer_count() > 0) {
+        else if (floats && child->layer_count() > 0) {
             std::vector<Polygons> seed(1);
             seed[0] = to_polygons(child->get_layer(0)->lslices);
-            BOOST_LOG_TRIVIAL(info) << "Cut planes: segment " << child->segment_index()
-                                    << " floats " << child->segment()->base_plane_distance_below_material
-                                    << "mm above its base plane; seeding its first layer as unsupported";
+            BOOST_LOG_TRIVIAL(info) << "Cut planes: segment " << child->segment_index() << " floats "
+                                    << (child->is_root_segment() ? child->segment()->slice_z_base()
+                                                                 : child->segment()->base_plane_distance_below_material)
+                                    << (child->is_root_segment() ? "mm above the build plate" : "mm above its base plane")
+                                    << "; seeding its first layer as unsupported";
             child->add_segment_body_demand(seed);
         }
 
@@ -4632,7 +4679,11 @@ std::string Print::export_gcode(const std::string& path_template, GCodeProcessor
         // BELT_MOD: the belt machine frame shears the emitted coordinates, which this check reads as bed-frame.
         if (! m_conflict_result && ! m_no_check && m_config.enable_nonplanar.value && ! m_config.belt_printer.value && result->tool_axes.size() > 1) {
             HotendCollisionParams hp;
+            // Each nozzle's own envelope for the moves it makes (MoveVertex::physical_extruder_id); the
+            // conservative one over every nozzle for a move made before the first tool change.
             hp.envelope = HotendEnvelope::from_config(m_config);
+            for (size_t x = 0; x < m_config.nozzle_diameter.values.size(); ++ x)
+                hp.extruder_envelopes.push_back(HotendEnvelope::from_config(m_config, int(x)));
             // A 3-axis printer never tilts its nozzle, whatever axis the chunk was tagged with.
             hp.upright  = m_config.virtual_5axis.value;
             if (trunnion_ac_enabled(this->full_print_config()))
@@ -4721,6 +4772,11 @@ std::string Print::export_gcode(const std::string& path_template, GCodeProcessor
                     }
                 }
             }
+            // UNLAYERED_MOD -- the written Z includes the printer's Z offset (the writer adds it, as
+            // GCode.cpp's max_extrusion_z() - z_offset knows): measure from the plate, or a printer with a
+            // negative Z offset has every virtual 5-axis slice refused as "below the build plate".
+            low_z   -= m_config.z_offset.value;
+            worst_z -= m_config.z_offset.value;
             height_limit_exceeded = check_height && worst_z > limit + EPSILON;
             below_plate           = check_floor && low_z < - EPSILON;
             if (below_plate) {

@@ -3549,7 +3549,10 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
                             type = static_cast<CustomGCode::Type>(tree.get<int>("<xmlattr>.type"));
                             extra = tree.get<std::string>("<xmlattr>.extra");
                         }
-                        m_model->plates_custom_gcodes[plate_id - 1].gcodes.push_back(CustomGCode::Item{ print_z, type, extruder, color, extra });
+                        CustomGCode::Item item{ print_z, type, extruder, color, extra };
+                        // UNLAYERED_MOD: the object a pause belongs to in a print by object (absent: by layer)
+                        item.sequential_object = tree.get<int>("<xmlattr>.sequential_object", -1);
+                        m_model->plates_custom_gcodes[plate_id - 1].gcodes.push_back(item);
                     }
                 }
             };
@@ -9267,6 +9270,9 @@ bool _BBS_3MF_Exporter::_add_custom_gcode_per_print_z_file_to_archive(mz_zip_arc
                 code_tree.put("<xmlattr>.extruder", code.extruder);
                 code_tree.put("<xmlattr>.color", code.color);
                 code_tree.put("<xmlattr>.extra", code.extra);
+                // UNLAYERED_MOD: written only when set, so a print-by-layer project's file is unchanged
+                if (code.sequential_object >= 0)
+                    code_tree.put("<xmlattr>.sequential_object", code.sequential_object);
 
                 //BBS
                 std::string gcode = //code.type == CustomGCode::ColorChange ? config->opt_string("color_change_gcode")    :
