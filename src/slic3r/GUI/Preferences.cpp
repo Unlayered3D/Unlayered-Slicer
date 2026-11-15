@@ -2640,6 +2640,34 @@ void PreferencesDialog::create_items()
         "preview_default_view_type", PreviewViewTypeLabels, PreviewViewTypeValues);
     g_sizer->Add(item_preview_view_type);
 
+    auto item_reduced_detail_mode = create_item_combobox(
+        _L("Simplify preview while dragging"),
+        _L("What the sliced preview draws while you drag the camera or a preview slider, or zoom with the mouse wheel, so that large prints stay responsive. "
+           "The full toolpaths are restored as soon as you let go.\n"
+           "Off: the full toolpaths.\n"
+           "Solid model: the sliced objects and the prime tower as solid shapes in the colors of the current view, cut to the visible layer range, "
+           "with its bottom and top layers and the supports drawn as toolpaths. Negative volumes are not cut out. "
+           "A print made object by object, or one on a belt printer, keeps its full toolpaths.\n"
+           "Shell only: every layer without its sparse infill, internal solid infill, internal bridges and gap fill, which lie under the walls and skins. "
+           "Walls, top and bottom surfaces, bridges, supports and the prime tower are drawn whole, so the print looks the same from outside.\n"
+           "The bottom and top layers of the visible range are always drawn whole; a layer with no infill of its own, as with infill combination, takes the layers down to the nearest one with infill along."),
+        "preview_reduced_detail_mode",
+        {_L("Off"), _L("Solid model"), _L("Shell only")},
+        {"off", "solid", "shell"},
+        "",
+        // apply the new mode immediately to the currently loaded preview
+        [](const std::string &value) {
+            if (Plater* plater = wxGetApp().plater()) {
+                if (GLCanvas3D* canvas = plater->get_preview_canvas3D()) {
+                    canvas->get_gcode_viewer().set_reduced_detail_mode(value);
+                    canvas->set_as_dirty();
+                    canvas->request_extra_frame();
+                }
+            }
+        }
+    );
+    g_sizer->Add(item_reduced_detail_mode);
+
     auto item_dim_previous_layers = create_item_checkbox(
         _L("Dim lower layers"),
         _L("When scrubbing the layer slider in the sliced preview, render the layers below the current one darkened so that only the layer being viewed is shown at full brightness."),

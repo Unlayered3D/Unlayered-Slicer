@@ -17,6 +17,8 @@
 #include <ios>
 #include <string>
 
+#include <string>
+
 using namespace Slic3r;
 
 TEST_CASE("Full collision-volume previews are opt-in and retain the user's preference", "[AppConfig][ExclusionVolume]")
@@ -154,6 +156,7 @@ TEST_CASE("Local machine agent replacements survive save and reload", "[AppConfi
     saved.printer_type     = "test-model";
     saved.printer_agent_id = "orca";
     saved.access_code      = "old-key";
+    saved.ca_file          = "old-ca.crt";
     config.update_local_machine(saved);
     config.save();
     REQUIRE_FALSE(config.dirty());
@@ -161,6 +164,7 @@ TEST_CASE("Local machine agent replacements survive save and reload", "[AppConfi
     BBLocalMachine replacement = saved;
     replacement.printer_agent_id = "moonraker";
     replacement.access_code = GENERATE("", "new-key", "88888888");
+    replacement.ca_file     = GENERATE("", "new-ca.crt");
     config.update_local_machine(replacement);
     REQUIRE(config.dirty());
     REQUIRE(config.get_local_machines().at(saved.dev_id) == replacement);
@@ -172,6 +176,29 @@ TEST_CASE("Local machine agent replacements survive save and reload", "[AppConfi
     REQUIRE_FALSE(reloaded.dirty());
     reloaded.update_local_machine(replacement);
     REQUIRE_FALSE(reloaded.dirty());
+}
+
+TEST_CASE("Local machines saved without an agent load as Bambu printers unless keyed by address", "[AppConfig]")
+{
+    ScopedDataDir data_dir("local-machine-legacy");
+    save_main_thread_id();
+    const std::string agent_field = GENERATE("", R"("printer_agent_id": "",)");
+    AppConfig config;
+    std::ofstream(config.config_path()) << R"({"local_machines": {)"
+                                        << R"("01P00A000000001": {)" << agent_field << R"("dev_ip": "192.0.2.20"},)"
+                                        << R"("192.0.2.30:7125": {)" << agent_field << R"("dev_ip": "192.0.2.30:7125"},)"
+                                        << R"("192.0.2.31:7125": {)" << agent_field << R"("dev_ip": "192.0.2.32"},)"
+                                        << R"("voron": {)" << agent_field << R"("dev_ip": "voron"},)"
+                                        << R"("01P00A000000002": {"printer_agent_id": "moonraker", "dev_ip": "192.0.2.40"})"
+                                        << "}}";
+
+    REQUIRE(config.load().empty());
+    const auto& machines = config.get_local_machines();
+    CHECK(machines.at("01P00A000000001").printer_agent_id == "bbl");
+    CHECK(machines.at("192.0.2.30:7125").printer_agent_id.empty());
+    CHECK(machines.at("192.0.2.31:7125").printer_agent_id.empty());
+    CHECK(machines.at("voron").printer_agent_id.empty());
+    CHECK(machines.at("01P00A000000002").printer_agent_id == "moonraker");
 }
 
 TEST_CASE("Clearing local credentials preserves another agent's record", "[AppConfig]")
@@ -382,3 +409,27 @@ TEST_CASE("A backup without the checksum line is not restored", "[AppConfig][Reg
     CHECK(config.get("k").empty());
 }
 #endif
+
+TEST_CASE("AppConfig keeps only the preview drag modes it knows", "[AppConfig]") {
+    AppConfig config;
+    const std::string key = "preview_reduced_detail_mode";
+
+    SECTION("a missing value becomes off") {
+        config.set_defaults();
+        REQUIRE(config.get(key) == "off");
+    }
+
+    SECTION("a known mode is kept") {
+        const std::string mode = GENERATE("off", "solid", "shell");
+        config.set(key, mode);
+        config.set_defaults();
+        REQUIRE(config.get(key) == mode);
+    }
+
+    SECTION("an unknown mode falls back to off") {
+        const std::string mode = GENERATE("layers", "outer_walls", "");
+        config.set(key, mode);
+        config.set_defaults();
+        REQUIRE(config.get(key) == "off");
+    }
+}

@@ -44,7 +44,8 @@ void host_bindings::register_model(py::module_& host)
         .value("PreciseSeamEnforced", ModelVolumeType::PRECISE_SEAM_ENFORCED)
         .value("PreciseSeamBlocked", ModelVolumeType::PRECISE_SEAM_BLOCKED)
         .value("PreciseSeamNeutral", ModelVolumeType::PRECISE_SEAM_NEUTRAL)
-        .value("InfillMesh", ModelVolumeType::INFILL_MESH);
+        .value("InfillMesh", ModelVolumeType::INFILL_MESH)
+        .value("PaintedModifier", ModelVolumeType::PAINTED_MODIFIER);
 
     py::class_<ModelVolume, std::unique_ptr<ModelVolume, py::nodelete>>(host, "ModelVolume")
         .def("id", [](const ModelVolume& volume) { return volume.id().id; })

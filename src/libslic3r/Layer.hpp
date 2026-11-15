@@ -249,6 +249,8 @@ public:
 
     // Whether two regions can be printed in a continues perimeter
     static bool             is_perimeter_compatible(const Print& print, const PrintRegion& a, const PrintRegion& b);
+    // Moves a strip of the regions supported next to a bridge of another region to the bridge to anchor on.
+    void                    anchor_bridges_in_neighbours();
     void                    make_perimeters();
     void                    make_fills(const PreSliceInfillStructures &pre_slice_infill_structures);
     Polylines               generate_sparse_infill_polylines_for_anchoring(const PreSliceInfillStructures &pre_slice_infill_structures) const;

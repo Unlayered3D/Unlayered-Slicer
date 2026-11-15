@@ -191,7 +191,8 @@ static std::vector<ExPolygons> slice_volume(
 static inline bool model_volume_needs_slicing(const ModelVolume &mv)
 {
     ModelVolumeType type = mv.type();
-    return type == ModelVolumeType::MODEL_PART || type == ModelVolumeType::NEGATIVE_VOLUME || type == ModelVolumeType::PARAMETER_MODIFIER;
+    return type == ModelVolumeType::MODEL_PART || type == ModelVolumeType::NEGATIVE_VOLUME || type == ModelVolumeType::PARAMETER_MODIFIER ||
+           type == ModelVolumeType::PAINTED_MODIFIER;
 }
 
 
@@ -571,7 +572,7 @@ static std::vector<std::vector<ExPolygons>> slices_to_regions(
                     for (int idx_region = 0; idx_region < int(layer_range.volume_regions.size()); ++ idx_region)
                         if (! temp_slices[idx_region].expolygons.empty()) {
                             const PrintObjectRegions::VolumeRegion &region = layer_range.volume_regions[idx_region];
-                            if (region.model_volume->is_modifier()) {
+                            if (region.model_volume->is_region_modifier()) {
                                 assert(region.parent > -1);
                                 bool next_region_same_modifier = idx_region + 1 < int(temp_slices.size()) && layer_range.volume_regions[idx_region + 1].model_volume == region.model_volume;
                                 RegionSlice &parent_slice = temp_slices[region.parent];
@@ -1225,7 +1226,7 @@ void PrintObject::slice()
 
         this->update_layer_height_profile(*this->model_object(), full_params, layer_height_profile);
         const std::vector<coordf_t> full_layers =
-            generate_object_layers(full_params, layer_height_profile, m_config.precise_z_height.value);
+            generate_object_layers(full_params, layer_height_profile, this->precise_z_height());
 
         // Keep the (lo, hi) pairs that overlap this segment, then rebase so the first retained
         // boundary sits at the segment's own zero -- matching the slice-frame rebase.
@@ -1250,7 +1251,7 @@ void PrintObject::slice()
                                 << " full_layers_max=" << (full_layers.empty() ? -1. : full_layers.back());
     } else {
         this->update_layer_height_profile(*this->model_object(), m_slicing_params, layer_height_profile); //ok so this line of code would need to be replaced. All it does is update layer height profile
-        object_layers = generate_object_layers(m_slicing_params, layer_height_profile, m_config.precise_z_height.value);
+        object_layers = generate_object_layers(m_slicing_params, layer_height_profile, this->precise_z_height());
     }
     m_print->throw_if_canceled();
     m_typed_slices = false;
@@ -1653,6 +1654,12 @@ void PrintObject::slice_volumes()
         objSliceByVolume = slice_volumes_inner(
             print->config(), this->config(), newTrafo,
             this->model_object()->volumes, m_shared_regions->layer_ranges, slice_zs, throw_on_cancel_callback);
+        // A painted modifier was sliced as its whole host, keep only what its paint covers.
+        for (const ModelVolume *model_volume : this->model_object()->volumes)
+            if (model_volume->is_painted_modifier())
+                if (auto it = std::find_if(objSliceByVolume.begin(), objSliceByVolume.end(), [model_volume](const VolumeSlices &vs) { return vs.volume_id == model_volume->id(); });
+                    it != objSliceByVolume.end())
+                    it->slices = painted_modifier_segmentation(*this, *model_volume, it->slices, throw_on_cancel_callback);
 
         // Declarative cut planes: confine this PrintObject's slices to its segment. Clipping a
         // solid by half-spaces and then slicing at z is identical to slicing the full solid and

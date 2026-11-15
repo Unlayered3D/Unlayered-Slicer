@@ -248,7 +248,7 @@ protected:
         };
 
         void render(const Vec3d* normal, GLModel& sphere_model);
-        void toggle_selection(const Vec2d& mouse_pos);
+        bool toggle_selection(const Vec2d& mouse_pos);
 
         void turn_over_selection();
         // Select only the part whose world-space bbox center is nearest to world_pos;
@@ -380,6 +380,7 @@ protected:
     void reset_cut_plane();
     void set_connectors_editing(bool connectors_editing);
     void flip_cut_plane();
+    bool is_mouse_over_selected_object(const Vec2d& mouse_pos) const;
     void process_contours();
     void reset_cut_by_contours();
     void render_flip_plane_button(bool disable_pred = false);

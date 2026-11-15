@@ -132,6 +132,7 @@ const std::vector<std::string> GCodeProcessor::Reserved_Tags = {
     "@TOTAL_COST@",
     "@TOTAL_WIPE_TOWER_COST@",
     "@TOTAL_WIPE_TOWER_FILAMENT@",
+    " OUTER_OVERHANG_WALL",
     // UNLAYERED_MOD: unit tool axis in bed-frame G-code coordinates, "x,y,z". Emitted whenever the
     // active chunk orientation changes so the preview can tilt extrusions and the toolhead.
     " TOOL_AXIS:"
@@ -168,6 +169,7 @@ const std::vector<std::string> GCodeProcessor::Reserved_Tags_compatible = {
     "@TOTAL_COST@",
     "@TOTAL_WIPE_TOWER_COST@",
     "@TOTAL_WIPE_TOWER_FILAMENT@",
+    " OUTER_OVERHANG_WALL",
     // UNLAYERED_MOD: unit tool axis in bed-frame G-code coordinates, "x,y,z". Emitted whenever the
     // active chunk orientation changes so the preview can tilt extrusions and the toolhead.
     " TOOL_AXIS:"
@@ -245,11 +247,15 @@ static float acceleration_time_from_distance(float initial_feedrate, float dista
     return (acceleration != 0.0f) ? (speed_from_distance(initial_feedrate, distance, acceleration) - initial_feedrate) / acceleration : 0.0f;
 }
 
+// The id after the last "id:", so that a colon in the object's name is not read as the separator:
+// "; printing object <name> id:<n> copy <m>" and "; start printing object, unique label id: <n>".
 static int get_object_label_id(const std::string_view comment_1)
 {
     std::string      comment(comment_1);
-    auto pos = comment.find(":");
-    std::string num_str = comment.substr(pos + 1);
+    auto pos = comment.rfind("id:");
+    if (pos == std::string::npos)
+        return -1;
+    std::string num_str = comment.substr(pos + 3);
     int id = -1;
     try {
         id = stoi(num_str);
@@ -1349,7 +1355,7 @@ void GCodeProcessor::run_post_process()
                         char buf[128];
                         sprintf(buf, "; estimated first layer printing time (%s mode) = %s\n",
                                 (mode == PrintEstimatedStatistics::ETimeMode::Normal) ? "normal" : "silent",
-                                get_time_dhms(machine.prepare_time).c_str());
+                                get_time_dhms(machine.first_layer_time).c_str());
                         export_line.append_line(buf);
                         processed = true;
                     }
@@ -2874,7 +2880,7 @@ void GCodeProcessor::register_commands()
         {"G3", [this](const GCodeReader::GCodeLine& line) { process_G2_G3(line, false); }}, // Move
         {"G4", [this](const GCodeReader::GCodeLine& line) { process_G4(line); }}, // Delay
 
-        {"G10", [this](const GCodeReader::GCodeLine& line) { process_G10(line); }}, // Retract
+        {"G10", [this](const GCodeReader::GCodeLine& line) { process_G10(line); }}, // Retract, or set tool temperature on RepRapFirmware
         {"G11", [this](const GCodeReader::GCodeLine& line) { process_G11(line); }}, // Unretract
 
         {"G20", [this](const GCodeReader::GCodeLine& line) { process_G20(line); }}, // Set Units to Inches
@@ -3867,6 +3873,9 @@ void GCodeProcessor::reset()
     m_layer_id = 0;
     m_cp_color.reset();
     m_mass_locator = nullptr;
+    m_seams_detector.reset();
+    m_outer_overhang_pending = false;
+    m_outer_overhang_candidate = false;
 
     m_producer = EProducer::Unknown;
 
@@ -4555,12 +4564,21 @@ void GCodeProcessor::process_tags(const std::string_view comment, bool producers
     // emitter only writes this for segmented objects, so on an ordinary print it never appears and
     // the id stays -1.
     if (boost::starts_with(comment, "SEGMENT_ID:")) {
-        m_cut_segment_id = get_object_label_id(comment);
+        // Its own parse: get_object_label_id() reads the number after the last "id:" (Orca #15818), not
+        // after this tag's colon.
+        int id = -1;
+        try {
+            id = std::stoi(std::string(comment.substr(std::string_view("SEGMENT_ID:").size())));
+        } catch (const std::exception &) {}
+        m_cut_segment_id = id;
         return;
     }
 
     // ; OBJECT_ID  start
-    if (boost::starts_with(comment, " start printing object")) {
+    // Every printer labels its objects as "; printing object <name> id:<n> copy <m>"; a Bambu
+    // printer follows it with "; start printing object, unique label id: <n>", whose id is the
+    // instance's and wins. The stop line reads " stop printing object" in both styles.
+    if (boost::starts_with(comment, " start printing object") || boost::starts_with(comment, " printing object")) {
         m_object_label_id = get_object_label_id(comment);
         return;
     }
@@ -4796,6 +4814,12 @@ void GCodeProcessor::process_tags(const std::string_view comment, bool producers
         CustomGCode::Item item = { static_cast<double>(m_end_position[2]), CustomGCode::Custom, get_filament_id() + 1, "", ""};
         m_result.custom_gcode_per_print_z.emplace_back(item);
         m_options_z_corrector.set();
+        return;
+    }
+
+    // Orca: the next printing move starts an outer wall, whatever its role
+    if (comment == reserved_tag(ETags::Outer_Overhang_Wall)) {
+        m_outer_overhang_pending = true;
         return;
     }
 
@@ -5832,9 +5856,17 @@ void GCodeProcessor::process_G1(const std::array<std::optional<double>, 4>& axes
 
     const Vec3f plate_offset = {(float) m_x_offset, (float) m_y_offset, 0.0f};
 
+    // Orca: a tagged wall that starts on an overhang is an outer wall for the seam detector only.
+    if (type == EMoveType::Extrude && m_outer_overhang_pending) {
+        m_outer_overhang_candidate = m_extrusion_role == erOverhangPerimeter;
+        m_outer_overhang_pending = false;
+    }
+    const bool external_for_seam = m_extrusion_role == erExternalPerimeter ||
+                                   (m_extrusion_role == erOverhangPerimeter && m_outer_overhang_candidate);
+
     if (m_seams_detector.is_active()) {
         // check for seam starting vertex
-        if (type == EMoveType::Extrude && m_extrusion_role == erExternalPerimeter) {
+        if (type == EMoveType::Extrude && external_for_seam) {
             //BBS: m_result.moves.back().position has plate offset, must minus plate offset before calculate the real seam position
             const Vec3f new_pos = m_result.moves.back().position - m_extruder_offsets[filament_id] - plate_offset;
             if (!m_seams_detector.has_first_vertex()) {
@@ -5866,9 +5898,10 @@ void GCodeProcessor::process_G1(const std::array<std::optional<double>, 4>& axes
             }
 
             m_seams_detector.activate(false);
+            m_outer_overhang_candidate = false;
         }
     }
-    else if (type == EMoveType::Extrude && m_extrusion_role == erExternalPerimeter) {
+    else if (type == EMoveType::Extrude && external_for_seam) {
         m_seams_detector.activate(true);
         m_seams_detector.set_first_vertex(m_result.moves.back().position - m_extruder_offsets[filament_id] - plate_offset);
     }
@@ -6539,6 +6572,20 @@ void GCodeProcessor::process_G29(const GCodeReader::GCodeLine& line)
 
 void GCodeProcessor::process_G10(const GCodeReader::GCodeLine& line)
 {
+    // Orca: RepRapFirmware's G10 with parameters sets tool temperatures, offsets or workplaces, only a bare G10 retracts
+    if (m_flavor == gcfRepRapFirmware &&
+        (line.has('P') || line.has('R') || line.has('S') || line.has('L') || line.has_x() || line.has_y() || line.has_z())) {
+        float new_temp;
+        if (line.has_value('S', new_temp)) {
+            float tool;
+            const int filament_id = line.has_value('P', tool) ? static_cast<int>(tool) : get_filament_id();
+            // Orca: RRF turns a heater off with a negative temperature
+            if (filament_id >= 0 && filament_id < static_cast<int>(m_extruder_temps.size()))
+                m_extruder_temps[filament_id] = std::max(new_temp, 0.f);
+        }
+        return;
+    }
+
     // Emulate G1 retract, decrement G1 count as it's will be incremented in process_G1, but it's fake G1
     GCodeReader::GCodeLine g10;
     g10.set(Axis::E, -this->m_parser.config().retraction_length.get_at(m_extruder_id));

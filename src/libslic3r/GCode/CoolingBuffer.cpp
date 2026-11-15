@@ -99,6 +99,9 @@ struct CoolingLine
         // region-config access. Parsed in parse_lines_and_collect_stats().
         TYPE_WAVE_OVERHANG_FAN_START   = 1 << 25,   // 21-24 are the belt contact markers
         TYPE_WAVE_OVERHANG_FAN_END     = 1 << 26,
+        // UNLAYERED_MOD -- a G0/G1 with a rotary word (A, B or C): it moves the machine even when X, Y, Z and E
+        // stay, so it must never be dropped as a line that "does not move the print head".
+        TYPE_ROTARY                    = 1 << 27,
     };
 
     CoolingLine(unsigned int type, size_t  line_start, size_t  line_end) :
@@ -424,6 +427,9 @@ std::vector<PerExtruderAdjustments> CoolingBuffer::parse_layer_gcode(const std::
         if (line.type) {
             // G0, G1 or G92
             // Parse the G-code line.
+            if (m_config.use_relative_e_distances.value)
+                // Reset extruder accumulator before the copy, so a line without an E word does not repeat the last one.
+                current_pos[3] = 0.f;
             std::vector<float> new_pos(current_pos);
             const char *c = sline.data() + 3;
             for (;;) {
@@ -436,6 +442,8 @@ std::vector<PerExtruderAdjustments> CoolingBuffer::parse_layer_gcode(const std::
                 size_t axis = (*c >= 'X' && *c <= 'Z') ? (*c - 'X') :
                               (*c == 'E') ? 3 : (*c == 'F') ? 4 :
                               (*c == 'I') ? 5 : (*c == 'J') ? 6 : size_t(-1);
+                if (axis == size_t(-1) && (*c == 'A' || *c == 'B' || *c == 'C') && (line.type & CoolingLine::TYPE_G92) == 0)
+                    line.type |= CoolingLine::TYPE_ROTARY; // UNLAYERED_MOD -- see TYPE_ROTARY
                 if (axis != size_t(-1)) {
                     ++ c;
                     new_pos[axis] = float(atof_decimal_point(std::string_view(c, sline.data() + sline.size() - c)));
@@ -477,9 +485,6 @@ std::vector<PerExtruderAdjustments> CoolingBuffer::parse_layer_gcode(const std::
             }
             if ((line.type & CoolingLine::TYPE_G92) == 0) {
                 //BBS: G0, G1, G2, G3. Calculate the duration.
-                if (m_config.use_relative_e_distances.value)
-                    // Reset extruder accumulator.
-                    current_pos[3] = 0.f;
                 float dif[4];
                 for (size_t i = 0; i < 4; ++ i)
                     dif[i] = new_pos[i] - current_pos[i];
@@ -1127,7 +1132,8 @@ std::string CoolingBuffer::apply_layer_cooldown(
             new_feedrate = line->slowdown ? int(floor(60. * line->feedrate + 0.5)) : atoi(fpos);
             if (new_feedrate == current_feedrate) {
                 // No need to change the F value.
-                if ((line->type & (CoolingLine::TYPE_ADJUSTABLE | CoolingLine::TYPE_EXTERNAL_PERIMETER | CoolingLine::TYPE_WIPE)) || line->length == 0.)
+                if ((line->type & (CoolingLine::TYPE_ADJUSTABLE | CoolingLine::TYPE_EXTERNAL_PERIMETER | CoolingLine::TYPE_WIPE)) ||
+                    (line->length == 0. && ! (line->type & CoolingLine::TYPE_ROTARY)))
                     // Feedrate does not change and this line does not move the print head. Skip the complete G-code line including the G-code comment.
                     end = line_end;
                 else
