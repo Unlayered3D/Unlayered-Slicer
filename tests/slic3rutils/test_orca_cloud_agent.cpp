@@ -624,8 +624,8 @@ std::string closed_port_url()
 } // namespace
 
 // Unlayered: the cloud service is removed, so OrcaCloudServiceAgent's http_get/post/put/delete
-// return before sending anything (OrcaCloudServiceAgent.cpp). The delete and subscription tests
-// below need a request to reach the loopback server, so they are skipped.
+// return before sending anything (OrcaCloudServiceAgent.cpp). The delete, subscription and sync
+// pull tests below need a request to reach the loopback server, so they are skipped.
 #define SKIP_WITHOUT_CLOUD_TRANSPORT() SKIP("OrcaCloudServiceAgent sends no requests in Unlayered Slicer")
 
 TEST_CASE_METHOD(HealthCheckFixture, "Deleting a profile succeeds once the cloud has no such profile", "[OrcaCloudServiceAgent]")
@@ -892,4 +892,31 @@ TEST_CASE("A delete that fails to reach the gateway keeps its .info for a later 
 
     CHECK(fs::exists(fixture.info_path));
     CHECK(fixture.queue.size() == 1);
+}
+
+TEST_CASE_METHOD(HealthCheckFixture, "A session with no saved sync state pulls without a cursor", "[OrcaCloudServiceAgent]")
+{
+    SKIP_WITHOUT_CLOUD_TRANSPORT();
+    // Nothing has been pulled yet, so there is no cursor to resume from.
+    CHECK(agent->get_sync_state().last_sync_timestamp == 0);
+
+    sign_in("user-a");
+    server.set_reply("200 OK", R"({"upserts":[],"deletes":[],"next_cursor":0})");
+    REQUIRE(agent->get_setting_list2("", nullptr, nullptr, nullptr) == BAMBU_NETWORK_SUCCESS);
+
+    const auto requests = server.requests();
+    REQUIRE(requests.size() == 1);
+    CHECK(requests.front().request_line == "GET /api/v1/sync/pull HTTP/1.1");
+}
+
+TEST_CASE_METHOD(HealthCheckFixture, "A pull answered 304 keeps the sync state it had", "[OrcaCloudServiceAgent]")
+{
+    SKIP_WITHOUT_CLOUD_TRANSPORT();
+    sign_in("user-a");
+    server.set_reply("304 Not Modified", "");
+    REQUIRE(agent->get_setting_list2("", nullptr, nullptr, nullptr) == BAMBU_NETWORK_SUCCESS);
+
+    // Nothing changed, so there is still no cursor and none is written for the next session.
+    CHECK(agent->get_sync_state().last_sync_timestamp == 0);
+    CHECK_FALSE(fs::exists(dir.path() / "user" / "user-a" / "sync_state"));
 }

@@ -1250,27 +1250,6 @@ static std::vector<Vec2d> get_path_of_change_filament(const Print& print)
         return gcode;
     }
 
-    // A folded tower layer is thicker than the object layer it sits on, so the height process_layer
-    // emitted is not the tower's. Both writers declare one, but each hardcodes a tag dialect - Type 1
-    // forces s_IsBBLPrinter and writes "; LAYER_HEIGHT:", Type 2 writes ";HEIGHT:" - and the processor
-    // reads only its printer's, so a Type 1 tower on a non-BBL printer loses it and the merged layer
-    // is drawn and costed as a thin one. Declare it here, where the printer is known, unless the tower
-    // already wrote the right tag. _extrude puts the object's height back on the next object path,
-    // since process_layer forces the role to erWipeTower on any layer with a tower.
-    std::string WipeTowerIntegration::tower_height_tag(GCode &gcodegen, const WipeTower::ToolChangeResult &tcr,
-                                                       const std::string &tcr_gcode) const
-    {
-        const std::string tag = ";" + GCodeProcessor::reserved_tag(GCodeProcessor::ETags::Height);
-        if (! m_sparse_layers_combined || std::abs(gcodegen.m_last_height - tcr.layer_height) <= EPSILON ||
-            tcr_gcode.find(tag) != std::string::npos)
-            return {};
-        // Keep m_last_height what the G-code last declared, so a second visit does not repeat it.
-        gcodegen.m_last_height = tcr.layer_height;
-        char buf[64];
-        sprintf(buf, "%s%g\n", tag.c_str(), tcr.layer_height);
-        return buf;
-    }
-
     // FanMover consumes these markers (and drops them) to avoid splitting a G1 inside custom gcode.
     // Only written when FanMover runs, the same gate as its construction in GCode::process_layers.
     static std::string wrap_custom_gcode_for_fan_mover(const FullPrintConfig &config, const std::string &gcode)
@@ -1820,7 +1799,6 @@ static std::vector<Vec2d> get_path_of_change_filament(const Print& print)
         config.set_key_value("filament_start_gcode", new ConfigOptionString(start_filament_gcode_str));
         std::string tcr_gcode, tcr_escaped_gcode = gcodegen.placeholder_parser_process("tcr_rotated_gcode", tcr_rotated_gcode, new_filament_id, &config);
         unescape_string_cstyle(tcr_escaped_gcode, tcr_gcode);
-        gcode += tower_height_tag(gcodegen, tcr, tcr_gcode);
         gcode += tcr_gcode;
         // Count the toolchange only when the emitted block really changed the tool —
         // tower visits without a filament change must not advance the ordinal.
@@ -2112,7 +2090,12 @@ static std::vector<Vec2d> get_path_of_change_filament(const Print& print)
                         }
                     }
                 }
-                if (!skip_line) {
+                if (skip_line) {
+                    // Also drop the planner sync WipeTower2 put right before the stripped M109.
+                    const std::string sync = flush_planner_queue_command(gcodegen.config().gcode_flavor.value);
+                    if (boost::ends_with(out, sync))
+                        out.resize(out.size() - sync.size());
+                } else {
                     out.append(line);
                     if (line_end < tcr_rotated_gcode.size())
                         out.push_back('\n');
@@ -2135,7 +2118,6 @@ static std::vector<Vec2d> get_path_of_change_filament(const Print& print)
         std::string tcr_gcode,
             tcr_escaped_gcode = gcodegen.placeholder_parser_process("tcr_rotated_gcode", tcr_rotated_gcode, new_extruder_id, &config);
         unescape_string_cstyle(tcr_escaped_gcode, tcr_gcode);
-        gcode += tower_height_tag(gcodegen, tcr, tcr_gcode);
         gcode += tcr_gcode;
         check_add_eol(toolchange_gcode_str);
 
@@ -3684,32 +3666,37 @@ static inline std::vector<const PrintInstance*> sort_object_instances_by_max_z(c
 }
 #endif
 
-// Produce a vector of PrintObjects in the order of their respective ModelObjects in print.model().
+// Produce a vector of PrintInstances in the order of their ModelInstances in the object and instance lists of print.model().
 //BBS: add sort logic for seq-print
 std::vector<const PrintInstance*> sort_object_instances_by_model_order(const Print& print, bool init_order)
 {
-    auto find_object_index = [](const Model& model, const ModelObject* obj) {
-        for (int index = 0; index < model.objects.size(); index++)
-        {
-            if (model.objects[index] == obj)
-                return index;
-        }
-        return -1;
-    };
+    if (init_order) {
+        // Number by position in the model's object and instance lists. Copies of one object can be split
+        // into separate PrintObjects, one per distinct transformation, and print.objects() orders those by
+        // transformation, so its order is not the list order.
+        int order = 0;
+        for (const ModelObject *model_object : print.model().objects)
+            for (ModelInstance *model_instance : model_object->instances)
+                model_instance->arrange_order = ++order;
+    }
 
     // Build up map from ModelInstance* to PrintInstance*
     std::vector<std::pair<const ModelInstance*, const PrintInstance*>> model_instance_to_print_instance;
     model_instance_to_print_instance.reserve(print.num_object_instances());
     for (const PrintObject *print_object : print.objects())
         for (const PrintInstance &print_instance : print_object->instances())
-        {
-            if (init_order)
-                const_cast<ModelInstance*>(print_instance.model_instance)->arrange_order = find_object_index(print.model(), print_object->model_object());
             model_instance_to_print_instance.emplace_back(print_instance.model_instance, &print_instance);
-        }
-    std::sort(model_instance_to_print_instance.begin(), model_instance_to_print_instance.end(), [](auto &l, auto &r) { return l.first->arrange_order < r.first->arrange_order; });
+    // Declarative cut planes: one ModelInstance may map to several PrintInstances (one per segment
+    // PrintObject); they share its arrange_order. Tie-break them by the segment's bed-upward BFS index
+    // so lower segments always print first.
+    std::sort(model_instance_to_print_instance.begin(), model_instance_to_print_instance.end(), [](auto &l, auto &r) {
+        if (l.first->arrange_order != r.first->arrange_order)
+            return l.first->arrange_order < r.first->arrange_order;
+        return l.second->print_object->segment_index() < r.second->print_object->segment_index();
+    });
     if (init_order) {
-        // Re-assign the arrange_order so each instance has a unique order number
+        // Re-assign the arrange_order so each instance of this print has a unique order number. The
+        // numbering above covers the whole model, including the instances of the other plates.
         for (int k = 0; k < model_instance_to_print_instance.size(); k++) {
             const_cast<ModelInstance*>(model_instance_to_print_instance[k].first)->arrange_order = k + 1;
         }
@@ -3717,23 +3704,8 @@ std::vector<const PrintInstance*> sort_object_instances_by_model_order(const Pri
 
     std::vector<const PrintInstance*> instances;
     instances.reserve(model_instance_to_print_instance.size());
-    for (const ModelObject *model_object : print.model().objects)
-        for (const ModelInstance *model_instance : model_object->instances) {
-            auto it = std::lower_bound(model_instance_to_print_instance.begin(), model_instance_to_print_instance.end(), std::make_pair(model_instance, nullptr), [](auto &l, auto &r) { return l.first->arrange_order < r.first->arrange_order; });
-            // Declarative cut planes: one ModelInstance may map to several PrintInstances (one per
-            // segment PrintObject). Collect them ALL — taking just the first would silently drop
-            // every segment but one from ordering, skirt and exclude-object logic.
-            for (; it != model_instance_to_print_instance.end() && it->first->arrange_order == model_instance->arrange_order; ++ it)
-                if (it->first == model_instance)
-                    instances.emplace_back(it->second);
-        }
-    std::sort(instances.begin(), instances.end(), [](auto& l, auto& r) {
-        // Tie-break equal arrange_orders (the segments of one instance) by the segment's
-        // bed-upward BFS index so lower segments always print first.
-        if (l->model_instance->arrange_order != r->model_instance->arrange_order)
-            return l->model_instance->arrange_order < r->model_instance->arrange_order;
-        return l->print_object->segment_index() < r->print_object->segment_index();
-    });
+    for (const auto &model_instance_print_instance : model_instance_to_print_instance)
+        instances.emplace_back(model_instance_print_instance.second);
     return instances;
 }
 
@@ -8949,7 +8921,7 @@ LayerResult GCode::process_layer(
                     m_nominal_z            = entry.sub_z;
                     // Use the same lazy-Z mechanism as change_layer(): set the flag so travel_to
                     // fires even when m_last_pos coincides with the first extrusion point,
-                    // ensuring Z reaches sub_z via the combined XY+Z move.
+                    // ensuring Z reaches sub_z on the travel to it.
                     m_need_change_layer_lift_z = true;
 
                     for (ObjectByExtruder::Island &island : instance_to_print.object_by_extruder.islands) {
@@ -12126,9 +12098,6 @@ std::string GCode::travel_to(const Point& point, ExtrusionRole role, std::string
             result.append(to_local_point(gcode_point));
         return result;
     };
-    const auto nominal_writer_z = [this]() {
-        return m_writer.get_position().z() - m_writer.get_zhop();
-    };
     // UNLAYERED_MOD -- the router works in the bed frame. A travel under a multi-planar chunk's or a
     // belt object's trafo is expressed in the slicing frame and rotated by the writer, so it is not
     // rerouted; the G-code processor's path check still reports a collision. A trafo that only
@@ -12142,7 +12111,8 @@ std::string GCode::travel_to(const Point& point, ExtrusionRole role, std::string
             return false;
 
         const double target_z = (z == DBL_MAX ? m_nominal_z : z) + trafo.translation().z();
-        double route_start_z = start_z_override.value_or(nominal_writer_z());
+        // A lifted nozzle travels at its lifted height, so the route is checked from there.
+        double route_start_z = start_z_override.value_or(m_writer.get_position().z());
         double route_end_z = target_z;
         if (include_planned_lift) {
             const Vec2d destination_xy = this->point_to_gcode(path.back());
@@ -12358,16 +12328,20 @@ std::string GCode::travel_to(const Point& point, ExtrusionRole role, std::string
                 gcode += m_writer.travel_to_xy(this->point_to_gcode(travel.points[i]), comment);
             }
         } else {
-            if (travel.size() == 2) {
-                // No extra movements emitted by avoid_crossing_perimeters, simply move to the end point with z change
-                const auto& dest2d = this->point_to_gcode(travel.points.back());
-                Vec3d dest3d(dest2d(0), dest2d(1), z == DBL_MAX ? m_nominal_z : z);
-                //gcode += m_writer.travel_to_xyz(dest3d, comment, m_need_change_layer_lift_z);
-
-                gcode += m_writer.travel_to_xyz(dest3d, comment, m_need_change_layer_lift_z, trafo);
-
-                m_need_change_layer_lift_z = false;
-            } else if (exclusion_volume_travel_rerouted && z != DBL_MAX) {
+            const double target_z = z == DBL_MAX ? m_nominal_z : z;
+            // UNLAYERED_MOD -- the writer's position is in the bed frame, so the target is compared there.
+            // Only a travel that keeps bed XY stays lifted over a detour; under a rotated trafo the writer
+            // approaches the target along the chunk normal (GCodeWriter::travel_to_xyz()).
+            const double target_bed_z = target_z + trafo.translation().z();
+            // A lifted nozzle keeps its height over the whole detour and descends only at the last
+            // point, so it never sinks over the print.
+            const bool stay_lifted = exclusion_routing_in_bed_frame && m_writer.get_zhop() > EPSILON &&
+                m_writer.get_position().z() > target_bed_z + EPSILON;
+            // A lift left pending by the retraction happens on the first leg, so that detour is lifted too.
+            const Vec2d first2d = this->point_to_gcode(travel.points[1]);
+            const bool lift_pending =
+                m_writer.planned_travel_z(Vec3d(first2d.x(), first2d.y(), target_bed_z), m_need_change_layer_lift_z).second > target_bed_z + EPSILON;
+            if (exclusion_volume_travel_rerouted && z != DBL_MAX && !stay_lifted && !lift_pending) {
                 // Preserve the original sloped-Z move over the longer detour.
                 // The router activates every volume touched by the complete Z
                 // range, so this interpolation remains conservative.
@@ -12386,33 +12360,24 @@ std::string GCode::travel_to(const Point& point, ExtrusionRole role, std::string
                         m_need_change_layer_lift_z = false;
                 }
             } else {
-                // Extra movements emitted by avoid_crossing_perimeters, lift the z to normal height at the beginning, then apply the z
-                // ratio at the last point
+                // Extra movements emitted by avoid_crossing_perimeters move to the layer height at the first point,
+                // unless the nozzle stays lifted. The target Z is applied at the last point.
+                const bool layer_z_first = travel.size() > 2 && !stay_lifted;
                 for (size_t i = 1; i < travel.size(); ++i) {
-                    if (i == 1) {
-                        // Lift to normal z at beginning
-                        Vec2d dest2d = this->point_to_gcode(travel.points[i]);
-                        Vec3d dest3d(dest2d(0), dest2d(1), m_nominal_z);
-
-                        gcode += m_writer.travel_to_xyz(dest3d, comment, m_need_change_layer_lift_z, trafo);
-                    
-                        //gcode += m_writer.travel_to_xyz(dest3d, comment, m_need_change_layer_lift_z);
+                    const Vec2d dest2d = this->point_to_gcode(travel.points[i]);
+                    if (i == 1 && layer_z_first) {
+                        gcode += m_writer.travel_to_xyz(Vec3d(dest2d.x(), dest2d.y(), m_nominal_z), comment, m_need_change_layer_lift_z, trafo);
                         m_need_change_layer_lift_z = false;
-                    } else if (z != DBL_MAX && i == travel.size() - 1) {
-                        // Apply z_ratio for the very last point
-                        Vec2d dest2d = this->point_to_gcode(travel.points[i]);
-                        Vec3d dest3d(dest2d(0), dest2d(1), z);
-
-                        gcode += m_writer.travel_to_xyz(dest3d, comment, false, trafo);
-                        //gcode += m_writer.travel_to_xyz(dest3d, comment);
+                    } else if (i == travel.size() - 1 && (z != DBL_MAX || !layer_z_first)) {
+                        gcode += m_writer.travel_to_xyz(Vec3d(dest2d.x(), dest2d.y(), target_z), comment, m_need_change_layer_lift_z, trafo);
+                        m_need_change_layer_lift_z = false;
+                    } else if (stay_lifted) {
+                        // Stays at the lifted height: the travel keeps bed XY (see stay_lifted).
+                        gcode += m_writer.travel_to_xy(dest2d, comment);
                     } else {
-                        // For all points in between, no z change
-                        Vec2d dest2d = this->point_to_gcode(travel.points[i]);
-                        Vec3d dest3d(dest2d(0), dest2d(1), m_nominal_z);
-                        gcode += m_writer.travel_to_xyz(dest3d, comment, false, trafo);
-
-
-                        //gcode += m_writer.travel_to_xy(this->point_to_gcode(travel.points[i]), comment);
+                        // UNLAYERED_MOD -- for all points in between, no z change. Through travel_to_xyz()
+                        // with the trafo, as a rotated frame's layer height is not one bed Z.
+                        gcode += m_writer.travel_to_xyz(Vec3d(dest2d.x(), dest2d.y(), m_nominal_z), comment, false, trafo);
                     }
                 }
             }

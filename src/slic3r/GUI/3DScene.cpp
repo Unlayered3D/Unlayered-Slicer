@@ -1189,6 +1189,8 @@ void GLVolumeCollection::render(GLVolumeCollection::ERenderType       type,
     // Compute up direction accounting for build plate tilt. This is frame-invariant
     // (config cannot change mid-render), so compute it once before the volume loop.
     const Vec3f up_direction = GUI::build_plate_tilt_up_direction().cast<float>();
+    const bool persistent_outline = outlined_volumes != nullptr &&
+                                   GUI::wxGetApp().app_config->get_bool(SETTING_OPENGL_OUTLINE_PERSISTENT);
 
     for (GLVolumeWithIdAndZ& volume : to_render) {
 #if ENABLE_MODIFIERS_ALWAYS_TRANSPARENT
@@ -1300,9 +1302,12 @@ void GLVolumeCollection::render(GLVolumeCollection::ERenderType       type,
             glsafe(::glEnable(GL_POLYGON_OFFSET_FILL));
             glsafe(::glPolygonOffset(1.0f, 1.0f));
         }
-        // A part drawing its instance's cut chunks is not outlined: the outline's mask is each volume's
-        // own mesh, while the chunks are drawn under the instance matrix. Selected chunks are brightened.
-        const bool outlined = outlined_volumes != nullptr && chunk_mode == 0 && volume.first->selected && volume.first->is_active && !volume.first->is_wipe_tower;
+        // A part drawing its instance's cut chunks is not outlined, persistent outline or not: the outline's
+        // mask is each volume's own mesh, while the chunks are drawn under the instance matrix. Selected
+        // chunks are brightened.
+        const bool outlined = outlined_volumes != nullptr && chunk_mode == 0 &&
+                              (volume.first->selected || (persistent_outline && volume.first->visible)) &&
+                              volume.first->is_active && !volume.first->is_wipe_tower;
         if (outlined) {
             outlined_volumes->push_back(volume.first);
             glsafe(::glEnable(GL_STENCIL_TEST));
