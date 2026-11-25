@@ -50,6 +50,7 @@
 #include "libslic3r/Point.hpp"
 #include <cstdlib>
 #include <boost/log/trivial.hpp>
+#include <boost/format.hpp>
 #include "slic3r/GUI/Tab.hpp"
 #include "ParamsPanel.hpp"
 #include "MsgDialog.hpp"
@@ -126,7 +127,8 @@ std::map<std::string, std::vector<SimpleSettingData>>  SettingsFactory::OBJECT_C
                     {"support_object_first_layer_gap","",35}, {"test_input", "", 36}, 
                     {"support_direction", "", 37}, {"support_direction_b", "", 38}, {"support_direction_c", "", 39}, {"support_direction_max_lean", "", 40}, {"support_section_overlap", "", 41}
                     }},
-    { L("Speed"), {{"support_speed", "",12}, {"support_interface_speed", "",13}
+    { L("Speed"), {{"support_speed", "",12}, {"support_interface_speed", "",13},
+                   {"support_volumetric_flow", "",12}, {"support_interface_volumetric_flow", "",13}
                   }}
 };
 
@@ -162,6 +164,7 @@ std::map<std::string, std::vector<SimpleSettingData>> SettingsFactory::PART_CATE
        {"sparse_infill_single_wall", "", 1},
        {"infill_mesh_global_orientation", "", 1},
        {"infill_mesh_path", "", 1},
+       {"sparse_infill_strategy", "", 1},
        {"adaptive_infill_mode", "", 1},
        {"adaptive_infill_interior_density", "", 1},
        {"adaptive_infill_gradient", "", 1},
@@ -195,18 +198,26 @@ std::map<std::string, std::vector<SimpleSettingData>> SettingsFactory::PART_CATE
        {"minimum_sparse_infill_area", "", 1}}},
      {L("Speed"),
       {{"outer_wall_speed", "", 1},
+       {"outer_wall_volumetric_flow", "", 1},
        {"inner_wall_speed", "", 2},
+       {"inner_wall_volumetric_flow", "", 2},
        {"sparse_infill_speed", "", 3},
+       {"sparse_infill_volumetric_flow", "", 3},
        {"top_surface_speed", "", 4},
+       {"top_surface_volumetric_flow", "", 4},
        {"internal_solid_infill_speed", "", 5},
+       {"internal_solid_infill_volumetric_flow", "", 5},
        {"enable_overhang_speed", "", 6},
        {"overhang_1_4_speed", "", 7},
        {"overhang_2_4_speed", "", 8},
        {"overhang_3_4_speed", "", 9},
        {"overhang_4_4_speed", "", 10},
        {"bridge_speed", "", 11},
+       {"bridge_volumetric_flow", "", 11},
        {"gap_infill_speed", "", 12},
-       {"internal_bridge_speed", "", 13}}}};
+       {"gap_infill_volumetric_flow", "", 12},
+       {"internal_bridge_speed", "", 13},
+       {"internal_bridge_volumetric_flow", "", 13}}}};
 
 std::vector<std::string> SettingsFactory::get_options(const bool is_part)
 {
@@ -2506,11 +2517,7 @@ void MenuFactory::append_menu_item_center(wxMenu* menu)
             if (plater()->canvas3D()->get_canvas_type() != GLCanvas3D::ECanvasType::CanvasView3D)
                 return false;
             else {
-                Selection& selection = plater()->get_view3D_canvas3D()->get_selection();
-                PartPlate* plate = plater()->get_partplate_list().get_selected_plate();
-                Vec3d model_pos = selection.get_bounding_box().center();
-                Vec3d center_pos = plate->get_center_origin();
-                return !( (model_pos.x() == center_pos.x()) && (model_pos.y() == center_pos.y()) );
+                return plater()->get_view3D_canvas3D()->get_selection().can_center();
             } //disable if model is at center / not in View3D
         }, m_parent);
 }

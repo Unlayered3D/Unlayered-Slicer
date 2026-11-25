@@ -384,7 +384,10 @@ bool PrintObject::has_belt_brim() const
 
 unsigned int PrintObject::belt_brim_filament() const
 {
-    // Lowest positive outer-wall filament over the printing regions; 1 when none is set.
+    // The chosen brim filament, else the lowest positive outer-wall filament over the printing
+    // regions; 1 when none is set.
+    if (m_config.brim_filament_id.value > 0)
+        return (unsigned int)m_config.brim_filament_id.value;
     unsigned int brim_filament = 0;
     for (size_t i = 0; i < this->num_printing_regions(); ++ i) {
         const unsigned int f = this->printing_region(i).config().outer_wall_filament_id.value;

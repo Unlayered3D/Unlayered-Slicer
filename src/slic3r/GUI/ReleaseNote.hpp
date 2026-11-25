@@ -41,7 +41,7 @@
 #include "DeviceManager.hpp"
 #include "Widgets/Label.hpp"
 #include "Widgets/Button.hpp"
-#include "Widgets/CheckBox.hpp"
+#include "Widgets/LabeledCheckBox.hpp"
 #include "Widgets/ComboBox.hpp"
 #include "Widgets/ScrolledWindow.hpp"
 #include "Widgets/HyperLink.hpp"
@@ -128,11 +128,10 @@ public:
     Label *           m_staticText_release_note{nullptr};
     wxStaticBitmap*   m_bitmap_open_in_browser;
     Button*           m_button_skip_version;
-    CheckBox*         m_cb_stable_only;
+    LabeledCheckBox*  m_cb_stable_only;
     Button*           m_button_download;
     Button*           m_button_cancel;
     HyperLink*        m_page_link{nullptr};
-    Label*            m_stable_only_label{nullptr};
     std::string       url_line;
     std::string       html_source;
 
@@ -187,7 +186,7 @@ public:
     Button* m_button_cancel { nullptr };
     Button* m_button_fn { nullptr };
     Button* m_button_resume { nullptr };
-    wxCheckBox* m_show_again_checkbox;
+    LabeledCheckBox* m_show_again_checkbox;
     VisibleButtons m_button_style; // ORCA VisibleButtons instead ButtonStyle 
     bool not_show_again = false;
     std::string show_again_config_text = "";
@@ -312,7 +311,7 @@ protected:
     Button* m_button_ok;
     Button* m_button_cancel;
     Button* m_button_update_nozzle;
-    wxCheckBox* m_show_again_checkbox;
+    LabeledCheckBox* m_show_again_checkbox;
     bool not_show_again = false;
     std::string show_again_config_text = "";
 };
@@ -374,6 +373,7 @@ public:
     std::map<std::string, std::string> m_models_map;// display_name -> model_id
 
     void switch_input_panel(int index);
+    void clamp_to_work_area();
     void on_cancel();
     void update_title(wxString title);
     void set_machine_obj(MachineObject* obj);

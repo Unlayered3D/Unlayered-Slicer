@@ -6,6 +6,7 @@ add_executable(${_TEST_NAME}_tests
 	test_adaptive_pressure_advance.cpp
 	test_bridge.cpp
 	test_calib.cpp
+	test_conflict_checker.cpp
 	test_cooling.cpp
 	test_cut_plane_apply.cpp
 	test_segment_frames.cpp

@@ -21,6 +21,7 @@
 #include <wx/settings.h>
 #include <wx/fontenum.h>
 #include <boost/log/trivial.hpp>
+#include <boost/format.hpp>
 #include <wx/string.h>
 #include <wx/stattext.h>
 #ifdef __linux__
@@ -154,6 +155,7 @@ void Label::initSysFont()
         };
         add("HarmonyOS Sans SC", {"HarmonyOS_Sans_SC_Bold.ttf", "HarmonyOS_Sans_SC_Regular.ttf"});
         add("NanumGothic", {"NanumGothic-Regular.ttf", "NanumGothic-Bold.ttf"});
+        add("Sarabun", {"Sarabun-Medium.ttf", "Sarabun-SemiBold.ttf"});
         // The readable-text choices (preference "ui_font_family").
         add("OpenDyslexic", {"OpenDyslexic-Regular.otf", "OpenDyslexic-Bold.otf"});
         add("Comic Neue", {"ComicNeue-Regular.ttf", "ComicNeue-Bold.ttf"});
@@ -162,7 +164,7 @@ void Label::initSysFont()
             pango_fc_font_map_config_changed(PANGO_FC_FONT_MAP(fmap));
         wxFontEnumerator::InvalidateCache();
 #endif
-        for (const char* family : {"HarmonyOS Sans SC", "NanumGothic", "OpenDyslexic", "Comic Neue"})
+        for (const char* family : {"HarmonyOS Sans SC", "NanumGothic", "Sarabun", "OpenDyslexic", "Comic Neue"})
             BOOST_LOG_TRIVIAL(info) << "bundled font " << family << (wxFontEnumerator::IsValidFacename(family) ? " available" : " NOT available");
     }
 #endif

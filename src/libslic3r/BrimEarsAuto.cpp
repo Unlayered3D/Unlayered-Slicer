@@ -1,8 +1,8 @@
 #include "BrimEarsAuto.hpp"
 
+#include "Brim.hpp"
 #include "ClipperUtils.hpp"
 #include "Model.hpp"
-#include "MultiPoint.hpp"
 #include "TriangleMeshSlicer.hpp"
 
 namespace Slic3r {
@@ -38,18 +38,10 @@ ExPolygons brim_ears_first_layer(const ModelObject& object, size_t instance)
     return diff_ex(part_ex, negative_ex);
 }
 
-Points brim_ears_corner_points(Polygon polygon, float detection_length_mm, float max_angle_deg, bool is_outer)
+Points brim_ears_corner_points(const Polygon& polygon, float detection_length_mm, float max_angle_deg, bool is_outer)
 {
-    const double angle_threshold = (180. - max_angle_deg) * PI / 180.0;
-    if (detection_length_mm > 0) {
-        Points points = polygon.points;
-        points.push_back(points.front());
-        points = MultiPoint::_douglas_peucker(points, detection_length_mm / SCALING_FACTOR);
-        if (points.size() > 4)
-            points.erase(points.end() - 1);
-        polygon.points = points;
-    }
-    return is_outer ? polygon.convex_points(angle_threshold) : polygon.concave_points(angle_threshold);
+    // Upstream's detection (#17163), which the tool's Auto-generate uses: independent of where the outline starts.
+    return make_brim_ear_points(polygon, scale_(detection_length_mm), max_angle_deg, is_outer);
 }
 
 Points brim_ears_auto_points(const ExPolygons& first_layer, float detection_length_mm, float max_angle_deg)

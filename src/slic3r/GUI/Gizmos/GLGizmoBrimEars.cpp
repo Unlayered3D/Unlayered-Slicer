@@ -21,6 +21,7 @@
 #include "slic3r/GUI/Event.hpp"
 #include "libslic3r/Utils.hpp"
 #include "libslic3r/Point.hpp"
+#include "libslic3r/Brim.hpp"
 #include "libslic3r/BrimEarsPoint.hpp"
 #include "libslic3r/Geometry.hpp"
 #include <limits>
@@ -959,7 +960,7 @@ void GLGizmoBrimEars::reload_cache()
     find_single();
 }
 
-Points GLGizmoBrimEars::generate_points(Polygon &obj_polygon, float ear_detection_length, float brim_ears_max_angle, bool is_outer)
+Points GLGizmoBrimEars::generate_points(const Polygon &obj_polygon, float ear_detection_length, float brim_ears_max_angle, bool is_outer)
 {
     // Shared with the object.brimEars action (libslic3r/BrimEarsAuto.hpp).
     return brim_ears_corner_points(obj_polygon, ear_detection_length, brim_ears_max_angle, is_outer);
@@ -1042,6 +1043,7 @@ void GLGizmoBrimEars::get_detection_radius_max()
         min_points_num   = MultiPoint::_douglas_peucker(out_points, 0).size();
         int repeat       = 0;
         int loop_protect = 0;
+        // ORCA: only a feature-size estimate for the slider's upper bound; the detector no longer decimates.
         for (;;) {
             loop_protect++;
             tolerance += 10;

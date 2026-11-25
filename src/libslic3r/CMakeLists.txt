@@ -83,6 +83,7 @@ set(lisbslic3r_sources
     BedMesh.hpp
     BlacklistedLibraryCheck.cpp
     BlacklistedLibraryCheck.hpp
+    BoostPolygonTraits.hpp
     BoundingBox.cpp
     BoundingBox.hpp
     BridgeDetector.cpp
@@ -422,6 +423,7 @@ set(lisbslic3r_sources
     Orient.hpp
     OtherSlicerImport.cpp
     OtherSlicerImport.hpp
+    ParallelForFirstError.hpp
     ParallelResolve.hpp
     ParameterUtils.cpp
     ParameterUtils.hpp

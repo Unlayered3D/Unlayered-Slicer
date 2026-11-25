@@ -19,9 +19,10 @@ ExPolygons brim_ears_first_layer(const ModelObject& object, size_t instance);
 
 // The corners of one outline that get an ear: convex corners of an outer contour or concave
 // corners of a hole (`is_outer` false; pass the hole reversed, as the tool does) whose turn is
-// sharper than `max_angle_deg` (an interior angle of at most that). `detection_length_mm` > 0
-// first simplifies the outline with Douglas-Peucker at that tolerance, so small wiggles do not count.
-Points brim_ears_corner_points(Polygon polygon, float detection_length_mm, float max_angle_deg, bool is_outer);
+// sharper than `max_angle_deg` (an interior angle of at most that), measured over a window of
+// `detection_length_mm` of outline on each side that widens while the outline keeps turning
+// (make_brim_ear_points() in Brim.hpp).
+Points brim_ears_corner_points(const Polygon& polygon, float detection_length_mm, float max_angle_deg, bool is_outer);
 
 // Every ear position of a first layer (scaled, plate frame), outer contours and holes.
 Points brim_ears_auto_points(const ExPolygons& first_layer, float detection_length_mm, float max_angle_deg);

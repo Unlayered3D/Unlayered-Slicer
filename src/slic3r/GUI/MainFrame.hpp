@@ -36,7 +36,6 @@
 
 #include <boost/property_tree/ptree_fwd.hpp>
 
-#include "slic3r/plugin/host/PluginPages.hpp"
 
 // Stable identifiers for MainFrame::m_tabpanel's built-in pages. These are
 // names rather than positional indices so optional pages cannot shift them.
@@ -74,6 +73,8 @@ class wxBookCtrlBase;
 class wxProgressDialog;
 
 namespace Slic3r {
+
+class PluginPages;
 
 namespace GUI
 {
@@ -579,7 +580,7 @@ public:
     // The frame's minimum size, widened while the side panel is open so the 3D canvas can
     // never be squeezed to nothing between the two sidebars.
     wxSize frame_min_size() const;
-    PluginPages& plugin_pages() { return m_plugin_pages; }
+    PluginPages& plugin_pages() { return *m_plugin_pages; }
 
     PA_Calibration_Dlg* m_pa_calib_dlg{ nullptr };
     FlowRateCalibrationDialog* m_flow_rate_calib_dlg{ nullptr };
@@ -625,7 +626,7 @@ public:
     SideButton*           m_side_panel_toggle_btn{nullptr};
     wxMenuItem*           m_side_panel_menu_item{nullptr};
     int                   m_side_panel_width_dip{380};
-    PluginPages           m_plugin_pages;
+    std::unique_ptr<PluginPages> m_plugin_pages;
     wxLogWindow*          m_log_window { nullptr };
     // BBS
     //wxBookCtrlBase*       m_tabpanel { nullptr };

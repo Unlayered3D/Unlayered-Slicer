@@ -105,6 +105,7 @@
 #include <boost/nowide/iostream.hpp>
 #include <boost/nowide/cstdio.hpp>
 #include <boost/nowide/cstdlib.hpp>
+#include <boost/format.hpp>
 
 #include "SVG.hpp"
 
@@ -941,6 +942,14 @@ static std::vector<Vec2d> get_path_of_change_filament(const Print& print)
     static float get_outer_wall_volumetric_speed(const FullPrintConfig& config, const Print& print, int filament_id, int filament_variant_idx, int extruder_id) {
         float outer_wall_volumetric_speed = 0;
         float filament_max_volumetric_speed = config.filament_max_volumetric_speed.get_at(filament_variant_idx);
+        const bool calibrating = print.calib_mode() != CalibMode::Calib_None;
+        // Orca: the outer wall is also limited by the max external volumetric speed.
+        float max_volumetric_speed = filament_max_volumetric_speed;
+        if (const float max_external = float(config.filament_max_external_volumetric_speed.get_at(filament_variant_idx)); max_external > 0 && !calibrating)
+            max_volumetric_speed = std::min(max_volumetric_speed, max_external);
+        if (config.enable_volumetric_speeds && !calibrating)
+            return std::min(float(print.default_region_config().outer_wall_volumetric_flow.get_at(extruder_id).get_abs_value(filament_max_volumetric_speed)),
+                            max_volumetric_speed);
         const double filament_diameter = config.filament_diameter.get_at(filament_id);
         float outer_wall_line_width = print.default_region_config().get_abs_value("outer_wall_line_width", filament_diameter);
         if (outer_wall_line_width == 0.0) {
@@ -950,8 +959,8 @@ static std::vector<Vec2d> get_path_of_change_filament(const Print& print)
         Flow outer_wall_flow = Flow(outer_wall_line_width, config.layer_height, config.nozzle_diameter.get_at(extruder_id));
         float outer_wall_speed = print.default_region_config().outer_wall_speed.get_at(extruder_id);
         outer_wall_volumetric_speed = outer_wall_speed * outer_wall_flow.mm3_per_mm();
-        if (outer_wall_volumetric_speed > filament_max_volumetric_speed)
-            outer_wall_volumetric_speed = filament_max_volumetric_speed;
+        if (outer_wall_volumetric_speed > max_volumetric_speed)
+            outer_wall_volumetric_speed = max_volumetric_speed;
         return outer_wall_volumetric_speed;
     }
 
@@ -2353,6 +2362,8 @@ static std::vector<Vec2d> get_path_of_change_filament(const Print& print)
 #define EXTRUDER_CONFIG(OPT) m_config.OPT.get_at(m_writer.filament()->extruder_id())
 #define FILAMENT_CONFIG(OPT) m_config.OPT.get_at(get_filament_config_index(m_writer.filament()->id()))
 #define NOZZLE_CONFIG(OPT) m_config.OPT.get_at(get_nozzle_config_index(m_writer.filament()->id()))
+// Speed of FEATURE (FEATURE_speed, or FEATURE_volumetric_flow with volumetric speeds) for a path of the given flow.
+#define FEATURE_SPEED(FEATURE, MM3_PER_MM) feature_speed(NOZZLE_CONFIG(FEATURE##_speed), m_config.FEATURE##_volumetric_flow, MM3_PER_MM)
 
 void GCode::PlaceholderParserIntegration::reset()
 {
@@ -3210,6 +3221,7 @@ void GCode::do_export(Print* print, const char* path, GCodeProcessorResult* resu
 
     // BBS
     m_curr_print = print;
+    m_overhang_layers_cache.valid = false;
     m_skirt_group_done.clear();
     m_pending_start_gcode_position.reset();
     m_exclusion_volume_travel_avoidance.init(print->config(), print->get_plate_origin());
@@ -4259,7 +4271,10 @@ void GCode::_do_export(Print& print, GCodeOutputStream &file, ThumbnailsGenerato
         std::vector<int> physicial_first_filaments;
         physicial_first_filaments.resize(filaments.size());
         for (int extruder_id = 0; extruder_id < filaments.size(); extruder_id++) {
-            physicial_first_filaments[config.physical_extruder_map.get_at(extruder_id)] = filaments[extruder_id];
+            // The map value is a firmware tool number, so it may legitimately fall outside this table.
+            const int physical_id = config.physical_extruder_map.get_at(extruder_id);
+            if (physical_id >= 0 && physical_id < static_cast<int>(physicial_first_filaments.size()))
+                physicial_first_filaments[physical_id] = filaments[extruder_id];
         }
         filaments = physicial_first_filaments;
     };
@@ -5110,11 +5125,14 @@ void GCode::_do_export(Print& print, GCodeOutputStream &file, ThumbnailsGenerato
     }
 
     // Write IMEX mode G-code first (processed above), then machine_start_gcode.
-    if (!imex_processed_gcode.empty())
+    if (!imex_processed_gcode.empty()) {
         file.writeln(imex_processed_gcode);
+        m_cooling_buffer->remember_motion_settings(imex_processed_gcode);
+    }
 
     // Write the custom start G-code
     file.writeln(machine_start_gcode);
+    m_cooling_buffer->remember_motion_settings(machine_start_gcode);
     // Mark the end of the machine start g-code so the GCodeProcessor usage-block builder knows where user
     // g-code ends and can start attributing filament/extruder usage. Gated on enable_pre_heating: only the
     // injector fleet (H2D/X2D/H2D-Pro/H2C) emits it; the byte-frozen fleet (X1/P1/A1/H2S, flag false) never
@@ -5143,6 +5161,7 @@ void GCode::_do_export(Print& print, GCodeOutputStream &file, ThumbnailsGenerato
             config.set_key_value("max_layer_z", new ConfigOptionFloat(max_layer_z_for_templates()));
             std::string filament_start_gcode = this->placeholder_parser_process("filament_start_gcode", print.config().filament_start_gcode.get_at(initial_non_support_extruder_id), initial_non_support_extruder_id,&config);
             file.writeln(filament_start_gcode);
+            m_cooling_buffer->remember_motion_settings(filament_start_gcode);
             // Mark the first filament used in print. Multi-nozzle printers (H2C) get ";VT%d H%d" where
             // H = dynamic ? nozzle_id : -1; existing single-nozzle printers keep the bare ";VT%d" so their
             // g-code stays byte-identical.
@@ -5281,6 +5300,9 @@ void GCode::_do_export(Print& print, GCodeOutputStream &file, ThumbnailsGenerato
     // so that first travel can be planned from the position the G-code actually
     // left the machine at rather than the default last_pos value.
     GCodeProcessor::PositionState startup_position = m_processor.get_current_position();
+    // ORCA: The layer cooling times the first layer from there too.
+    if (startup_position.has_known_xy())
+        m_cooling_buffer->reset(startup_position.position);
     const Vec2f plate_offset = m_writer.get_xy_offset();
     startup_position.position.x() += plate_offset.x();
     startup_position.position.y() += plate_offset.y();
@@ -5972,24 +5994,24 @@ struct PrecomputedLayer
 };
 } // namespace
 
-// Whether process_layer() prepares the overhang estimator for `layer`.
-template<typename OverhangSpeed>
-static bool prepares_overhang_estimator(const Layer &layer, bool overhang_fan, OverhangSpeed overhang_speed)
+// Whether process_layer() prepares the overhang estimator for `layer`. Any filament may print the layer, and
+// process_layer() prepares it before the layer's tool changes, so a region's overhang speed counts if it is enabled for
+// any nozzle.
+static bool prepares_overhang_estimator(const Layer &layer, bool overhang_fan)
 {
     const LayerRegionPtrs &regions = layer.regions();
-    return std::any_of(regions.begin(), regions.end(), [overhang_fan, &overhang_speed](const LayerRegion *region) {
-        return region->has_extrusions() && (overhang_fan || overhang_speed(*region));
+    return std::any_of(regions.begin(), regions.end(), [overhang_fan](const LayerRegion *region) {
+        return region->has_extrusions() &&
+            (overhang_fan || any_enabled(region->region().config().enable_overhang_speed));
     });
 }
 
 std::vector<PrecomputedOverhangLayer> precompute_overhang_layers(const std::vector<GCode::LayerToPrint> &layers, bool overhang_fan)
 {
-    // Any filament may print the layer, so a region's overhang speed counts if it is enabled for any.
-    auto overhang_speed = [](const LayerRegion &region) { return any_enabled(region.region().config().enable_overhang_speed); };
     std::vector<PrecomputedOverhangLayer> out;
     for (const GCode::LayerToPrint &layer : layers)
         if (layer.object_layer != nullptr && layer.object_layer->lower_layer != nullptr &&
-            prepares_overhang_estimator(*layer.object_layer, overhang_fan, overhang_speed)) {
+            prepares_overhang_estimator(*layer.object_layer, overhang_fan)) {
             const LayerRegionPtrs &regions = layer.object_layer->regions();
             const bool curled_lines = std::any_of(regions.begin(), regions.end(), [](const LayerRegion *region) {
                 return any_enabled(region->region().config().slowdown_for_curled_perimeters);
@@ -6839,14 +6861,14 @@ std::string GCode::generate_skirt(const Print &print,
                 path.mm3_per_mm = mm3_per_mm;
             }
 
-            //FIXME using the support_speed of the 1st object printed.
+            // _extrude() prints skirt paths at the support speed.
             if (first_layer && i==loops.first) {
                 //set skirt start point location
                 const Point desired_start_point = Skirt::find_start_point(loop, skirt_start_angle);
-                gcode += this->extrude_loop(loop, "skirt", NOZZLE_CONFIG(support_speed), {}, &desired_start_point);
+                gcode += this->extrude_loop(loop, "skirt", -1., {}, &desired_start_point);
             }
             else
-                gcode += this->extrude_loop(loop, "skirt", NOZZLE_CONFIG(support_speed));
+                gcode += this->extrude_loop(loop, "skirt");
 
             // If we only want a single wall on non-first layers, break now
             if (!first_layer && print.m_config.single_loop_draft_shield) {
@@ -6961,7 +6983,8 @@ std::string GCode::generate_belt_brim_fills(const Print &print, const PrintObjec
     m_avoid_crossing_perimeters.use_external_mp();
     for (const ExtrusionEntity *ee : fills.entities)
         if (ee != nullptr)
-            gcode += this->extrude_entity(*ee, "brim", NOZZLE_CONFIG(support_speed), {}, trafo);
+            // The brim role takes the support speed in _extrude(), in mm³/s too with volumetric speeds.
+            gcode += this->extrude_entity(*ee, "brim", -1., {}, trafo);
     m_avoid_crossing_perimeters.use_external_mp(false);
     m_avoid_crossing_perimeters.disable_once();
     return gcode;
@@ -7084,8 +7107,9 @@ std::string GCode::generate_object_brim(const Print &print, const PrintObject &o
     if (!first_layer)
         return {};
 
-    const bool wait_for_owner_filament = has_bed_exclude_volumes(m_config) &&
-        active_bed_exclude_volume_mode(m_config) != BedExcludeVolumeMode::Shared;
+    // A chosen brim filament also waits for its own pass, see process_layer().
+    const bool wait_for_owner_filament = object.config().brim_filament_id.value > 0 ||
+        (has_bed_exclude_volumes(m_config) && active_bed_exclude_volume_mode(m_config) != BedExcludeVolumeMode::Shared);
     auto emit_brim = [this, extruder_id, wait_for_owner_filament](const ExtrusionEntityCollection& brim,
                                          const std::vector<ObjectInstanceID>& instances,
                                          const unsigned int brim_filament_id) {
@@ -7105,7 +7129,7 @@ std::string GCode::generate_object_brim(const Print &print, const PrintObject &o
         m_avoid_crossing_perimeters.use_external_mp();
         for (const ExtrusionEntity* ee : brim.entities)
             if (ee != nullptr)
-                gcode += this->extrude_entity(*ee, "brim", NOZZLE_CONFIG(support_speed));
+                gcode += this->extrude_entity(*ee, "brim");
         m_avoid_crossing_perimeters.use_external_mp(false);
         m_avoid_crossing_perimeters.disable_once();
         for (const ObjectInstanceID& instance : instances)
@@ -7808,12 +7832,9 @@ LayerResult GCode::process_layer(
         return next_extruder;
     };
     
-    const bool overhang_fan   = overhang_fan_enabled(m_config, m_enable_cooling_markers);
-    auto       overhang_speed = [this](const LayerRegion &region) {
-        return bool(region.region().config().enable_overhang_speed.get_at(get_nozzle_config_index(m_writer.filament()->id())));
-    };
+    const bool overhang_fan = overhang_fan_enabled(m_config, m_enable_cooling_markers);
     for (const auto &layer_to_print : layers)
-        if (layer_to_print.object_layer && prepares_overhang_estimator(*layer_to_print.object_layer, overhang_fan, overhang_speed))
+        if (layer_to_print.object_layer && prepares_overhang_estimator(*layer_to_print.object_layer, overhang_fan))
             m_extrusion_quality_estimator.prepare_for_new_layer(layer_to_print.original_object, layer_to_print.object_layer);
 
     // Group extrusions by an extruder, then by an object, an island and a region.
@@ -8392,6 +8413,21 @@ LayerResult GCode::process_layer(
         if (print.has_belt_brim()) {
             const Vec2d saved_origin = m_origin;
             gcode += this->emit_belt_brim_bands(print, layers, single_object_instance_idx, int(extruder_id));
+            this->set_origin(saved_origin);
+        }
+
+        // A chosen brim filament may print nothing else on its objects, so their brims go down at the start of its pass.
+        if (first_layer) {
+            const Vec2d saved_origin = m_origin;
+            for (const LayerToPrint &ltp : layers) {
+                const PrintObject *object = ltp.original_object;
+                if (object == nullptr || object->config().brim_filament_id.value <= 0 || object->has_belt_brim())
+                    continue;
+                const size_t i_begin = single_object_instance_idx == size_t(-1) ? 0 : single_object_instance_idx;
+                const size_t i_end   = single_object_instance_idx == size_t(-1) ? object->instances().size() : single_object_instance_idx + 1;
+                for (size_t i = i_begin; i < i_end && i < object->instances().size(); ++i)
+                    gcode += generate_object_brim(print, *object, i, first_layer, extruder_id);
+            }
             this->set_origin(saved_origin);
         }
 
@@ -9557,13 +9593,7 @@ std::string GCode::extrude_loop(const ExtrusionLoop &loop_ref, const std::string
     if (paths.empty()) return "";
 
     // SoftFever: check loop lenght for small perimeter. 
-    double small_peri_speed = -1;
-    if (speed == -1 && loop.length() <= SMALL_PERIMETER_LENGTH(NOZZLE_CONFIG(small_perimeter_threshold))) {
-        if(NOZZLE_CONFIG(small_perimeter_speed).value == 0)
-            small_peri_speed = NOZZLE_CONFIG(outer_wall_speed) * 0.5;
-        else
-            small_peri_speed = NOZZLE_CONFIG(small_perimeter_speed).get_abs_value(NOZZLE_CONFIG(outer_wall_speed));
-    }
+    const bool is_small_perimeter = speed == -1 && loop.length() <= SMALL_PERIMETER_LENGTH(NOZZLE_CONFIG(small_perimeter_threshold));
 
     // extrude along the path
     std::string gcode;
@@ -9642,10 +9672,17 @@ std::string GCode::extrude_loop(const ExtrusionLoop &loop_ref, const std::string
     }
 
 
-    const auto speed_for_path = [&speed, &small_peri_speed](const ExtrusionPath& path) {
+    const auto speed_for_path = [this, speed, is_small_perimeter](const ExtrusionPath& path) {
         // don't apply small perimeter setting for overhangs/bridges/non-perimeters
-        const bool is_small_small_perimeter = small_peri_speed > 0 && !is_bridge(path.role()) && is_perimeter(path.role());
-        return is_small_small_perimeter ? small_peri_speed : speed;
+        if (!is_small_perimeter || is_bridge(path.role()) || !is_perimeter(path.role()))
+            return speed;
+        // The outer wall speed depends on the path's flow with volumetric speeds.
+        // UNLAYERED_MOD: the layer's first-layer test; the per-path contact is only known inside _extrude().
+        const double outer_wall_speed = FEATURE_SPEED(outer_wall, extrusion_mm3_per_mm(path, this->on_first_layer()));
+        const FloatOrPercent &small_perimeter_speed = NOZZLE_CONFIG(small_perimeter_speed);
+        const double small_peri_speed = small_perimeter_speed.value == 0 ? outer_wall_speed * 0.5 :
+                                                                           small_perimeter_speed.get_abs_value(outer_wall_speed);
+        return small_peri_speed > 0 ? small_peri_speed : speed;
     };
 
     
@@ -10027,14 +10064,17 @@ std::string GCode::extrude_support(const ExtrusionEntityCollection &support_fill
     static constexpr const char* support_ironing_label    = "support ironing";
 
     // Not static: it captures `this` by reference.
-    const auto speed_for_path = [&](double length, ExtrusionRole role, double default_speed = -1.0) {
+    const auto speed_for_path = [&](double length, ExtrusionRole role, const ExtrusionPath *first_path, double default_speed = -1.0) {
         if (!is_support(role) || length > SMALL_PERIMETER_LENGTH(NOZZLE_CONFIG(small_support_perimeter_threshold)))
             return default_speed;
 
         double small_perimeter_speed = -1.0;
 
+        // The support speeds depend on the paths' flow with volumetric speeds.
+        // UNLAYERED_MOD: the layer's first-layer test; the per-path contact is only known inside _extrude().
+        const double mm3_per_mm = first_path ? extrusion_mm3_per_mm(*first_path, this->on_first_layer()) : 0.;
         const auto base_speed = (role == erSupportMaterialInterface) 
-            ? NOZZLE_CONFIG(support_interface_speed) : NOZZLE_CONFIG(support_speed);
+            ? FEATURE_SPEED(support_interface, mm3_per_mm) : FEATURE_SPEED(support, mm3_per_mm);
 
         if (NOZZLE_CONFIG(small_support_perimeter_speed).value == 0)
             small_perimeter_speed = base_speed * 0.5;
@@ -10081,15 +10121,17 @@ std::string GCode::extrude_support(const ExtrusionEntityCollection &support_fill
             const ExtrusionEntityCollection* collection = dynamic_cast<const ExtrusionEntityCollection*>(ee);
 
             if (path) {
-                gcode += extrude_path(*path, label, speed_for_path(path->length(), role), trafo);
+                gcode += extrude_path(*path, label, speed_for_path(path->length(), role, path), trafo);
             }
             else if (multipath) {
-                gcode += extrude_multi_path(*multipath, label, speed_for_path(multipath->length(), role), trafo);
+                gcode += extrude_multi_path(*multipath, label, speed_for_path(multipath->length(), role,
+                                                                              multipath->paths.empty() ? nullptr : &multipath->paths.front()), trafo);
             }
             else if (loop) {
                 // NOTE the trafo is extrude_loop's SIXTH parameter, after region_perimeters and
                 // start_point; both defaults are spelled out so it lands in the right slot.
-                gcode += extrude_loop(*loop, label, speed_for_path(loop->length(), role), {}, nullptr, trafo);
+                gcode += extrude_loop(*loop, label, speed_for_path(loop->length(), role, loop->paths.empty() ? nullptr : &loop->paths.front()),
+                                      {}, nullptr, trafo);
             }
             else if (collection) {
                 // Nested collections must carry the transform down, or a sub-collection's paths
@@ -10506,6 +10548,81 @@ static bool overhang_fan_active(float overlap, int overhang_fan_threshold, Extru
     return overlap_threshold >= 0.f && overlap <= overlap_threshold;
 }
 
+// UNLAYERED_MOD: the fork judges the first layer per path by its contact (path_on_first_layer()), so callers pass that
+// flag and, on printed material, the object contact flow ratio, which replaces the first layer's (0 = first layer's).
+double GCode::extrusion_mm3_per_mm(const ExtrusionPath &path, bool on_first_layer, double object_contact_flow_ratio) const
+{
+    const bool sloped = dynamic_cast<const ExtrusionPathSloped*>(&path) != nullptr;
+    // Effective flow = Geometric volume * print flow ratio * filament flow ratio * role-based-flow-ratios
+    double _mm3_per_mm = path.mm3_per_mm * this->config().print_flow_ratio;
+    _mm3_per_mm *= FILAMENT_CONFIG(filament_flow_ratio);
+
+    if (path.role() == erTopSolidInfill) {
+        _mm3_per_mm *= NOZZLE_CONFIG(top_solid_infill_flow_ratio);
+    } else if (path.role() == erBottomSurface) {
+        _mm3_per_mm *= m_config.bottom_solid_infill_flow_ratio;
+    } else if (path.role() == erInternalBridgeInfill) {
+        _mm3_per_mm *= m_config.internal_bridge_flow;
+    } else if (path.role() == erBrim) {
+        _mm3_per_mm *= m_config.brim_flow_ratio;
+    } else if (sloped) {
+        _mm3_per_mm *= m_config.scarf_joint_flow_ratio;
+    }
+
+    if (m_config.set_other_flow_ratios) {
+        if (path.role() == erExternalPerimeter) {
+            _mm3_per_mm *= m_config.outer_wall_flow_ratio;
+        } else if (path.role() == erPerimeter) {
+            _mm3_per_mm *= m_config.inner_wall_flow_ratio;
+        } else if (path.role() == erOverhangPerimeter) {
+            _mm3_per_mm *= m_config.overhang_flow_ratio;
+        } else if (path.role() == erInternalInfill) {
+            _mm3_per_mm *= m_config.sparse_infill_flow_ratio;
+        } else if (path.role() == erSolidInfill) {
+            _mm3_per_mm *= m_config.internal_solid_infill_flow_ratio;
+        } else if (path.role() == erGapFill) {
+            _mm3_per_mm *= m_config.gap_fill_flow_ratio;
+        } else if (path.role() == erSupportMaterial) { // Should this condition also cover erSupportTransition?
+            _mm3_per_mm *= m_config.support_flow_ratio;
+        } else if (path.role() == erSupportMaterialInterface) {
+            _mm3_per_mm *= m_config.support_interface_flow_ratio;
+        }
+
+        // Additionally, adjust the value if we are on the first layer (except for brims and skirts)
+        if (on_first_layer && (path.role() != erBrim && path.role() != erSkirt)) {
+            // BELT_MOD: on printed material the user may set a separate ratio (0 = first layer's).
+            _mm3_per_mm *= object_contact_flow_ratio > 0. ? object_contact_flow_ratio : m_config.first_layer_flow_ratio;
+        }
+    }
+
+    // Mixed-color sublayer: scale the flow down to the sub-layer's share of the layer height.
+    if (m_sub_layer_flow_ratio > 0.0)
+        _mm3_per_mm *= m_sub_layer_flow_ratio;
+    return _mm3_per_mm;
+}
+
+double GCode::feature_speed(double speed, const ConfigOptionFloatsOrPercentsNullable &volumetric_flow, double mm3_per_mm) const
+{
+    // Orca: calibrations set linear speeds, and a path that extrudes nothing has no flow to divide by.
+    if (!m_config.enable_volumetric_speeds || m_print->calib_mode() != CalibMode::Calib_None || mm3_per_mm <= 0.)
+        return speed;
+    const double max_volumetric_speed = FILAMENT_CONFIG(filament_max_volumetric_speed);
+    return volumetric_flow.get_at(get_nozzle_config_index(m_writer.filament()->id())).get_abs_value(max_volumetric_speed) / mm3_per_mm;
+}
+
+double GCode::volumetric_speed_limit(ExtrusionRole role) const
+{
+    const double max_volumetric_speed          = FILAMENT_CONFIG(filament_max_volumetric_speed);
+    const double max_external_volumetric_speed = FILAMENT_CONFIG(filament_max_external_volumetric_speed);
+    // Orca: visible features are outer walls, what prints at the external bridge speed, and top surfaces this layer does not iron.
+    const bool visible = role == erExternalPerimeter || role == erOverhangPerimeter || role == erBridgeInfill ||
+                         (role == erTopSolidInfill && m_layer != nullptr &&
+                          Layer::choose_ironing_extruder(m_config, m_config.spiral_mode.value, m_layer->no_material_above()) < 0);
+    if (max_external_volumetric_speed <= 0. || !visible || m_print->calib_mode() != CalibMode::Calib_None)
+        return max_volumetric_speed;
+    return max_volumetric_speed > 0. ? std::min(max_volumetric_speed, max_external_volumetric_speed) : max_external_volumetric_speed;
+}
+
 std::string GCode::_extrude(const ExtrusionPath &path, const std::string &path_description, double speed, const Transform3d &trafo)
 {
     std::string gcode;
@@ -10758,58 +10875,10 @@ std::string GCode::_extrude(const ExtrusionPath &path, const std::string &path_d
     }
 
     // calculate effective extrusion length per distance unit (e_per_mm)
-    double filament_flow_ratio = FILAMENT_CONFIG(filament_flow_ratio);
-    // We set _mm3_per_mm to effectove flow = Geometric volume * print flow ratio * filament flow ratio * role-based-flow-ratios
-    auto _mm3_per_mm = path.mm3_per_mm * this->config().print_flow_ratio;
-    _mm3_per_mm *= filament_flow_ratio;
+    const double _mm3_per_mm = extrusion_mm3_per_mm(path, this->path_on_first_layer(), this->path_object_contact_flow_ratio());
 
-    if (path.role() == erTopSolidInfill) {
-        _mm3_per_mm *= NOZZLE_CONFIG(top_solid_infill_flow_ratio);
-    } else if (path.role() == erBottomSurface) {
-        _mm3_per_mm *= m_config.bottom_solid_infill_flow_ratio;
-    } else if (path.role() == erInternalBridgeInfill) {
-        _mm3_per_mm *= m_config.internal_bridge_flow;
-    } else if (path.role() == erBrim) {
-        _mm3_per_mm *= m_config.brim_flow_ratio;
-    } else if (sloped) {
-        _mm3_per_mm *= m_config.scarf_joint_flow_ratio;
-    }
-
-    if (m_config.set_other_flow_ratios) {
-        if (path.role() == erExternalPerimeter) {
-            _mm3_per_mm *= m_config.outer_wall_flow_ratio;
-        } else if (path.role() == erPerimeter) {
-            _mm3_per_mm *= m_config.inner_wall_flow_ratio;
-        } else if (path.role() == erOverhangPerimeter) {
-            _mm3_per_mm *= m_config.overhang_flow_ratio;
-        } else if (path.role() == erInternalInfill) {
-            _mm3_per_mm *= m_config.sparse_infill_flow_ratio;
-        } else if (path.role() == erSolidInfill) {
-            _mm3_per_mm *= m_config.internal_solid_infill_flow_ratio;
-        } else if (path.role() == erGapFill) {
-            _mm3_per_mm *= m_config.gap_fill_flow_ratio;
-        } else if (path.role() == erSupportMaterial) { // Should this condition also cover erSupportTransition?
-            _mm3_per_mm *= m_config.support_flow_ratio;
-        } else if (path.role() == erSupportMaterialInterface) {
-            _mm3_per_mm *= m_config.support_interface_flow_ratio;
-        }
-
-        // Additionally, adjust the value if we are on the first layer (except for brims and skirts)
-        if (this->path_on_first_layer() && (path.role() != erBrim && path.role() != erSkirt)) {
-            // BELT_MOD: on printed material the user may set a separate ratio (0 = first layer's).
-            const double object_ratio = this->path_object_contact_flow_ratio();
-            _mm3_per_mm *= object_ratio > 0. ? object_ratio : m_config.first_layer_flow_ratio;
-        }
-    }
-
-    // Mixed-color sublayer: this path belongs to one sub-layer of a split layer, so scale the
-    // flow down to that sub-layer's share of the nominal layer height and report the sub-height
-    // as the effective extrusion height. Inert (ratio == 0) outside the sublayer emission block.
-    float effective_height = path.height;
-    if (m_sub_layer_flow_ratio > 0.0) {
-        _mm3_per_mm *= m_sub_layer_flow_ratio;
-        effective_height = static_cast<float>(m_sub_layer_height);
-    }
+    // Mixed-color sublayer: report the sub-layer height as the effective extrusion height.
+    const float effective_height = m_sub_layer_flow_ratio > 0.0 ? static_cast<float>(m_sub_layer_height) : path.height;
 
     // _mm3_per_mm already includes the filament flow ratio, so convert it with the bare cross-section
     // rather than e_per_mm3(), which would apply the ratio a second time.
@@ -10818,38 +10887,40 @@ std::string GCode::_extrude(const ExtrusionPath &path, const std::string &path_d
     // set speed
     if (speed == -1) {
         if (path.role() == erPerimeter) {
-            speed = NOZZLE_CONFIG(inner_wall_speed);
+            speed = FEATURE_SPEED(inner_wall, _mm3_per_mm);
             if (sloped) {
                 speed = std::min(speed, m_config.scarf_joint_speed.get_abs_value(speed));
             }
         } else if (path.role() == erExternalPerimeter) {
-            speed = NOZZLE_CONFIG(outer_wall_speed);
+            speed = FEATURE_SPEED(outer_wall, _mm3_per_mm);
             if (sloped) {
                 speed = std::min(speed, m_config.scarf_joint_speed.get_abs_value(speed));
             }
         } else if(path.role() == erInternalBridgeInfill) {
-            speed = m_config.internal_bridge_speed.get_at(nozzle).get_abs_value(m_config.bridge_speed.get_at(nozzle));
+            speed = feature_speed(m_config.internal_bridge_speed.get_at(nozzle).get_abs_value(m_config.bridge_speed.get_at(nozzle)),
+                                  m_config.internal_bridge_volumetric_flow, _mm3_per_mm);
         } else if (path.role() == erOverhangPerimeter || path.role() == erSupportTransition || path.role() == erBridgeInfill) {
-            speed = NOZZLE_CONFIG(bridge_speed);
+            speed = FEATURE_SPEED(bridge, _mm3_per_mm);
         } else if (path.role() == erInternalInfill) {
-            speed = NOZZLE_CONFIG(sparse_infill_speed);
+            speed = FEATURE_SPEED(sparse_infill, _mm3_per_mm);
         } else if (path.role() == erSolidInfill) {
-            speed = NOZZLE_CONFIG(internal_solid_infill_speed);
+            speed = FEATURE_SPEED(internal_solid_infill, _mm3_per_mm);
         } else if (path.role() == erTopSolidInfill) {
-            speed = NOZZLE_CONFIG(top_surface_speed);
+            speed = FEATURE_SPEED(top_surface, _mm3_per_mm);
         } else if (path.role() == erIroning) {
             const size_t filament_idx = get_filament_config_index(m_writer.filament()->id());
             speed = m_config.filament_ironing_speed.is_nil(filament_idx)
                 ? m_config.ironing_speed.value
                 : m_config.filament_ironing_speed.get_at(filament_idx);
         } else if (path.role() == erBottomSurface) {
-            speed = NOZZLE_CONFIG(initial_layer_infill_speed);
+            speed = FEATURE_SPEED(initial_layer_infill, _mm3_per_mm);
         } else if (path.role() == erGapFill) {
-            speed = NOZZLE_CONFIG(gap_infill_speed);
-        } else if (path.role() == erSupportMaterial) {
-            speed = NOZZLE_CONFIG(support_speed);
+            speed = FEATURE_SPEED(gap_infill, _mm3_per_mm);
+        } else if (path.role() == erSupportMaterial || path.role() == erSkirt || path.role() == erBrim) {
+            //FIXME skirt and brim use the support speed of the 1st object printed.
+            speed = FEATURE_SPEED(support, _mm3_per_mm);
         } else if (path.role() == erSupportMaterialInterface) {
-            speed = NOZZLE_CONFIG(support_interface_speed);
+            speed = FEATURE_SPEED(support_interface, _mm3_per_mm);
         } else {
             throw Slic3r::InvalidArgument("Invalid speed");
         }
@@ -10873,16 +10944,16 @@ std::string GCode::_extrude(const ExtrusionPath &path, const std::string &path_d
             speed = object_speed;
         } else if (path.role() != erBottomSurface) {
             const bool use_first_layer_speed = is_perimeter(path.role()) || path.role() == erBrim;
-            speed = use_first_layer_speed ? NOZZLE_CONFIG(initial_layer_speed) :
-                                            NOZZLE_CONFIG(initial_layer_infill_speed);
+            speed = use_first_layer_speed ? FEATURE_SPEED(initial_layer, _mm3_per_mm) :
+                                            FEATURE_SPEED(initial_layer_infill, _mm3_per_mm);
         }
     } else if (m_config.slow_down_layers > 1 && m_config.raft_layers == 0) {
         
         if (_layer > 0 && _layer < m_config.slow_down_layers) {
             const auto first_layer_speed =
                 is_perimeter(path.role())
-                    ? NOZZLE_CONFIG(initial_layer_speed)
-                    : NOZZLE_CONFIG(initial_layer_infill_speed);
+                    ? FEATURE_SPEED(initial_layer, _mm3_per_mm)
+                    : FEATURE_SPEED(initial_layer_infill, _mm3_per_mm);
             if (first_layer_speed < speed) {
                 speed = std::min(
                     speed,
@@ -10894,8 +10965,8 @@ std::string GCode::_extrude(const ExtrusionPath &path, const std::string &path_d
         
         if (_layer > m_config.raft_layers && (_layer - m_config.raft_layers) < m_config.slow_down_layers) {
             const auto first_layer_speed 
-                = is_perimeter(path.role()) ? NOZZLE_CONFIG(initial_layer_speed) :
-                                                                       NOZZLE_CONFIG(initial_layer_infill_speed);
+                = is_perimeter(path.role()) ? FEATURE_SPEED(initial_layer, _mm3_per_mm) :
+                                                                       FEATURE_SPEED(initial_layer_infill, _mm3_per_mm);
             if (first_layer_speed < speed) {
                 speed = std::min(speed, Slic3r::lerp(first_layer_speed, speed,
                                                      (double) (_layer - m_config.raft_layers) / m_config.slow_down_layers));
@@ -10918,9 +10989,10 @@ std::string GCode::_extrude(const ExtrusionPath &path, const std::string &path_d
     //        m_config.max_volumetric_speed.value / _mm3_per_mm
     //    );
     //}
-    if (FILAMENT_CONFIG(filament_max_volumetric_speed) > 0) {
+    const double max_volumetric_speed = volumetric_speed_limit(path.role());
+    if (max_volumetric_speed > 0) {
         // cap speed with max_volumetric_speed anyway (even if user is not using autospeed)
-        speed = std::min(speed, FILAMENT_CONFIG(filament_max_volumetric_speed) / _mm3_per_mm);
+        speed = std::min(speed, max_volumetric_speed / _mm3_per_mm);
     }
     // ORCA: resonance‑avoidance on short external perimeters
 {
@@ -10934,10 +11006,10 @@ std::string GCode::_extrude(const ExtrusionPath &path, const std::string &path_d
         }
 
         // re‑apply volumetric cap
-        if (FILAMENT_CONFIG(filament_max_volumetric_speed) > 0) {
+        if (max_volumetric_speed > 0) {
             speed = std::min(
                 speed,
-                FILAMENT_CONFIG(filament_max_volumetric_speed) / _mm3_per_mm
+                max_volumetric_speed / _mm3_per_mm
             );
         }
 
@@ -10945,7 +11017,10 @@ std::string GCode::_extrude(const ExtrusionPath &path, const std::string &path_d
             // - speeds in lower half of range: clamp down to "min"
             // - speeds in upper half of range: boost up to "max"
         if (m_resonance_avoidance && speed < m_config.max_resonance_avoidance_speed.value) {
-            if (speed < m_config.min_resonance_avoidance_speed.value +
+            // ORCA: a wall the volumetric limit keeps below "max" cannot be boosted, so it clamps down to "min".
+            const bool can_boost = max_volumetric_speed <= 0 ||
+                                   m_config.max_resonance_avoidance_speed.value <= max_volumetric_speed / _mm3_per_mm;
+            if (!can_boost || speed < m_config.min_resonance_avoidance_speed.value +
                             ((m_config.max_resonance_avoidance_speed.value - m_config.min_resonance_avoidance_speed.value) / 2)) {
                 speed = std::min(speed, m_config.min_resonance_avoidance_speed.value);
             } else {
@@ -10972,12 +11047,12 @@ std::string GCode::_extrude(const ExtrusionPath &path, const std::string &path_d
     if (need_overhang_detection && !this->path_on_first_layer() && !object_layer_over_raft() && ! path.nonplanar_shell &&
         (is_bridge(path.role()) || is_perimeter(path.role()))) {
             bool is_external = is_external_perimeter(path.role());
-            double ref_speed   = is_external ? NOZZLE_CONFIG(outer_wall_speed) : NOZZLE_CONFIG(inner_wall_speed);
+            double ref_speed   = is_external ? FEATURE_SPEED(outer_wall, _mm3_per_mm) : FEATURE_SPEED(inner_wall, _mm3_per_mm);
             if (ref_speed == 0)
-                ref_speed = FILAMENT_CONFIG(filament_max_volumetric_speed) / _mm3_per_mm;
+                ref_speed = max_volumetric_speed / _mm3_per_mm;
 
-            if (FILAMENT_CONFIG(filament_max_volumetric_speed) > 0) {
-                ref_speed = std::min(ref_speed, FILAMENT_CONFIG(filament_max_volumetric_speed) / _mm3_per_mm);
+            if (max_volumetric_speed > 0) {
+                ref_speed = std::min(ref_speed, max_volumetric_speed / _mm3_per_mm);
             }
             if (sloped) {
                 ref_speed = std::min(ref_speed, m_config.scarf_joint_speed.get_abs_value(ref_speed));
@@ -10994,7 +11069,7 @@ std::string GCode::_extrude(const ExtrusionPath &path, const std::string &path_d
 
             if (NOZZLE_CONFIG(slowdown_for_curled_perimeters)){
                 const FloatOrPercent fully_unsupported_speed = path.role() == erBridgeInfill ?
-                    FloatOrPercent{NOZZLE_CONFIG(bridge_speed) * 100 / ref_speed, true} :
+                    FloatOrPercent{FEATURE_SPEED(bridge, _mm3_per_mm) * 100 / ref_speed, true} :
                     (NOZZLE_CONFIG(overhang_4_4_speed).get_abs_value(ref_speed) < 0.5 ?
                          FloatOrPercent{100, true} :
                          FloatOrPercent{NOZZLE_CONFIG(overhang_4_4_speed).get_abs_value(ref_speed) * 100 / ref_speed, true});
@@ -11032,7 +11107,7 @@ std::string GCode::_extrude(const ExtrusionPath &path, const std::string &path_d
                       (NOZZLE_CONFIG(overhang_4_4_speed).get_abs_value(ref_speed) < 0.5) ?
                             FloatOrPercent{100, true} :
                             FloatOrPercent{NOZZLE_CONFIG(overhang_4_4_speed).get_abs_value(ref_speed) * 100 / ref_speed, true},
-                     FloatOrPercent{NOZZLE_CONFIG(bridge_speed) * 100 / ref_speed, true}});
+                     FloatOrPercent{FEATURE_SPEED(bridge, _mm3_per_mm) * 100 / ref_speed, true}});
 
                 new_points = m_extrusion_quality_estimator.estimate_extrusion_quality(path, overhang_overlap_levels, dynamic_overhang_speeds,
                                                                               ref_speed, speed, NOZZLE_CONFIG(slowdown_for_curled_perimeters),
@@ -12464,12 +12539,22 @@ bool GCode::needs_retraction(const Polyline &travel, ExtrusionRole role, LiftTyp
         std::pair<float, float> z_range;
         z_range.second = m_layer ? m_layer->print_z : 0.f;
         z_range.first = std::max(0.f, z_range.second - protect_z);
-        std::vector<LayerPtrs> layers_of_objects;
-        std::vector<BoundingBox> boundingBox_for_objects;
-        VecOfPoints objects_instances_shift;
-        std::vector<size_t> idx_of_object_sorted = m_curr_print->layers_sorted_for_object(z_range.first, z_range.second, layers_of_objects, boundingBox_for_objects, objects_instances_shift);
-
-        std::vector<bool> is_layers_of_objects_sorted(layers_of_objects.size(), false);
+        OverhangLayersCache &cache = m_overhang_layers_cache;
+        if (!cache.valid || cache.z_min != z_range.first || cache.z_max != z_range.second) {
+            cache.layers_of_objects.clear();
+            cache.boundingBox_for_objects.clear();
+            cache.idx_of_object_sorted = m_curr_print->layers_sorted_for_object(z_range.first, z_range.second, cache.layers_of_objects,
+                                                                                cache.boundingBox_for_objects, cache.objects_instances_shift);
+            for (LayerPtrs &layers : cache.layers_of_objects)
+                std::sort(layers.begin(), layers.end(), [](auto left, auto right) { return left->loverhangs_bbox.area() > right->loverhangs_bbox.area();});
+            cache.z_min = z_range.first;
+            cache.z_max = z_range.second;
+            cache.valid = true;
+        }
+        const std::vector<LayerPtrs>   &layers_of_objects       = cache.layers_of_objects;
+        const std::vector<BoundingBox> &boundingBox_for_objects = cache.boundingBox_for_objects;
+        const VecOfPoints              &objects_instances_shift = cache.objects_instances_shift;
+        const std::vector<size_t>      &idx_of_object_sorted    = cache.idx_of_object_sorted;
 
         for (size_t idx : idx_of_object_sorted) {
             for (const Point & instance_shift : objects_instances_shift[idx]) {
@@ -12486,11 +12571,6 @@ bool GCode::needs_retraction(const Polyline &travel, ExtrusionRole role, LiftTyp
                 temp.emplace_back(instance_bbox.polygon());
                 if (intersection_pl(travel, temp).empty())
                     continue;
-
-                if (!is_layers_of_objects_sorted[idx]) {
-                    std::sort(layers_of_objects[idx].begin(), layers_of_objects[idx].end(), [](auto left, auto right) { return left->loverhangs_bbox.area() > right->loverhangs_bbox.area();});
-                    is_layers_of_objects_sorted[idx] = true;
-                }
 
                 for (const auto& layer : layers_of_objects[idx]) {
                     for (ExPolygon overhang : layer->loverhangs) {

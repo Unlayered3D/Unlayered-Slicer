@@ -291,9 +291,11 @@ if (WIN32)
     endif ()
     # copy libpython to the bin folder for Windows
     add_custom_command(TARGET UnlayeredSlicer POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E rm -rf "$<TARGET_FILE_DIR:UnlayeredSlicer>/python"
-        COMMAND ${CMAKE_COMMAND} -E copy_directory "${CMAKE_PREFIX_PATH}/libpython" "$<TARGET_FILE_DIR:UnlayeredSlicer>/python"
-        COMMENT "Copying Python runtime into the build tree"
+        COMMAND ${CMAKE_COMMAND} "-DSOURCE=${CMAKE_PREFIX_PATH}/libpython"
+            "-DDESTINATION=$<TARGET_FILE_DIR:UnlayeredSlicer>/python"
+            "-DSTAMP=${CMAKE_CURRENT_BINARY_DIR}/python_runtime_$<CONFIG>.stamp"
+            -P "${CMAKE_SOURCE_DIR}/cmake/modules/StagePythonRuntime.cmake"
+        COMMENT "Updating the Python runtime in the build tree"
         VERBATIM)
 
     if (CMAKE_CONFIGURATION_TYPES)
