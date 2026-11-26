@@ -471,7 +471,7 @@ InvokeResult run_calib(InvokeContext& ctx)
         plater->up_to_date(true, false);
         plater->up_to_date(true, true);
     }
-    if (plater->new_project(!(prompt_project || prompt_presets), true) == wxID_CANCEL)
+    if (plater->new_project((prompt_project || prompt_presets) ? Ops::Prompts::Ask : Ops::Prompts::Skip, /*silent=*/true) == wxID_CANCEL)
         return InvokeResult::error(WAB_USER_CANCELLED, "the person kept the current project");
 
     // Every Plater::calib_* starts a new project of its own: the questions are settled, so it

@@ -16,6 +16,7 @@
 #include "libslic3r/Preset.hpp"
 #include <functional>
 #include <memory>
+#include <set>
 #include <wx/busycursor.h>
 #include <cstddef>
 #include "slic3r/GUI/Project.hpp"
@@ -100,6 +101,12 @@
 #include "3DScene.hpp"
 #include "ParamsDialog.hpp"
 #include "PrintHostDialogs.hpp"
+#include "RecordingIndicator.hpp"
+#include "ActionReplayDialog.hpp"
+#include "AgentActivityPanel.hpp"
+#include "RunScriptPanel.hpp"
+#include "CodeEditorWindow.hpp"
+#include "NativeCommands.hpp"
 #include "libslic3r_version.h"
 #include "wxExtensions.hpp"
 #include "GUI_ObjectList.hpp"
@@ -111,7 +118,6 @@
 #include "Plater.hpp"
 #ifdef SLIC3R_CAD
 #include "slic3r/GUI/CAD/DesignPanel.hpp"
-#include "slic3r/GUI/CAD/McpControl.hpp"
 #endif
 #include "ProjectAside.hpp"
 #include "SlicePrepare.hpp" // complete type for m_slice_prepare: ~MainFrame is defaulted here
@@ -136,6 +142,7 @@
 
 #include "GUI_App.hpp"
 #include "AutoUpdater.hpp"
+#include "Mcp/AutomationRuntime.hpp"
 #include "ImGuiWrapper.hpp"
 #include "OpenGLManager.hpp"
 #include "Shortcuts.hpp"
@@ -827,6 +834,12 @@ DPIFrame(NULL, wxID_ANY, "", wxDefaultPosition, wxDefaultSize, BORDERLESS_FRAME_
             return wxGetApp().check_and_save_current_preset_changes(_L("Closing application"), _L("Closing Application while some presets are modified."));
         };
 
+        // The Run Script panel's unsaved script is asked about before the project.
+        if (RunScriptPanel* panel = wxGetApp().run_script_panel_if_built(); event.CanVeto() && panel != nullptr && !panel->confirm_close()) {
+            event.Veto();
+            return;
+        }
+
         // BBS: close save project
         int result;
         if (event.CanVeto() && ((result = m_plater->close_with_confirm(check)) == wxID_CANCEL)) {
@@ -950,6 +963,16 @@ DPIFrame(NULL, wxID_ANY, "", wxDefaultPosition, wxDefaultSize, BORDERLESS_FRAME_
             return;
         }
 #endif
+        // A key in the Run Script panel goes to its page, past the global shortcuts, apart from the toggle's.
+        if (focused_code_editor() != nullptr) {
+            const KeyChord chord = KeyChord::from_event(evt);
+            if (chord.valid() && chord == wxGetApp().shortcuts().binding(Shortcut::ToggleRunScript)) {
+                wxGetApp().run_script_panel().toggle();
+                return;
+            }
+            evt.Skip();
+            return;
+        }
         if (!handle_global_shortcut(KeyChord::from_event(evt)))
             evt.Skip();
     });
@@ -1051,6 +1074,7 @@ bool MainFrame::handle_global_shortcut(const KeyChord& chord)
         if (m_plater && is_prepare_or_preview_tab())
             m_plater->collapse_sidebar(!m_plater->is_sidebar_collapsed());
         break;
+    case Shortcut::ToggleRunScript: wxGetApp().run_script_panel().toggle(); break;
     case Shortcut::SpeedDial:
         if (!wxGetApp().app_config->get_bool("enable_speed_dial") || (chord == KeyChord{ WXK_SPACE } && focus_keeps_space(wxWindow::FindFocus())))
             return false;
@@ -1508,10 +1532,21 @@ void MainFrame::shutdown()
     BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << "MainFrame::shutdown enter";
     // A crash from here until OnExit is reported as one while closing.
     UsageTelemetry::set_phase("closing");
+    // Automation calls must not reach panels that are about to go away. A language change rebuilds the
+    // frame, so the runtime only pauses until GUI_App::recreate_GUI() resumes it, and the MCP endpoint stays open.
+    if (wxGetApp().is_recreating_gui()) {
+        if (Mcp::AutomationRuntime* runtime = wxGetApp().automation_if_started())
+            runtime->suspend();
+    } else
+        wxGetApp().stop_automation();
     m_idle.stop();
     if (ProjectPanel* project = ProjectPanel::if_built())
         project->shutdown();
     m_plugin_pages->shutdown();
+    if (RunScriptPanel* panel = wxGetApp().run_script_panel_if_built())
+        panel->main_window_closing();
+    if (AgentActivityPanel* panel = wxGetApp().agent_activity_panel_if_built())
+        panel->main_window_closing();
     if (m_plater != nullptr)
         m_plater->remove_dock_panes();
 #ifdef SLIC3R_CAD
@@ -1611,6 +1646,14 @@ void MainFrame::show_publish_button(bool show)
 {
     // m_publish_btn->Show(show);
     // Layout();
+}
+
+void MainFrame::show_recording_indicator(bool show)
+{
+    if (m_recording->Show(show)) {
+        m_recording->GetParent()->Layout();
+        fit_tab_labels(); // ORCA on the REC pill showing or going
+    }
 }
 
 void MainFrame::update_title_colour_after_set_title()
@@ -1739,7 +1782,19 @@ void MainFrame::init_tabpanel() {
             DesignPanel::ensure()->update_undo_redo_buttons();
 #endif
 
-        if (panel)
+        // A page with a 3D view gives the keyboard to the view. The page's own SetFocus() would give it to
+        // its first focusable child, a sidebar control, which keeps Space (the Speed Dial) and the view's
+        // other keys until the pointer enters the view. A view switch posted above focuses the view it
+        // shows in turn.
+        if (panel == m_plater) {
+            if (GLCanvas3D* canvas = m_plater->get_current_canvas3D())
+                canvas->force_set_focus();
+        }
+#ifdef SLIC3R_CAD
+        else if (m_design_page != nullptr && panel == m_design_page)
+            DesignPanel::ensure()->focus_viewport();
+#endif
+        else if (panel)
             panel->SetFocus();
     });
 
@@ -1765,12 +1820,11 @@ void MainFrame::init_tabpanel() {
     // The experimental feature is off by default, and when it is off the page is never
     // created, so the tab does not appear at all (the preference takes effect on the next
     // start, like the other feature toggles). Nor in the G-code viewer, which has no Design tab to put
-    // it in — and no business opening a control socket onto one.
+    // it in.
     if (wxGetApp().is_enable_cad_feature() && wxGetApp().is_editor()) {
         // Experimental and heavy enough that building it unasked would cost more than it saves.
         m_design_page = new LazyPage<DesignPanel>(this, TAB_ID_DESIGN, -1);
         m_lazy_pages.push_back(m_design_page);
-        start_mcp_control_if_enabled();   // opens the MCP socket iff ORCA_CAD_MCP is set
     }
 #endif
 
@@ -2317,7 +2371,7 @@ void MainFrame::fit_tab_labels()
             }
         }
     }
-    if (!m_tabpanel || !m_slice_option_btn) // ignore layout change while slice/print buttons not visible
+    if (!m_tabpanel || !m_slice_option_btn || !m_recording) // ignore layout change while the side tools are not built
         return;
 
     auto* ctrl  = m_tabpanel->GetBtnsListCtrl();
@@ -2330,9 +2384,14 @@ void MainFrame::fit_tab_labels()
     m_tabpanel->Refresh();
     Layout();
 
+    // The side tools start at the REC pill while it shows, else at the slice button's dropdown.
+    const wxWindow* side = m_slice_option_btn;
+    if (m_recording->IsShown())
+        side = m_recording;
+
     // Compact (last to first)
     for (size_t i = count - 1; i >= 1; --i) {
-        int right = ScreenToClient(m_slice_option_btn->ClientToScreen({})).x;
+        int right = ScreenToClient(side->ClientToScreen({})).x;
         int left  = sizer->GetSize().GetWidth();
         // The overflow button sits between the tab buttons and the side tools, so it is not free space.
         if (const wxWindow* overflow = ctrl->GetOverflowButton())
@@ -2922,6 +2981,9 @@ wxBoxSizer* MainFrame::create_side_tools()
     m_slice_option_btn->Enable();
     m_print_option_btn->Enable();
     //sizer->Add(FromDIP(15), 0, 0, 0, 0);
+    m_recording = new RecordingIndicator(this);
+    m_recording->Hide();
+    sizer->Add(m_recording, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, FromDIP(15));
     sizer->Add(slice_panel);
     sizer->Add(FromDIP(15), 0, 0, 0, 0);
     sizer->Add(print_panel);
@@ -3230,6 +3292,13 @@ void MainFrame::press_print_button(bool wait)
 
 bool MainFrame::get_enable_print_status()
 {
+    const bool enable = print_action_enabled(PrintSelectType(m_print_select));
+    BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(": m_print_select %1%, enable= %2% ")%m_print_select %enable;
+    return enable;
+}
+
+bool MainFrame::print_action_enabled(PrintSelectType action)
+{
     bool enable = true;
 
     // Preview-only mode: the G-code was LOADED, not sliced, so there is no plate slice result to
@@ -3238,7 +3307,7 @@ bool MainFrame::get_enable_print_status()
     // send_loaded_gcode are what these actions run. Anything that genuinely needs a slice (a
     // sliced-file export, the SD-card and multi-machine flows) stays disabled.
     if (m_plater != nullptr && m_plater->only_gcode_mode()) {
-        switch (m_print_select) {
+        switch (action) {
         case eExportGcode:
             return m_plater->can_export_loaded_gcode();
         case eSendGcode:
@@ -3253,14 +3322,14 @@ bool MainFrame::get_enable_print_status()
     PartPlateList &part_plate_list = m_plater->get_partplate_list();
     PartPlate *current_plate = part_plate_list.get_curr_plate();
     bool is_all_plates = wxGetApp().plater()->get_preview_canvas3D()->is_all_plates_selected();
-    if (m_print_select == ePrintAll)
+    if (action == ePrintAll)
     {
         if (!part_plate_list.is_all_slice_results_ready_for_print())
         {
             enable = false;
         }
     }
-    else if (m_print_select == ePrintPlate)
+    else if (action == ePrintPlate)
     {
         if (!current_plate->is_slice_result_ready_for_print())
         {
@@ -3268,7 +3337,7 @@ bool MainFrame::get_enable_print_status()
         }
         enable = enable && !is_all_plates;
     }
-    else if (m_print_select == eExportGcode)
+    else if (action == eExportGcode)
     {
         if (!current_plate->is_slice_result_valid())
         {
@@ -3276,7 +3345,7 @@ bool MainFrame::get_enable_print_status()
         }
         enable = enable && !is_all_plates;
     }
-    else if (m_print_select == eSendGcode)
+    else if (action == eSendGcode)
     {
         if (!current_plate->is_slice_result_valid())
             enable = false;
@@ -3284,7 +3353,7 @@ bool MainFrame::get_enable_print_status()
             enable = false;
         enable = enable && !is_all_plates;
     }
-    else if (m_print_select == eUploadGcode)
+    else if (action == eUploadGcode)
     {
         if (!current_plate->is_slice_result_valid())
             enable = false;
@@ -3292,7 +3361,7 @@ bool MainFrame::get_enable_print_status()
             enable = false;
         enable = enable && !is_all_plates;
     }
-    else if (m_print_select == eExportSlicedFile || m_print_select == eOpenInBambuConnect)
+    else if (action == eExportSlicedFile || action == eOpenInBambuConnect)
     {
         if (!current_plate->is_slice_result_ready_for_export())
         {
@@ -3300,7 +3369,7 @@ bool MainFrame::get_enable_print_status()
         }
         enable = enable && !is_all_plates;
 	}
-	else if (m_print_select == eSendToPrinter)
+	else if (action == eSendToPrinter)
 	{
 		if (!current_plate->is_slice_result_ready_for_print())
 		{
@@ -3308,21 +3377,21 @@ bool MainFrame::get_enable_print_status()
 		}
         enable = enable && !is_all_plates;
 	}
-    else if (m_print_select == eSendToPrinterAll)
+    else if (action == eSendToPrinterAll)
     {
         if (!part_plate_list.is_all_slice_results_ready_for_print())
         {
             enable = false;
         }
     }
-    else if (m_print_select == eExportAllSlicedFile)
+    else if (action == eExportAllSlicedFile)
     {
         if (!part_plate_list.is_all_slice_result_ready_for_export())
         {
             enable = false;
         }
     }
-    else if (m_print_select == ePrintMultiMachine)
+    else if (action == ePrintMultiMachine)
     {
         if (!current_plate->is_slice_result_ready_for_print())
         {
@@ -3330,8 +3399,6 @@ bool MainFrame::get_enable_print_status()
         }
         enable = enable && !is_all_plates;
     }
-
-    BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(": m_print_select %1%, enable= %2% ")%m_print_select %enable;
 
     return enable;
 }
@@ -3599,6 +3666,82 @@ void MainFrame::update_shortcut_labels()
 {
     for (const ShortcutMenuItem& entry : m_shortcut_menu_items)
         entry.item->SetItemLabel(shortcut_label(entry.label, entry.shortcut, entry.accelerator));
+    if (RunScriptPanel* panel = wxGetApp().run_script_panel_if_built())
+        panel->shortcuts_changed();
+}
+
+wxString MainFrame::menu_item_label(const wxMenuItem& item) const
+{
+#ifdef __APPLE__
+    for (const ShortcutMenuItem& entry : m_shortcut_menu_items)
+        if (entry.item == &item)
+            return wxMenuItem::GetLabelText(entry.label);
+    for (const auto& [shown, label] : m_key_text_items)
+        if (shown == &item)
+            return wxMenuItem::GetLabelText(label);
+#endif
+    return item.GetItemLabelText();
+}
+
+CodeEditorWindow* MainFrame::focused_code_editor() const
+{
+    const wxWindow* focus = wxWindow::FindFocus();
+    if (RunScriptPanel* panel = wxGetApp().run_script_panel_if_built(); panel != nullptr && panel->owns_focus(focus))
+        return panel;
+    if (auto* replay = dynamic_cast<ActionReplayDialog*>(m_action_replay.get()); replay != nullptr && replay->owns_focus(focus))
+        return replay;
+    return nullptr;
+}
+
+bool MainFrame::forward_to_editor(const char* action)
+{
+    CodeEditorWindow* editor = focused_code_editor();
+    if (editor == nullptr)
+        return false;
+    editor->forward_action(action);
+    return true;
+}
+
+bool MainFrame::editor_clipboard(char command)
+{
+    CodeEditorWindow* editor = focused_code_editor();
+    if (editor == nullptr)
+        return false;
+    // Through the web view, whose clipboard events the editor takes.
+    if (wxWebView* web = editor->web_view()) {
+        if (command == 'x')
+            web->Cut();
+        else if (command == 'c')
+            web->Copy();
+        else
+            web->Paste();
+    }
+    return true;
+}
+
+// While a code editor has the focus, a shortcut menu item whose key the editor takes is disabled, so the key reaches the
+// editor: a chord the page reported its editor binds, or a key with no modifier other than Shift. Save, the Edit items the
+// editor takes over and File › Run Script stay. The chords are compared, so this follows a rebinding.
+void MainFrame::bind_code_editor_menu_rule()
+{
+    static const std::set<Shortcut> kept{Shortcut::SaveProject, Shortcut::SaveProjectAs, Shortcut::Undo,  Shortcut::Redo,
+                                         Shortcut::Cut,         Shortcut::Copy,          Shortcut::Paste, Shortcut::SelectAll,
+                                         Shortcut::ToggleRunScript};
+    for (const ShortcutMenuItem& entry : m_shortcut_menu_items) {
+        if (kept.count(entry.shortcut) != 0)
+            continue;
+        // Bound after the item's own handler, so it runs first; an item it leaves alone goes on to that handler.
+        Bind(wxEVT_UPDATE_UI, [this, shortcut = entry.shortcut](wxUpdateUIEvent& evt) {
+            const CodeEditorWindow* editor = focused_code_editor();
+            const KeyChord          chord  = wxGetApp().shortcuts().binding(shortcut);
+            if (editor != nullptr && chord.valid() &&
+                ((chord.modifiers & ~wxMOD_SHIFT) == 0 || editor->editor_keys().count(chord.to_string()) != 0)) {
+                evt.Enable(false);
+                return;
+            }
+            evt.Skip();
+        }, entry.item->GetId());
+    }
 }
 
 wxMenu* MainFrame::generate_help_menu()
@@ -3642,6 +3785,19 @@ wxMenu* MainFrame::generate_help_menu()
     if (wxGetApp().is_editor())
         append_menu_item(helpMenu, wxID_ANY, _L("Benchmark 3D Scene"), _L("Measure how fast the 3D scene renders in Prepare and Preview"),
             [](wxCommandEvent&) { run_scene_benchmark(); });
+
+    // Screenshots and recordings of the app, for a bug report or a how-to; the Speed Dial has them too.
+    if (wxGetApp().is_editor()) {
+        helpMenu->AppendSeparator();
+        append_menu_item(helpMenu, wxID_ANY, _L("Take Screenshot"), _L("Save a picture of the main window"),
+            [](wxCommandEvent&) { NativeCommands::notify_result(NativeCommands::run("window_save_screenshot")); });
+        append_menu_item(helpMenu, wxID_ANY, _L("Start Recording") + dots, _L("Record a video of the main window"),
+            [](wxCommandEvent&) { NativeCommands::notify_result(NativeCommands::run("recording_start")); }, "", nullptr,
+            []() { return !NativeCommands::recording_active(); }, this);
+        append_menu_item(helpMenu, wxID_ANY, _L("Stop Recording"), _L("Stop the recording and save it"),
+            [](wxCommandEvent&) { NativeCommands::notify_result(NativeCommands::run("recording_stop")); }, "", nullptr,
+            []() { return NativeCommands::recording_active(); }, this);
+    }
 
     helpMenu->AppendSeparator();
 
@@ -3823,22 +3979,22 @@ void MainFrame::init_menubar_as_editor()
         // BBS: close save project
 #ifndef __APPLE__
         append_shortcut_item(fileMenu, Shortcut::SaveProject, true, _L("Save Project"), _L("Save current project to file"),
-            [this](wxCommandEvent&) { if (m_plater) m_plater->save_project(); }, "menu_save", nullptr,
-            [this](){return m_plater != nullptr && can_save(); }, this);
+            [this](wxCommandEvent&) { if (!forward_to_editor("save") && m_plater) m_plater->save_project(); }, "menu_save", nullptr,
+            [this](){return focused_code_editor() != nullptr || (m_plater != nullptr && can_save()); }, this);
 #else
         append_shortcut_item(fileMenu, Shortcut::SaveProject, true, _L("Save Project"), _L("Save current project to file"),
-            [this](wxCommandEvent&) { if (m_plater) m_plater->save_project(); }, "", nullptr,
-            [this](){return m_plater != nullptr && can_save(); }, this);
+            [this](wxCommandEvent&) { if (!forward_to_editor("save") && m_plater) m_plater->save_project(); }, "", nullptr,
+            [this](){return focused_code_editor() != nullptr || (m_plater != nullptr && can_save()); }, this);
 #endif
 
 #ifndef __APPLE__
         append_shortcut_item(fileMenu, Shortcut::SaveProjectAs, true, _L("Save Project as") + dots, _L("Save current project as"),
-            [this](wxCommandEvent&) { if (m_plater) m_plater->save_project(true); }, "menu_save", nullptr,
-            [this](){return m_plater != nullptr && can_save_as(); }, this);
+            [this](wxCommandEvent&) { if (!forward_to_editor("save_as") && m_plater) m_plater->save_project(true); }, "menu_save", nullptr,
+            [this](){return focused_code_editor() != nullptr || (m_plater != nullptr && can_save_as()); }, this);
 #else
         append_shortcut_item(fileMenu, Shortcut::SaveProjectAs, true, _L("Save Project as") + dots, _L("Save current project as"),
-            [this](wxCommandEvent&) { if (m_plater) m_plater->save_project(true); }, "", nullptr,
-            [this](){return m_plater != nullptr && can_save_as(); }, this);
+            [this](wxCommandEvent&) { if (!forward_to_editor("save_as") && m_plater) m_plater->save_project(true); }, "", nullptr,
+            [this](){return focused_code_editor() != nullptr || (m_plater != nullptr && can_save_as()); }, this);
 #endif
 
         // BBS: publish
@@ -3928,6 +4084,12 @@ void MainFrame::init_menubar_as_editor()
 
         append_submenu(fileMenu, export_menu, wxID_ANY, _L("Export"), "");
 
+        append_shortcut_check_item(fileMenu, Shortcut::ToggleRunScript, _L("Run Script"), _L("Show or hide the Run Script panel"),
+            [](wxCommandEvent&) { wxGetApp().run_script_panel().toggle(); }, []() { return true; },
+            []() { RunScriptPanel* panel = wxGetApp().run_script_panel_if_built(); return panel != nullptr && panel->on_screen(); });
+        append_menu_item(fileMenu, wxID_ANY, _L("Action Replay") + dots, _L("Open a replay file and replay its steps"),
+            [this](wxCommandEvent&) { show_action_replay(); }, "", nullptr, []() { return true; }, this);
+
         fileMenu->AppendSeparator();
 
 #ifndef __APPLE__
@@ -3947,8 +4109,9 @@ void MainFrame::init_menubar_as_editor()
 
     // Feeds the key to ImGui instead when ImGui has the focused canvas's keyboard, since the menu
     // handles its key equivalents before the canvas receives the key.
-    auto handle_key_event = [](wxKeyEvent& evt) {
-        if (wxWebView* view = focused_web_view()) {
+    auto handle_key_event = [this](wxKeyEvent& evt) {
+        // A code editor (Run Script, Action Replay) takes these through forward_to_editor() / editor_clipboard().
+        if (wxWebView* view = focused_code_editor() == nullptr ? focused_web_view() : nullptr) {
             switch (evt.GetKeyCode()) {
             case 'C': view->Copy(); return true;
             case 'V': view->Paste(); return true;
@@ -3970,11 +4133,15 @@ void MainFrame::init_menubar_as_editor()
         // BBS undo
         append_shortcut_item(editMenu, Shortcut::Undo, true, _L("Undo"),
             _L("Undo"), [this](wxCommandEvent&) {
+                if (forward_to_editor("undo"))
+                    return;
 #ifdef SLIC3R_CAD
                 if (DesignPanel* dp = shown_design_panel()) { dp->menu_undo_redo(false); return; }
 #endif
                 m_plater->undo(); },
             "menu_undo", nullptr, [this](){
+                if (focused_code_editor() != nullptr)
+                    return true;
 #ifdef SLIC3R_CAD
                 if (DesignPanel* dp = shown_design_panel()) return dp->menu_can_undo_redo(false);
 #endif
@@ -3982,11 +4149,15 @@ void MainFrame::init_menubar_as_editor()
         // BBS redo
         append_shortcut_item(editMenu, Shortcut::Redo, true, _L("Redo"),
             _L("Redo"), [this](wxCommandEvent&) {
+                if (forward_to_editor("redo"))
+                    return;
 #ifdef SLIC3R_CAD
                 if (DesignPanel* dp = shown_design_panel()) { dp->menu_undo_redo(true); return; }
 #endif
                 m_plater->redo(); },
             "menu_redo", nullptr, [this](){
+                if (focused_code_editor() != nullptr)
+                    return true;
 #ifdef SLIC3R_CAD
                 if (DesignPanel* dp = shown_design_panel()) return dp->menu_can_undo_redo(true);
 #endif
@@ -3994,16 +4165,16 @@ void MainFrame::init_menubar_as_editor()
         editMenu->AppendSeparator();
         // BBS Cut TODO
         append_shortcut_item(editMenu, Shortcut::Cut, true, _L("Cut"),
-            _L("Cut selection to clipboard"), [this](wxCommandEvent&) {m_plater->cut_selection_to_clipboard(); },
-            "menu_cut", nullptr, [this]() {return m_plater->can_copy_to_clipboard(); }, this);
+            _L("Cut selection to clipboard"), [this](wxCommandEvent&) { if (!editor_clipboard('x')) m_plater->cut_selection_to_clipboard(); },
+            "menu_cut", nullptr, [this]() {return focused_code_editor() != nullptr || m_plater->can_copy_to_clipboard(); }, this);
         // BBS Copy
         append_shortcut_item(editMenu, Shortcut::Copy, true, _L("Copy"),
-            _L("Copy selection to clipboard"), [this](wxCommandEvent&) { m_plater->copy_selection_to_clipboard(); },
-            "menu_copy", nullptr, [this](){return m_plater->can_copy_to_clipboard(); }, this);
+            _L("Copy selection to clipboard"), [this](wxCommandEvent&) { if (!editor_clipboard('c')) m_plater->copy_selection_to_clipboard(); },
+            "menu_copy", nullptr, [this](){return focused_code_editor() != nullptr || m_plater->can_copy_to_clipboard(); }, this);
         // BBS Paste
         append_shortcut_item(editMenu, Shortcut::Paste, true, _L("Paste"),
-            _L("Paste clipboard"), [this](wxCommandEvent&) { m_plater->paste_from_clipboard(); },
-            "menu_paste", nullptr, [this](){return m_plater->can_paste_from_clipboard(); }, this);
+            _L("Paste clipboard"), [this](wxCommandEvent&) { if (!editor_clipboard('v')) m_plater->paste_from_clipboard(); },
+            "menu_paste", nullptr, [this](){return focused_code_editor() != nullptr || m_plater->can_paste_from_clipboard(); }, this);
         // BBS Delete selected
         append_shortcut_item(editMenu, Shortcut::DeleteSelected, true, _L("Delete Selected"),
             _L("Deletes the current selection"),[this](wxCommandEvent&) { m_plater->remove_selected(); },
@@ -4030,6 +4201,8 @@ void MainFrame::init_menubar_as_editor()
         // BBS undo
         append_shortcut_item(editMenu, Shortcut::Undo, false, _L("Undo"),
             _L("Undo"), [this, handle_key_event](wxCommandEvent&) {
+                if (forward_to_editor("undo"))
+                    return;
                 wxKeyEvent e;
                 e.SetEventType(wxEVT_KEY_DOWN);
                 e.SetControlDown(true);
@@ -4042,6 +4215,8 @@ void MainFrame::init_menubar_as_editor()
 #endif
                 m_plater->undo(); },
             "", nullptr, [this](){
+                if (focused_code_editor() != nullptr)
+                    return true;
 #ifdef SLIC3R_CAD
                 if (DesignPanel* dp = shown_design_panel()) return dp->menu_can_undo_redo(false);
 #endif
@@ -4049,6 +4224,8 @@ void MainFrame::init_menubar_as_editor()
         // BBS redo
         append_shortcut_item(editMenu, Shortcut::Redo, false, _L("Redo"),
             _L("Redo"), [this, handle_key_event](wxCommandEvent&) {
+                if (forward_to_editor("redo"))
+                    return;
                 wxKeyEvent e;
                 e.SetEventType(wxEVT_KEY_DOWN);
                 e.SetControlDown(true);
@@ -4061,6 +4238,8 @@ void MainFrame::init_menubar_as_editor()
 #endif
                 m_plater->redo(); },
             "", nullptr, [this](){
+                if (focused_code_editor() != nullptr)
+                    return true;
 #ifdef SLIC3R_CAD
                 if (DesignPanel* dp = shown_design_panel()) return dp->menu_can_undo_redo(true);
 #endif
@@ -4076,8 +4255,9 @@ void MainFrame::init_menubar_as_editor()
                 if (handle_key_event(e)) {
                     return;
                 }
-                m_plater->cut_selection_to_clipboard(); },
-            "", nullptr, [this]() {return focused_web_view() != nullptr || m_plater->can_copy_to_clipboard(); }, this);
+                if (!editor_clipboard('x'))
+                    m_plater->cut_selection_to_clipboard(); },
+            "", nullptr, [this]() {return focused_code_editor() != nullptr || focused_web_view() != nullptr || m_plater->can_copy_to_clipboard(); }, this);
         // BBS Copy
         append_shortcut_item(editMenu, Shortcut::Copy, false, _L("Copy"),
             _L("Copy selection to clipboard"), [this, handle_key_event](wxCommandEvent&) {
@@ -4088,8 +4268,9 @@ void MainFrame::init_menubar_as_editor()
                 if (handle_key_event(e)) {
                     return;
                 }
-                m_plater->copy_selection_to_clipboard(); },
-            "", nullptr, [this](){return focused_web_view() != nullptr || m_plater->can_copy_to_clipboard(); }, this);
+                if (!editor_clipboard('c'))
+                    m_plater->copy_selection_to_clipboard(); },
+            "", nullptr, [this](){return focused_code_editor() != nullptr || focused_web_view() != nullptr || m_plater->can_copy_to_clipboard(); }, this);
         // BBS Paste
         append_shortcut_item(editMenu, Shortcut::Paste, false, _L("Paste"),
             _L("Paste clipboard"), [this, handle_key_event](wxCommandEvent&) {
@@ -4100,8 +4281,9 @@ void MainFrame::init_menubar_as_editor()
                 if (handle_key_event(e)) {
                     return;
                 }
-                m_plater->paste_from_clipboard(); },
-            "", nullptr, [this](){return focused_web_view() != nullptr || m_plater->can_paste_from_clipboard(); }, this);
+                if (!editor_clipboard('v'))
+                    m_plater->paste_from_clipboard(); },
+            "", nullptr, [this](){return focused_code_editor() != nullptr || focused_web_view() != nullptr || m_plater->can_paste_from_clipboard(); }, this);
 #if 0
         // BBS Delete selected
         append_shortcut_item(editMenu, Shortcut::DeleteSelected, true, _L("Delete Selected"),
@@ -4156,10 +4338,11 @@ void MainFrame::init_menubar_as_editor()
                 if (handle_key_event(e)) {
                     return;
                 }
-                m_plater->select_all(); },
-            "", nullptr, [this](){return focused_web_view() != nullptr || can_select(); }, this);
+                if (!forward_to_editor("select_all"))
+                    m_plater->select_all(); },
+            "", nullptr, [this](){return focused_code_editor() != nullptr || focused_web_view() != nullptr || can_select(); }, this);
         // BBS Deslect All
-        append_menu_item(editMenu, wxID_ANY, _L("Deselect All") + sep + _L_CONTEXT("Esc", "Keyboard Shortcut"),
+        wxMenuItem* deselect_all = append_menu_item(editMenu, wxID_ANY, _L("Deselect All") + sep + _L_CONTEXT("Esc", "Keyboard Shortcut"),
             _L("Deselects all objects"), [this, handle_key_event](wxCommandEvent&) {
                 wxKeyEvent e;
                 e.SetEventType(wxEVT_KEY_DOWN);
@@ -4169,6 +4352,7 @@ void MainFrame::init_menubar_as_editor()
                 }
                 m_plater->deselect_all(); },
             "", nullptr, [this](){return can_deselect(); }, this);
+        m_key_text_items.emplace_back(deselect_all, _L("Deselect All"));
         //editMenu->AppendSeparator();
         //append_menu_check_item(editMenu, wxID_ANY, _L("Show Model Mesh(TODO)"),
         //    _L("Display triangles of models."), [this](wxCommandEvent& evt) {
@@ -4307,6 +4491,15 @@ void MainFrame::init_menubar_as_editor()
                 return false;
             },
             []() { return wxGetApp().app_config->get("show_imex_toolhead_boxes") != "false"; },
+            this);
+
+        append_menu_check_item(
+            viewMenu, wxID_ANY, _L("Agent Activity"), _L("Show or hide the Agent Activity pane, which lists what automation does in the app"),
+            [](wxCommandEvent&) { wxGetApp().agent_activity_panel().toggle(); }, this, []() { return true; },
+            []() {
+                AgentActivityPanel* panel = wxGetApp().agent_activity_panel_if_built();
+                return panel != nullptr && panel->on_screen();
+            },
             this);
 
         append_menu_item(
@@ -4678,6 +4871,7 @@ void MainFrame::init_menubar_as_editor()
         }, wxID_EXIT);
     }
 #endif // __APPLE__
+    bind_code_editor_menu_rule();
 }
 
 void MainFrame::set_max_recent_count(int max)
@@ -4815,6 +5009,14 @@ struct ConfigsOverwriteConfirmDialog : MessageDialog
     }
 };
 
+void MainFrame::show_action_replay()
+{
+    if (!m_action_replay)
+        m_action_replay = new ActionReplayDialog(this);
+    m_action_replay->Show();
+    m_action_replay->Raise();
+}
+
 void MainFrame::export_config()
 {
     ExportConfigsDialog export_configs_dlg(nullptr);
@@ -4930,28 +5132,14 @@ void MainFrame::load_config_file()
         cfiles.push_back(into_u8(file));
         m_last_config = file;
     }
-    bool update = false;
     install_missing_import_parents(this, cfiles);
     PresetBundle::ImportReport report;
-    wxGetApp().preset_bundle->import_presets(cfiles, [this](std::string const & name) {
+    cfiles = import_configs(cfiles, [this](std::string const & name) {
             ConfigsOverwriteConfirmDialog dlg(this, from_u8(name), false);
             int           res = dlg.ShowModal();
             int           ids[]{wxID_NO, wxID_YES, wxID_NOTOALL, wxID_YESTOALL};
             return std::find(ids, ids + 4, res) - ids;
-        },
-        ForwardCompatibilitySubstitutionRule::Enable,
-        *wxGetApp().app_config, &report);
-    if (!cfiles.empty()) {
-        wxGetApp().app_config->update_config_dir(get_dir_name(cfiles.back()));
-        wxGetApp().load_current_presets();
-        BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << " presets has been import,and size is" << cfiles.size();
-        NetworkAgent* agent = wxGetApp().getAgent();
-        if (agent) {
-            BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << " user is: " << agent->get_user_id();
-        }
-    }
-    wxGetApp().preset_bundle->update_compatible(PresetSelectCompatibleType::Always);
-    update_side_preset_ui();
+        }, &report);
     // Unlayered: report what was actually imported, not how many files were picked.
     const size_t imported = report.imported.size();
     auto msg = wxString::Format(_L_PLURAL("There is %d config imported. (Only non-system and compatible configs)",
@@ -4968,6 +5156,24 @@ void MainFrame::load_config_file()
     MessageDialog dlg2(this,msg ,
                         _L("Import result"), wxOK);
     dlg2.ShowModal();
+}
+
+std::vector<std::string> MainFrame::import_configs(std::vector<std::string> files, std::function<int(const std::string &)> confirm,
+                                                   PresetBundle::ImportReport *report)
+{
+    wxGetApp().preset_bundle->import_presets(files, confirm, ForwardCompatibilitySubstitutionRule::Enable, *wxGetApp().app_config, report);
+    if (!files.empty()) {
+        wxGetApp().app_config->update_config_dir(get_dir_name(files.back()));
+        wxGetApp().load_current_presets();
+        BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << " presets has been import,and size is" << files.size();
+        NetworkAgent* agent = wxGetApp().getAgent();
+        if (agent) {
+            BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << " user is: " << agent->get_user_id();
+        }
+    }
+    wxGetApp().preset_bundle->update_compatible(PresetSelectCompatibleType::Always);
+    update_side_preset_ui();
+    return files;
 }
 
 // Load a config file containing a Print, Filament & Printer preset from command line.

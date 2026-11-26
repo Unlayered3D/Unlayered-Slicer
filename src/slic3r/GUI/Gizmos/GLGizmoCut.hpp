@@ -8,6 +8,7 @@
 #include "libslic3r/TriangleMesh.hpp"
 #include "libslic3r/Model.hpp"
 #include "libslic3r/CutUtils.hpp"
+#include "libslic3r/ObjectID.hpp"
 #include "imgui/imgui.h"
 #include "libslic3r/Skeleton.hpp"
 #include "libslic3r/Point.hpp"
@@ -506,6 +507,11 @@ public:
         : GLGizmoCut3D(parent, icon_filename, sprite_id)
     {}
 };
+
+// What Perform cut does to the cut object's cut id before it cuts, and to the model's other pieces of the same cut after
+// it, which a cut made from arguments (Ops::cut_object()) does as well.
+void update_object_cut_id(CutObjectBase& cut_id, ModelObjectCutAttributes attributes, const int dowels_count);
+void synchronize_model_after_cut(Model& model, const CutObjectBase& cut_id);
 
 } // namespace GUI
 } // namespace Slic3r

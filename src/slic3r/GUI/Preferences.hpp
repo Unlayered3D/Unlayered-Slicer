@@ -12,6 +12,7 @@
 #include <wx/string.h>
 #include <wx/gdicmn.h>
 #include <wx/sizer.h>
+#include <wx/stattext.h>
 #include <wx/timer.h>
 #include <string>
 #include <vector>
@@ -24,9 +25,14 @@
 #include "Theme.hpp"
 #include "Widgets/SpinInput.hpp"
 #include "Widgets/TabCtrl.hpp"
+#include "Widgets/Label.hpp"
+#include "Widgets/Button.hpp"
+#include "Widgets/RadioGroup.hpp"
 #include "slic3r/Utils/bambu_networking.hpp"
 
 namespace Slic3r { namespace GUI {
+
+namespace Ops { struct Preference; }
 
 #define DESIGN_GRAY900_COLOR wxColour("#363636") // Label color
 #define DESIGN_GRAY600_COLOR wxColour("#ACACAC") // Dimmed text color
@@ -46,8 +52,8 @@ namespace Slic3r { namespace GUI {
 #define PREFERENCES_COMBOBOX_SIZE wxSize(PREFERENCES_FONT_SCALED(120), -1)
 #define PREFERENCES_INPUT_SIZE wxSize(PREFERENCES_FONT_SCALED(120), -1)
 
-// The tabs other dialogs open Preferences on.
-enum class PreferencesTab { General, Appearance, Files, Behaviour, Control, Graphics, Online };   // Appearance: Unlayered
+// The tabs other dialogs and window_open {window: "preferences"} open Preferences on.
+enum class PreferencesTab { General, Appearance, Files, Behaviour, Control, Graphics, Online, Developer };   // Appearance: Unlayered
 
 class PreferencesDialog : public DPIDialog
 {
@@ -82,10 +88,12 @@ public:
 
     ~PreferencesDialog();
 
-    void select_tab(PreferencesTab tab, const std::string& option = {});   // and scrolls a combobox option's row into view, focused
+    // Shows `tab`, or the tab of `option` (a control named after its AppConfig key), scrolled to that control and focused.
+    void select_tab(PreferencesTab tab, const std::string& option = {});
 
     wxString m_backup_interval_time;
     wxTimer m_filament_height_timer;
+    wxTimer m_mcp_status_timer;   // refreshes the MCP status while another window holds the port
 
     void      create();
 
@@ -101,11 +109,21 @@ public:
     void          on_improvement_program_toggled(bool on);
     void          update_privacy_controls();
     ::CheckBox * m_bambu_cloud_checkbox      = {nullptr};
+    ::Label *    m_mcp_intro                 = {nullptr};
+    ::Label *    m_mcp_status_dot            = {nullptr};
+    ::Label *    m_mcp_status                = {nullptr};
+    ::Label *    m_mcp_address               = {nullptr};
+    RadioGroup * m_mcp_transport             = {nullptr};
+    ::Label *    m_mcp_transport_hint        = {nullptr};
+    ::Label *    m_mcp_agent_hint            = {nullptr};
+    ::Button *   m_mcp_copy_button           = {nullptr};
     ::CheckBox * m_skip_identical_frames_checkbox = {nullptr};
     ::TextInput *m_backup_interval_textinput = {nullptr};
     ::SpinInput *m_dim_previous_layers_brightness_input = {nullptr};
     // Disabled while persistent outlines are off.
     wxWindow *   m_persistent_outline_color_button = {nullptr};
+    wxStaticText *m_download_path_text       = {nullptr}; // the downloads folder, in its row
+    wxBoxSizer * m_download_path_row         = {nullptr};
     ::ComboBox * m_network_version_combo     = {nullptr};
     std::vector<NetworkLibraryVersionInfo> m_available_versions;
 
@@ -118,8 +136,7 @@ public:
 
     wxBoxSizer *create_item_title(wxString title);
     wxBoxSizer *create_item_label(wxString label, const wxString tooltip = "", const wxString wiki_url = "");
-    wxBoxSizer *create_item_combobox(wxString title, wxString tooltip, std::string param, std::vector<wxString> vlist, std::function<void(wxString)> onchange = {}, const wxString wiki_url = "");
-    wxBoxSizer *create_item_combobox(wxString title, wxString tooltip, std::string param, std::vector<wxString> vlist, std::vector<std::string> config_name_index, const wxString wiki_url = "", std::function<void(const std::string&)> onchange = {});
+    wxBoxSizer *create_item_combobox(wxString title, wxString tooltip, std::string param, std::vector<wxString> vlist, std::vector<std::string> config_name_index, std::function<void(std::string)> onchange = {}, const wxString wiki_url = "");
     wxBoxSizer *create_item_region_combobox(wxString title, wxString tooltip);
     wxBoxSizer *create_item_language_combobox(wxString title, wxString tooltip);
     wxBoxSizer *create_item_loglevel_combobox(wxString title, wxString tooltip, std::vector<wxString> vlist);
@@ -131,6 +148,8 @@ public:
     void set_dark_mode();
     wxBoxSizer *create_item_button(wxString title, wxString title2, wxString tooltip, wxString tooltip2, std::function<void()> onclick, const wxString wiki_url = "");
     wxBoxSizer *create_item_downloads(wxString title, wxString tooltip);
+    // Shows the downloads folder the app configuration holds in its row. Ops::apply_preference() calls it.
+    void        show_download_path();
     // validator_style is a wxTextValidator style; pass wxFILTER_NONE for free text such as a URL.
     // Note the default is wxFILTER_DIGITS, which is what every pre-existing caller relies on.
     wxBoxSizer *create_item_input(wxString title, wxString title2, wxString tooltip, std::string param, std::function<void(wxString)> onchange = {}, const wxString wiki_url = "", long validator_style = wxFILTER_DIGITS);
@@ -143,16 +162,35 @@ public:
     wxBoxSizer *create_item_backup(wxString title, wxString tooltip);
     wxBoxSizer *create_item_auto_reslice(wxString title, wxString checkbox_tooltip, wxString delay_tooltip);
     wxBoxSizer *create_item_bambu_cloud(wxString title, wxString tooltip);
+    wxBoxSizer *create_item_mcp_server(wxString title, wxString tooltip);
+    wxBoxSizer *create_item_mcp_port(wxString title, wxString tooltip);
+    wxBoxSizer *create_item_mcp_address(wxString title, wxString tooltip);
+    wxBoxSizer *create_item_mcp_transport(wxString title, wxString tooltip);
+    wxBoxSizer *create_item_mcp_connect(wxString title, wxString tooltip);
+    wxBoxSizer *create_item_mcp_python(wxString title, wxString tooltip);
+    wxBoxSizer *with_mcp_hint(wxBoxSizer *row, ::Label *hint);
+    void        update_mcp_status(const std::string& note = {});
     wxBoxSizer *create_item_network_plugin_version(wxString title, wxString tooltip);
 #ifdef WIN32
     wxBoxSizer *create_item_link_association(wxString url_prefix, wxString website_name);
 #endif // WIN32
 
     void create_items();
+    // The rows of `tab`'s preferences (Ops::preferences()), in the table's order under their sections' titles, with
+    // the rows that go with them.
+    void add_preference_rows(wxFlexGridSizer *g_sizer, const std::string &tab);
+    // The row of a preference of the table's kinds, built from its entry.
+    wxBoxSizer *create_preference_row(const Ops::Preference &p);
+    // The row of a preference whose control is built by a function of its own (Ops::Preference::own_row); none for a
+    // preference whose control is in another's row.
+    wxBoxSizer *create_own_row(wxFlexGridSizer *g_sizer, const Ops::Preference &p);
+    // What the dialog adds after preference `p`'s row `row`: the rows of its section that store no preference of the
+    // table, and the state of controls that follow the rows built so far.
+    void add_rows_after(wxFlexGridSizer *g_sizer, const Ops::Preference &p, wxBoxSizer *row);
+    // What a number field's change of `key` does: Ops::apply_preference(), or later for the filament area's height.
+    void preference_changed(const std::string &key);
     void create_sync_page();
     wxBoxSizer* create_debug_page();
-
-    void UpdateSidebarLayout();
 
     // BBS
     void create_select_domain_widget();

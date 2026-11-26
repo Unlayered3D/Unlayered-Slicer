@@ -19,3 +19,12 @@ src/slic3r/GUI/GUI_App.cpp:// Agent already gone
 # The one-time migration of the side panel's pre-rename configuration keys (AppConfig): it has to
 # name the old prefix to read it.
 src/libslic3r/AppConfig.*:agent_app_\*|"agent_app_"
+
+# Upstream OrcaSlicer's MCP server (#17819): an "agent" there is any AI client of the server (Claude Code,
+# Codex, ...), Agent Activity is the pane that lists their calls, and Mcp::Agent the clients a setup is copied
+# for. Not ours, and not a product name.
+src/slic3r/GUI/*:Agent Activity|AgentActivity
+src/slic3r/GUI/AgentActivityPanel.cpp:_u8L\("Agent"\)
+src/slic3r/GUI/Mcp/McpCore.hpp:captions and the Agent$
+src/slic3r/GUI/Mcp/McpSetup.*:\bAgent::|enum class Agent \{|\(Agent agent,
+src/slic3r/GUI/Preferences.cpp:struct Agent$|std::vector<Agent> agents|const Agent &agent : agents|Mcp::Agent\b

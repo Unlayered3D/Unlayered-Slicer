@@ -73,3 +73,5 @@ ctest_results.xml
 # The publish script's dependency (.github/publish/README.md)
 .github/publish/node_modules/
 .github/publish/package-lock.json
+.superpowers/
+docs/sf-plan/

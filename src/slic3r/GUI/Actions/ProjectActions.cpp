@@ -224,7 +224,7 @@ InvokeResult run_new(InvokeContext& ctx)
     // "prompt": the slicer's own save-changes question decides; otherwise the preflight already did.
     const bool     prompt = ctx.if_project_dirty == "prompt";
     const wxString name   = wxString::FromUTF8(ctx.params.value("name", "").c_str());
-    if (plater->new_project(!prompt, false, name) == wxID_CANCEL)
+    if (plater->new_project(prompt ? Ops::Prompts::Ask : Ops::Prompts::Skip, /*silent=*/false, name) == wxID_CANCEL)
         return InvokeResult::error(WAB_USER_CANCELLED, "the user kept the current project");
     return InvokeResult::ok(project_info(*plater));
 }

@@ -178,6 +178,14 @@ std::vector<size_t> GLGizmosManager::get_selectable_idxs() const
     return out;
 }
 
+bool GLGizmosManager::is_on_toolbar(EType type) const
+{
+    for (size_t idx : get_selectable_idxs())
+        if (m_gizmos[idx]->get_sprite_id() == (unsigned int) type)
+            return true;
+    return false;
+}
+
 //BBS: GUI refactor: GLToolbar&&Gizmo adjust
 GLGizmosManager::EType GLGizmosManager::get_gizmo_from_mouse(const Vec2d &mouse_pos) const
 {
@@ -585,6 +593,22 @@ bool GLGizmosManager::open_gizmo(EType type)
 }
 
 
+GLGizmosManager::ToolbarClick GLGizmosManager::click_toolbar_icon(EType type)
+{
+    if (m_gizmos.empty())
+        return ToolbarClick::Nothing;
+    const EType before = m_current;
+    if (type == Emboss) {
+        if (dynamic_cast<GLGizmoEmboss *>(m_gizmos[Emboss].get())->on_shortcut_key())
+            return ToolbarClick::CreationStarted;
+    } else {
+        open_gizmo(type);
+    }
+    if (m_current == type)
+        return ToolbarClick::Opened;
+    return before == type ? ToolbarClick::Closed : ToolbarClick::Nothing;
+}
+
 bool GLGizmosManager::check_gizmos_closed_except(EType type) const
 {
     if (get_current_type() != type && get_current_type() != Undefined) {
@@ -652,6 +676,11 @@ bool GLGizmosManager::is_running() const
     //GLGizmoBase* curr = get_current();
     //return (curr != nullptr) ? (curr->get_state() == GLGizmoBase::On) : false;
     return m_current != Undefined;
+}
+
+bool GLGizmosManager::is_busy() const
+{
+    return std::any_of(m_gizmos.begin(), m_gizmos.end(), [](const auto &g) { return g->is_busy(); });
 }
 
 bool GLGizmosManager::open_gizmo_by_shortcut(Shortcut shortcut)
@@ -909,10 +938,7 @@ bool GLGizmosManager::gizmos_toolbar_on_mouse(const wxMouseEvent &mouse_event) {
         // mouse is above toolbar
         if (mouse_event.LeftDown() || mouse_event.LeftDClick()) {
             mc.left = true;
-            if (gizmo == Emboss) {
-                GLGizmoBase *gizmo_emboss = m_gizmos[Emboss].get();
-                dynamic_cast<GLGizmoEmboss *>(gizmo_emboss)->on_shortcut_key();
-            } else if (is_multiplanar_gizmo(gizmo) && !nonplanar_printing_enabled()) {
+            if (is_multiplanar_gizmo(gizmo) && !nonplanar_printing_enabled()) {
                 // UNLAYERED_MOD -- a greyed multiplanar tool offers to turn non-planar printing on
                 // instead of ignoring the click. Deferred: a modal dialog inside the canvas mouse
                 // handler would swallow the LeftUp and leave the capture state stuck.
@@ -921,7 +947,7 @@ bool GLGizmosManager::gizmos_toolbar_on_mouse(const wxMouseEvent &mouse_event) {
                         open_gizmo(gizmo);
                 });
             } else {
-                open_gizmo(gizmo);
+                click_toolbar_icon(gizmo);
             }
             return true;
         }

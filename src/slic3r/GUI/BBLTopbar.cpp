@@ -36,6 +36,7 @@ static wxColour topbar_text()
     const wxColour bg = topbar_background();
     return Slic3r::GUI::ThemeManager::get().active().auto_contrast_text ? StateColor::EnsureContrast(*wxWHITE, bg, 4.5) : *wxWHITE;
 }
+#include "SyntheticInput.hpp"
 #ifdef SLIC3R_CAD
 #include "CAD/DesignPanel.hpp"
 #endif
@@ -677,7 +678,7 @@ void BBLTopbar::PopupToolMenu(int tool_id, wxMenu* menu, bool& skip_popup)
         // A menu item can rebuild the main window (and this bar with it) before PopupMenu returns:
         // reported crashes in SetToolSticky after a theme or language change from Preferences.
         wxWeakRef<BBLTopbar> alive(this);
-        GetParent()->PopupMenu(menu, wxPoint(rec.GetLeft(), GetSize().GetHeight() - 2));
+        popup_menu(*GetParent(), *menu, wxPoint(rec.GetLeft(), GetSize().GetHeight() - 2));
         if (!alive)
             return;
         m_popup_open = false;
